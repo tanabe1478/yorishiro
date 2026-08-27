@@ -1,0 +1,10 @@
+{
+  "name": "yorishiro",
+  "private": true,
+  "description": "A personal harness layered on top of pi",
+  "keywords": ["pi-package"],
+  "pi": {
+    "skills": ["./skills"],
+    "extensions": ["./extensions"]
+  }
+}

@@ -1,0 +1,16 @@
+# Private instructions
+AGENTS.local.md
+
+# Project-local pi package installations
+.pi/git/
+.pi/npm/
+
+# Working repositories
+work/*
+!work/.gitkeep
+
+# Local environment and OS files
+.env
+.env.*
+!.env.example
+.DS_Store

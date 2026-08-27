@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+PI_BIN="${YORISHIRO_PI_BIN:-pi}"
+
+export YORISHIRO_ROOT="$ROOT"
+
+load_harness=1
+for argument in "$@"; do
+  case "$argument" in
+    install|remove|uninstall|update|list|config|auth|--help|-h|--version|-v|--list-models)
+      load_harness=0
+      break
+      ;;
+  esac
+done
+
+if [[ "$load_harness" == 1 ]]; then
+  exec "$PI_BIN" --extension "$ROOT" "$@"
+fi
+
+exec "$PI_BIN" "$@"
