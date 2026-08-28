@@ -8,7 +8,8 @@
     "test:verifier-boundary": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/verifier-boundary-load.mjs",
     "test:verifier-runtime": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/verifier-runtime.mjs",
     "test:sandbox-preflight": "node --experimental-strip-types ./test/sandbox-preflight.mjs",
-    "test": "npm run test:reporter && npm run test:pipeline-control && npm run test:pipeline-flow && npm run test:verifier-boundary && npm run test:verifier-runtime && npm run test:sandbox-preflight"
+    "test:cleanup-policy": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/cleanup-policy.mjs",
+    "test": "npm run test:reporter && npm run test:pipeline-control && npm run test:pipeline-flow && npm run test:verifier-boundary && npm run test:verifier-runtime && npm run test:sandbox-preflight && npm run test:cleanup-policy"
   },
   "description": "A personal harness layered on top of pi",
   "keywords": ["pi-package"],

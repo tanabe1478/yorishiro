@@ -7,11 +7,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { preflightVerifierSandbox } from "./sandbox.ts";
 import { finalizeStage, flowAfterReview, flowAfterVerification } from "./pipeline-flow.ts";
+import { cleanupRun, registerCleanupTool, recordCleanupFailure } from "./cleanup.ts";
+import { shouldCleanup } from "./cleanup-policy.ts";
 
 const MODELS = { plan: "openai-codex/gpt-5.6-sol", implement: "openai-codex/gpt-5.6-luna", verify: "openai-codex/gpt-5.6-terra", review: "openai-codex/gpt-5.6-sol" } as const;
 type Stage = "plan" | "implement" | "verify" | "review";
 type StageStatus = "pending" | "running" | "passed" | "failed" | "blocked" | "aborted";
-type Input = { task: string; approvedPlan: string; cwd?: string; maxRepairCycles?: number };
+type Input = { task: string; approvedPlan: string; cwd?: string; maxRepairCycles?: number; cleanupMode?: "ask" | "on-success" | "never" };
 type CommandResult = { code: number; stdout: string; stderr: string };
 type Attempt = { attempt: number; status: StageStatus; startedAt: string; finishedAt?: string; reportFile: string; paneId: string; verdict?: string; error?: string };
 type Pane = { paneId: string; name: string; model: string; attempts: Attempt[] };
@@ -81,10 +83,12 @@ function promptFor(stage: Stage, task: string, dir: string, plan: string, verifi
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.registerTool({ name: "development_pipeline", label: "Development Pipeline", description: "Run an auditable development pipeline in visible Herdr panes.", parameters: Type.Object({ task: Type.String({ description: "User-approved development task" }), approvedPlan: Type.String({ description: "Plan approved in the parent Sol conversation" }), cwd: Type.Optional(Type.String()), maxRepairCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 1, default: 1 })) }), async execute(_id, input: Input, signal, onUpdate, ctx) {
+  registerCleanupTool(pi, rootDir());
+  pi.registerTool({ name: "development_pipeline", label: "Development Pipeline", description: "Run an auditable development pipeline in visible Herdr panes.", parameters: Type.Object({ task: Type.String({ description: "User-approved development task" }), approvedPlan: Type.String({ description: "Plan approved in the parent Sol conversation" }), cwd: Type.Optional(Type.String()), maxRepairCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 1, default: 1 })), cleanupMode: Type.Optional(Type.String({ description: "ask, on-success, or never; defaults to ask" })) }), async execute(_id, input: Input, signal, onUpdate, ctx) {
     const task = input.task?.trim(), approvedPlan = input.approvedPlan?.trim(), cwd = path.resolve(input.cwd?.trim() || ctx.cwd);
     if (!task) throw new Error("task must not be empty");
     if (!approvedPlan) throw new Error("approvedPlan must not be empty; planning is expected in the parent Sol conversation");
+    const cleanupMode = input.cleanupMode ?? "ask"; if (!["ask", "on-success", "never"].includes(cleanupMode)) throw new Error("cleanupMode must be ask, on-success, or never");
     for (const key of ["HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_SOCKET_PATH"]) if (!process.env[key]) throw new Error(`Herdr context is required (${key} is missing)`);
     if (!existsSync(process.env.HERDR_SOCKET_PATH!)) throw new Error(`Herdr socket is unavailable: ${process.env.HERDR_SOCKET_PATH}`);
     const herdr = await command("herdr", ["status"]); if (herdr.code) throw new Error(`Herdr is unavailable: ${herdr.stderr || herdr.stdout}`);
@@ -120,7 +124,7 @@ export default function (pi: ExtensionAPI) {
       } catch (e) { record.status = signal?.aborted ? "aborted" : "failed"; stageData.status = record.status; record.error = e instanceof Error ? e.message : String(e); return { valid: false, positive: false, text: "" }; }
       finally { if (pane?.paneId && !terminalCaptured) { try { await captureTranscript(pane.paneId, terminalFile); } catch (e) { record.error = record.error || `terminal capture failed: ${e instanceof Error ? e.message : String(e)}`; } } record.finishedAt = now(); stageData.finishedAt = record.finishedAt; try { await snapshot(cwd, diffs, `${stage}-${attempt}`); } catch (e) { if (record.status !== "aborted") { record.status = "failed"; stageData.status = "failed"; snapshotSucceeded = false; record.error = `stage snapshot failed: ${e instanceof Error ? e.message : String(e)}`; stageResult.valid = false; stageResult.positive = false; stageResult.text = ""; } } if (signal?.aborted && pane?.paneId) { abortWork ??= interrupt(pane.paneId); const stopped = await abortWork; if (!stopped) record.error = record.error || "abort could not be confirmed"; } const finalized = finalizeStage(stageResult, snapshotSucceeded); stageResult.valid = finalized.valid; stageResult.positive = finalized.positive; stageResult.text = finalized.text; signal?.removeEventListener("abort", abortHandler); await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); }
     };
-    const finish = async (outcome: string) => { if (signal?.aborted) { if (activePane && !(await interrupt(activePane))) metadata.abortError = "Herdr could not confirm the active pane became idle"; outcome = "ABORTED"; } metadata.finishedAt = now(); metadata.outcome = outcome; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); return { content: [{ type: "text", text: `${outcome}\nArtifacts: ${artifactDir}\nVisible panes remain open.` }], details: { outcome, artifactDir, panes: metadata.panes } }; };
+    const finish = async (outcome: string) => { if (signal?.aborted) { if (activePane && !(await interrupt(activePane))) metadata.abortError = "Herdr could not confirm the active pane became idle"; outcome = "ABORTED"; } metadata.finishedAt = now(); metadata.outcome = outcome; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); return { content: [{ type: "text", text: `${outcome}\nArtifacts: ${artifactDir}\n${outcome === "SUCCESS" ? "Cleanup decision pending." : "Worker panes remain open."}` }], details: { outcome, artifactDir, panes: metadata.panes } }; };
     const implemented = await runStage("implement", promptFor("implement", task, artifactDir, plan, "", "", 1), 1); if (!implemented.positive) return finish(signal?.aborted ? "ABORTED" : "IMPLEMENTATION_FAILED");
     let cycle = 0;
     let verified = await runStage("verify", promptFor("verify", task, artifactDir, plan, "", "", 1), 1); verification = verified.text;
@@ -128,6 +132,15 @@ export default function (pi: ExtensionAPI) {
     if (!verified.positive) { if (flowAfterVerification(verified, cycle, input.maxRepairCycles ?? 1)[0] !== "implement") return finish(verified.valid ? "CHANGES_REQUIRED" : "VERIFICATION_FAILED"); cycle = 1; metadata.repairCycles = cycle; const repair = await runStage("implement", promptFor("implement", task, artifactDir, plan, verification, "", 2), 2); if (!repair.positive) return finish(signal?.aborted ? "ABORTED" : "REPAIR_FAILED"); verified = await runStage("verify", promptFor("verify", task, artifactDir, plan, "", "", 2), 2); verification = verified.text; if (!verified.positive) return finish(signal?.aborted ? "ABORTED" : verified.valid ? "CHANGES_REQUIRED" : "VERIFICATION_FAILED"); }
     let reviewed = await runStage("review", promptFor("review", task, artifactDir, plan, verification, "", 1), 1); review = reviewed.text; if (!reviewed.valid) return finish(signal?.aborted ? "ABORTED" : "REVIEW_FAILED");
     if (!reviewed.positive) { if (flowAfterReview(reviewed, cycle, input.maxRepairCycles ?? 1)[0] !== "implement") return finish(reviewed.valid ? "CHANGES_REQUIRED" : "REVIEW_FAILED"); cycle = 1; metadata.repairCycles = cycle; const repair = await runStage("implement", promptFor("implement", task, artifactDir, plan, verification, review, 3), 3); if (!repair.positive) return finish(signal?.aborted ? "ABORTED" : "REPAIR_FAILED"); verified = await runStage("verify", promptFor("verify", task, artifactDir, plan, "", "", 3), 3); verification = verified.text; if (!verified.positive) return finish(signal?.aborted ? "ABORTED" : verified.valid ? "CHANGES_REQUIRED" : "VERIFICATION_FAILED"); reviewed = await runStage("review", promptFor("review", task, artifactDir, plan, verification, review, 2), 2); review = reviewed.text; if (!reviewed.positive) return finish(signal?.aborted ? "ABORTED" : reviewed.valid ? "CHANGES_REQUIRED" : "REVIEW_FAILED"); }
-    if (signal?.aborted) return finish("ABORTED"); return finish("SUCCESS");
+    if (signal?.aborted) return finish("ABORTED");
+    const finalResult: any = await finish("SUCCESS"); let cleanupMessage = cleanupMode === "never" ? "Cleanup disabled; all worker panes remain open." : "Cleanup declined; all worker panes remain open.";
+    let confirmed = false;
+    try { confirmed = cleanupMode === "ask" && ctx.hasUI ? await ctx.ui.confirm("Close pipeline panes?", "Close only this run's idle worker panes?") : false;
+      if (shouldCleanup("SUCCESS", cleanupMode, ctx.hasUI, confirmed)) {
+        try { const cleanup = await cleanupRun(artifactDir, path.join(rootDir(), "artifacts"), process.env.HERDR_PANE_ID); cleanupMessage = cleanup.results.every((r: any) => r.status === "closed") ? "Cleanup complete; all worker panes were closed." : `Cleanup partial; worker panes remain where not closed. ${cleanup.summary}`; finalResult.details.cleanup = cleanup; }
+        catch (error) { const message = error instanceof Error ? error.message : String(error); await recordCleanupFailure(artifactDir, path.join(rootDir(), "artifacts"), message); cleanupMessage = `Cleanup failed; all worker panes remain open where not already closed. ${message}`; finalResult.details.cleanupError = message; }
+      } else if (cleanupMode === "ask" && !ctx.hasUI) cleanupMessage = "Cleanup unavailable without a usable UI; all worker panes remain open. Use development_pipeline_cleanup later.";
+    } catch (error) { const message = error instanceof Error ? error.message : String(error); await recordCleanupFailure(artifactDir, path.join(rootDir(), "artifacts"), message); cleanupMessage = `Cleanup confirmation failed; all worker panes remain open. ${message}`; finalResult.details.cleanupError = message; }
+    finalResult.content[0].text = finalResult.content[0].text.replace("Cleanup decision pending.", cleanupMessage); return finalResult;
   });
 }
