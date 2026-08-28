@@ -12,6 +12,7 @@ import { shouldCleanup } from "./cleanup-policy.ts";
 import { monitorPane, routeMonitorFailure } from "./pane-monitor.ts";
 export { routeMonitorFailure } from "./pane-monitor.ts";
 export function abortBeforePaneStart() { return { status: "aborted" as const, evidence: "pipeline aborted before pane startup; no child was started; pane preserved" }; }
+export function shouldSplitForAttempt(paneId: string) { return paneId.length === 0; }
 
 const MODELS = { plan: "openai-codex/gpt-5.6-sol", implement: "openai-codex/gpt-5.6-luna", verify: "openai-codex/gpt-5.6-terra", review: "openai-codex/gpt-5.6-sol" } as const;
 type Stage = "plan" | "implement" | "verify" | "review";
@@ -20,6 +21,9 @@ type Input = { task: string; approvedPlan: string; cwd?: string; maxRepairCycles
 type CommandResult = { code: number; stdout: string; stderr: string };
 type Attempt = { attempt: number; status: StageStatus; startedAt: string; finishedAt?: string; reportFile: string; paneId: string; verdict?: string; error?: string };
 type Pane = { paneId: string; name: string; model: string; attempts: Attempt[] };
+type LayoutCommand = (program: string, args: string[]) => Promise<CommandResult>;
+const ROLE_LABELS = ["Implement · Luna", "Verify · Terra", "Review · Sol"] as const;
+function shellQuote(value: string) { return "'" + value.replaceAll("'", "'\\''") + "'"; }
 
 const STAGE_TIMEOUT_MS = Number(process.env.YORISHIRO_STAGE_TIMEOUT_MS ?? 30 * 60 * 1000);
 const STARTUP_GRACE_MS = Number(process.env.YORISHIRO_STARTUP_GRACE_MS ?? 15 * 1000);
@@ -34,6 +38,14 @@ function rootDir() { return process.env.YORISHIRO_ROOT ?? path.resolve(path.dirn
 function now() { return new Date().toISOString(); }
 function json(value: unknown) { return JSON.stringify(value, null, 2); }
 async function atomicWrite(file: string, content: string) { const tmp = `${file}.tmp-${process.pid}`; await fs.writeFile(tmp, content, { encoding: "utf8", mode: 0o600 }); await fs.rename(tmp, file); }
+export async function clearLaunchersAfterCleanup(artifactDir: string) {
+  const runFile = path.join(artifactDir, "run.json");
+  const audited = JSON.parse(await fs.readFile(runFile, "utf8"));
+  for (const file of audited.launchers ?? []) await fs.rm(path.join(artifactDir, file), { force: true });
+  audited.launchers = [];
+  await atomicWrite(runFile, json(audited));
+  return audited;
+}
 function command(program: string, args: string[], cwd?: string, signal?: AbortSignal, env?: Record<string, string>): Promise<CommandResult> {
   return new Promise((resolve) => {
     const child = spawn(program, args, { cwd, shell: false, env: env ? { ...process.env, ...env } : undefined, stdio: ["ignore", "pipe", "pipe"] });
@@ -50,15 +62,59 @@ function field(value: unknown, name: string): string | undefined { if (!value ||
 function exactVerdict(text: string, choices: string[]): string | undefined { const lines = text.trim().split(/\r?\n/).map(x => x.trim()); if (!lines.length || lines.filter(x => /^VERDICT: /.test(x)).length !== 1) return undefined; const last = lines.at(-1)!; return choices.includes(last.slice("VERDICT: ".length)) ? last : undefined; }
 async function snapshot(cwd: string, dir: string, name: string) { const s = await command("git", ["status", "--short"], cwd), u = await command("git", ["diff", "--no-ext-diff"], cwd), st = await command("git", ["diff", "--cached", "--no-ext-diff"], cwd); if (s.code || u.code || st.code) throw new Error(`git snapshot failed: ${s.stderr || u.stderr || st.stderr}`); await atomicWrite(path.join(dir, `${name}-status.txt`), s.stdout); await atomicWrite(path.join(dir, `${name}-diff.patch`), `${u.stdout}\n\n# --- staged diff ---\n${st.stdout}`); }
 async function paneGet(id: string) { return parse(await command("herdr", ["pane", "get", id])); }
-export async function interrupt(id: string, run: (program: string, args: string[]) => Promise<CommandResult> = (program, args) => command(program, args), getPane: (paneId: string) => Promise<unknown> = paneGet): Promise<boolean> { for (let attempt = 0; attempt < 2; attempt++) { const ctrl = await run("herdr", ["pane", "send-keys", id, "ctrl+c"]); const esc = await run("herdr", ["pane", "send-keys", id, "escape"]); const waited = await run("herdr", ["agent", "wait", id, "--status", "idle", "--timeout", "2000"]); const pane = await getPane(id); const status = field(pane, "agent_status"); if (!ctrl.code && !esc.code && !waited.code && (status === "idle" || status === "unknown")) return true; await new Promise(r => setTimeout(r, 250)); } return false; }
-async function startPane(stage: Stage, name: string, cwd: string, tab: string, workspace: string, prompt: string, reportPath: string) {
+function herdrEnvelope(result: CommandResult, operation: string): any {
+  if (result.code) throw new Error(`Herdr ${operation} failed: ${result.stderr || result.stdout || `exit ${result.code}`}`);
+  const value = parse(result), payload = value?.result;
+  if (!payload || typeof payload !== "object") throw new Error(`Herdr ${operation} returned an invalid response envelope`);
+  return payload;
+}
+export async function splitPane(target: string, direction: "right" | "down", ratio: string, cwd: string, run: LayoutCommand = (program, args) => command(program, args)) {
+  const payload = herdrEnvelope(await run("herdr", ["pane", "split", target, "--direction", direction, "--ratio", ratio, "--cwd", cwd, "--no-focus"]), `pane split ${target}`);
+  const paneId = payload.pane?.pane_id;
+  if (typeof paneId !== "string" || !paneId) throw new Error(`Herdr pane split ${target} did not return a pane ID`);
+  return { paneId, payload };
+}
+export async function inspectLayout(parent: string, run: LayoutCommand = (program, args) => command(program, args)) {
+  const payload = herdrEnvelope(await run("herdr", ["pane", "layout", "--pane", parent]), "pane layout");
+  if (!Array.isArray(payload.layout?.panes) || !Array.isArray(payload.layout?.splits)) throw new Error("Herdr pane layout returned no layout geometry");
+  return payload.layout;
+}
+export function validateGeometry(layout: any, parent: string, workers: string[], expectedDirections: string[], expectedRatios: number[]) {
+  const panes = layout.panes.map((p: any) => p?.pane_id);
+  if (panes.length !== workers.length + 1 || ![parent, ...workers].every(id => panes.includes(id))) throw new Error("Herdr layout geometry has unexpected panes");
+  const splits = layout.splits;
+  if (splits.length < expectedDirections.length) throw new Error("Herdr layout geometry has too few splits");
+  expectedDirections.forEach((direction, i) => { const split = splits[i]; if (split.direction !== direction || Math.abs(split.ratio - expectedRatios[i]) > 0.01) throw new Error(`Herdr layout split ${i} was not ${direction} at the requested ratio`); });
+  if (layout.zoomed !== false) throw new Error("Herdr layout unexpectedly changed zoom state");
+}
+async function renameDetectedPane(id: string, label: string) {
+  const payload = herdrEnvelope(await command("herdr", ["pane", "rename", id, label]), `pane rename ${id}`);
+  if (payload.type !== "ok") throw new Error(`Herdr pane rename ${id} was not confirmed`);
+}
+async function writeLauncher(dir: string, stage: Stage, name: string, prompt: string, cwd: string, reportPath: string) {
+  const promptFile = path.join(dir, `${stage}-prompt.md`), launcher = path.join(dir, `${stage}-launcher.sh`);
+  await fs.writeFile(promptFile, prompt, { encoding: "utf8", mode: 0o700 });
   const reporter = path.join(rootDir(), "extensions", "development-pipeline", "stage-reporter.ts");
   const verifier = path.join(rootDir(), "extensions", "development-pipeline", "verifier-tools.ts");
-  const extensions = stage === "verify" ? ["-e", reporter, "-e", verifier] : ["-e", reporter];
-  const env = ["--env", `YORISHIRO_REPORT_PATH=${reportPath}`, "--env", `YORISHIRO_REPORT_STAGE=${stage}`]; if (stage === "verify") env.push("--env", `YORISHIRO_TARGET_CWD=${cwd}`);
-  const args = ["agent", "start", name, "--cwd", cwd, "--workspace", workspace, "--tab", tab, "--split", "right", "--no-focus", ...env, "--", "pi", "--name", name, "--model", MODELS[stage], "--tools", INFO[stage].tools, "--no-extensions", "--no-skills", ...extensions, prompt];
-  const result = await command("herdr", args, cwd); if (result.code) throw new Error(`Herdr could not start ${name}: ${result.stderr || result.stdout}`);
-  const id = field(parse(result), "pane_id"); if (!id) throw new Error(`Herdr did not return a pane id for ${name}`); return id;
+  const target = stage === "verify" ? `export YORISHIRO_TARGET_CWD=${shellQuote(cwd)}\n` : "";
+  const script = `#!/bin/sh\nset -eu\nexport YORISHIRO_REPORT_PATH=${shellQuote(reportPath)}\nexport YORISHIRO_REPORT_STAGE=${shellQuote(stage)}\n${target}prompt=$(cat -- ${shellQuote(promptFile)})\nexec pi --name ${shellQuote(name)} --model ${shellQuote(MODELS[stage])} --tools ${shellQuote(INFO[stage].tools)} --no-extensions --no-skills -e ${shellQuote(reporter)}${stage === "verify" ? ` -e ${shellQuote(verifier)}` : ""} "$prompt"\n`;
+  await fs.writeFile(launcher, script, { encoding: "utf8", mode: 0o700 });
+  return { promptFile, launcher };
+}
+export async function interrupt(id: string, run: (program: string, args: string[]) => Promise<CommandResult> = (program, args) => command(program, args), getPane: (paneId: string) => Promise<unknown> = paneGet): Promise<boolean> { for (let attempt = 0; attempt < 2; attempt++) { const ctrl = await run("herdr", ["pane", "send-keys", id, "ctrl+c"]); const esc = await run("herdr", ["pane", "send-keys", id, "escape"]); const waited = await run("herdr", ["agent", "wait", id, "--status", "idle", "--timeout", "2000"]); const pane = await getPane(id); const status = field(pane, "agent_status"); if (!ctrl.code && !esc.code && !waited.code && (status === "idle" || status === "unknown")) return true; await new Promise(r => setTimeout(r, 250)); } return false; }
+async function startPane(stage: Stage, name: string, cwd: string, parent: string, tab: string, prompt: string, reportPath: string, workers: string[], artifactDir: string, onPaneCreated: (paneId: string, files: { promptFile: string; launcher: string }) => Promise<void>) {
+  const layoutIndex = workers.length;
+  const target = layoutIndex === 0 ? parent : workers.at(-1)!;
+  const direction = layoutIndex === 0 ? "right" as const : "down" as const;
+  const ratio = layoutIndex === 0 ? "0.55" : layoutIndex === 1 ? "0.3333333333" : "0.5";
+  const files = await writeLauncher(artifactDir, stage, name, prompt, cwd, reportPath);
+  const split = await splitPane(target, direction, ratio, cwd);
+  await onPaneCreated(split.paneId, files);
+  const launched = await command("herdr", ["pane", "run", split.paneId, shellQuote(files.launcher)]);
+  if (launched.code) throw new Error(`Herdr pane run ${split.paneId} failed: ${launched.stderr || launched.stdout || `exit ${launched.code}`}`);
+  const layout = await inspectLayout(parent);
+  validateGeometry(layout, parent, [...workers, split.paneId], ["right", ...(layoutIndex > 0 ? ["down"] : []), ...(layoutIndex > 1 ? ["down"] : [])], [0.55, ...(layoutIndex > 0 ? [0.3333333333] : []), ...(layoutIndex > 1 ? [0.5] : [])]);
+  return { paneId: split.paneId, layout, files };
 }
 async function sendPrompt(id: string, prompt: string) { const sent = await command("herdr", ["pane", "send-text", id, prompt]); if (sent.code) throw new Error(`Could not send prompt: ${sent.stderr || sent.stdout}`); const enter = await command("herdr", ["pane", "send-keys", id, "enter"]); if (enter.code) throw new Error(`Could not submit prompt: ${enter.stderr || enter.stdout}`); }
 async function captureTranscript(id: string, file: string) { const result = await command("herdr", ["agent", "read", id, "--source", "recent-unwrapped", "--lines", "200", "--format", "text"]); if (result.code) throw new Error(`Herdr transcript capture failed: ${result.stderr || result.stdout}`); await atomicWrite(file, result.stdout); }
@@ -105,6 +161,7 @@ export default function (pi: ExtensionAPI) {
     await atomicWrite(path.join(artifactDir, "request.md"), `# Request\n\n${task}\n\nTarget: ${cwd}\n`); await atomicWrite(path.join(artifactDir, "approved-plan.md"), `# Approved plan\n\n${approvedPlan}\n`); await snapshot(cwd, diffs, "baseline");
     const metadata: any = { targetRepository: path.basename(cwd), targetPath: cwd, startedAt: now(), parentPaneId: process.env.HERDR_PANE_ID, tabId: process.env.HERDR_TAB_ID, workspaceId: process.env.HERDR_WORKSPACE_ID, limitation: "Baseline captures pre-existing dirty changes; attribution is not perfect.", planning: { status: "passed", source: "parent Sol conversation", artifact: "approved-plan.md" }, stages: Object.fromEntries(stages.filter(s => s !== "plan").map(s => [s, { status: "pending", attempts: [] }])), panes: [], repairCycles: 0 };
     await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
+    const parentPaneId = metadata.parentPaneId as string;
     const emit = (stage: string, text: string) => onUpdate?.({ content: [{ type: "text", text: `${stage}: ${text}` }], details: { stage, artifactDir, panes: metadata.panes } });
     let activePane: string | undefined, abortWork: Promise<boolean> | undefined, plan = approvedPlan, verification = "", review = "";
     const runStage = async (stage: Stage, text: string, attempt: number): Promise<{ valid: boolean; positive: boolean; verdict?: string; text: string }> => {
@@ -117,13 +174,28 @@ export default function (pi: ExtensionAPI) {
       try {
         if (signal?.aborted) { const result = abortBeforePaneStart(); record.status = result.status; stageData.status = result.status; record.error = result.evidence; return { valid: false, positive: false, text: "" }; }
         await fs.rm(pendingReport, { force: true });
-        if (!pane.paneId) { pane.paneId = await startPane(stage, pane.name, cwd, process.env.HERDR_TAB_ID!, process.env.HERDR_WORKSPACE_ID!, text, pendingReport); record.paneId = pane.paneId; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); }
-        else { record.paneId = pane.paneId; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); await sendPrompt(pane.paneId, text); }
+        if (shouldSplitForAttempt(pane.paneId)) {
+          const workerIds = metadata.panes.filter((p: Pane) => p.paneId).map((p: Pane) => p.paneId);
+          try {
+            const started = await startPane(stage, pane.name, cwd, parentPaneId, process.env.HERDR_TAB_ID!, text, pendingReport, workerIds, artifactDir, async (paneId, files) => {
+              pane.paneId = paneId;
+              record.paneId = paneId;
+              metadata.launchers = [...(metadata.launchers ?? []), ...[files.launcher, files.promptFile].map(file => path.basename(file))];
+              await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
+            });
+            metadata.layout = { ...(metadata.layout ?? {}), intended: { parentPaneId, roleOrder: ROLE_LABELS }, actual: started.layout, error: undefined };
+          } catch (error) {
+            metadata.layout = { ...(metadata.layout ?? {}), intended: { parentPaneId, roleOrder: ROLE_LABELS }, error: error instanceof Error ? error.message : String(error) };
+            throw error;
+          }
+          await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
+        } else { record.paneId = pane.paneId; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); await sendPrompt(pane.paneId, text); }
         if (signal?.aborted) { const result = await routeMonitorFailure("aborted", abortWork ? () => abortWork! : () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
         activePane = pane.paneId; emit(stage, `${pane.paneId} (${pane.name}), attempt ${attempt}`);
         const state = await waitPane(pane.paneId, pendingReport, signal, m => emit(stage, m)); if (state === "aborted" || signal?.aborted) { const result = await routeMonitorFailure("aborted", abortWork ? () => abortWork! : () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
         if (state === "startup-timeout" || state === "timeout" || state === "process-info-failure") { const result = await routeMonitorFailure(state, () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
         if (state !== "settled") { record.status = "failed"; stageData.status = "failed"; record.error = `pane ${state}; pane preserved`; return { valid: false, positive: false, text: "" }; }
+        await renameDetectedPane(pane.paneId, pane.name);
         await captureTranscript(pane.paneId, terminalFile); terminalCaptured = true;
         const submitted = await fs.readFile(pendingReport, "utf8"); await atomicWrite(reportFile, `# ${stage} report (attempt ${attempt})\n\n${submitted.replace(/^# .*?\n\n/, "")}`); await fs.rm(pendingReport, { force: true });
         let report = ""; try { report = await fs.readFile(reportFile, "utf8"); } catch { record.error = "missing durable report"; }
@@ -145,7 +217,7 @@ export default function (pi: ExtensionAPI) {
     let confirmed = false;
     try { confirmed = cleanupMode === "ask" && ctx.hasUI ? await ctx.ui.confirm("Close pipeline panes?", "Close only this run's idle worker panes?") : false;
       if (shouldCleanup("SUCCESS", cleanupMode, ctx.hasUI, confirmed)) {
-        try { const cleanup = await cleanupRun(artifactDir, path.join(rootDir(), "artifacts"), process.env.HERDR_PANE_ID); cleanupMessage = cleanup.results.every((r: any) => r.status === "closed") ? "Cleanup complete; all worker panes were closed." : `Cleanup partial; worker panes remain where not closed. ${cleanup.summary}`; finalResult.details.cleanup = cleanup; }
+        try { const cleanup = await cleanupRun(artifactDir, path.join(rootDir(), "artifacts"), parentPaneId); const allClosed = cleanup.results.length > 0 && cleanup.results.every((r: any) => r.status === "closed"); cleanupMessage = allClosed ? "Cleanup complete; all worker panes were closed." : `Cleanup partial; worker panes remain where not closed. ${cleanup.summary}`; finalResult.details.cleanup = cleanup; if (allClosed) { const audited = await clearLaunchersAfterCleanup(artifactDir); metadata.cleanup = audited.cleanup; metadata.launchers = []; } }
         catch (error) { const message = error instanceof Error ? error.message : String(error); await recordCleanupFailure(artifactDir, path.join(rootDir(), "artifacts"), message); cleanupMessage = `Cleanup failed; all worker panes remain open where not already closed. ${message}`; finalResult.details.cleanupError = message; }
       } else if (cleanupMode === "ask" && !ctx.hasUI) cleanupMessage = "Cleanup unavailable without a usable UI; all worker panes remain open. Use development_pipeline_cleanup later.";
     } catch (error) { const message = error instanceof Error ? error.message : String(error); await recordCleanupFailure(artifactDir, path.join(rootDir(), "artifacts"), message); cleanupMessage = `Cleanup confirmation failed; all worker panes remain open. ${message}`; finalResult.details.cleanupError = message; }

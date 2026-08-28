@@ -1,10 +1,15 @@
+---
+name: development-pipeline
+description: Run the approved development pipeline in stable Herdr worker panes with auditable reports and cleanup safeguards.
+---
+
 # Development pipeline
 
 Use `development_pipeline` only after requirements and an implementation plan are approved in the parent Sol conversation. Pass both the task and approved plan; the tool does not spawn a duplicate planner. Do not duplicate implementation in the parent agent.
 
 ## Herdr requirement
 
-The parent Pi must be running inside Herdr. The extension requires `HERDR_PANE_ID`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID`, and `HERDR_SOCKET_PATH`; it fails clearly when Herdr is absent. It splits the **current tab** to the right, leaves the parent pane intact, uses `--no-focus`, and never closes or zooms panes. The user can focus, resize, zoom, or manually close completed panes in Herdr. The official Pi Herdr integration is optional and is not installed or changed by Yorishiro.
+The parent Pi must be running inside Herdr. The extension requires `HERDR_PANE_ID`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID`, and `HERDR_SOCKET_PATH`; it fails clearly when Herdr is absent. It constructs the **current tab** layout with explicit `pane split` calls, leaves the parent pane intact, launches each interactive Pi in its allocated shell pane, uses `--no-focus`, and never closes or zooms panes. The user can focus, resize, zoom, or manually close completed panes in Herdr. The official Pi Herdr integration is optional and is not installed or changed by Yorishiro.
 
 ## Visible stages
 

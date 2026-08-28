@@ -15,8 +15,14 @@ const a = process.argv.slice(2), scenario = process.env.FAKE_HERDR_SCENARIO;
 const log = process.env.FAKE_HERDR_LOG;
 const stopped = fs.existsSync(process.env.FAKE_HERDR_STOP_FILE);
 fs.appendFileSync(log, JSON.stringify(a) + "\\n");
+const starts = fs.readFileSync(log, "utf8").split("\\n").filter(Boolean).map(line => JSON.parse(line)).filter(args => args[0] === "agent" && args[1] === "start").map(args => "fake:" + args[2].toLowerCase());
 if (a[0] === "status") process.stdout.write("{}\\n");
-else if (a[0] === "agent" && a[1] === "start") process.stdout.write('{"pane_id":"fake:pane"}\\n');
+else if (a[0] === "agent" && a[1] === "start") process.stdout.write(JSON.stringify({pane_id:"fake:" + a[2].toLowerCase()}) + "\\n");
+else if (a[0] === "pane" && a[1] === "split") { const id = "fake:split" + (fs.readFileSync(log, "utf8").split("\\n").filter(Boolean).map(line => JSON.parse(line)).filter(args => args[0] === "pane" && args[1] === "split").length); process.stdout.write(JSON.stringify({id:"cli:pane:split",result:{pane:{pane_id:id}}}) + "\\n"); }
+else if (a[0] === "pane" && a[1] === "run") process.stdout.write("");
+else if (a[0] === "pane" && a[1] === "rename") process.stdout.write(JSON.stringify({id:"cli:pane:rename",result:{type:"ok"}}) + "\\n");
+else if (a[0] === "pane" && a[1] === "layout" && scenario === "layout-failure") process.exit(8);
+else if (a[0] === "pane" && a[1] === "layout") { const n = fs.readFileSync(log, "utf8").split("\\n").filter(Boolean).map(line => JSON.parse(line)).filter(args => args[0] === "pane" && args[1] === "split").length; const panes = ["parent",...Array.from({length:n}, (_, i) => "fake:split" + (i + 1))]; const splits = [{direction:"right",ratio:0.55},{direction:"down",ratio:0.33333334},{direction:"down",ratio:0.5}].slice(0,n); process.stdout.write(JSON.stringify({id:"cli:pane:layout",result:{layout:{panes:panes.map(pane_id => ({pane_id})),splits,zoomed:false}}}) + "\\n"); }
 else if (a[0] === "pane" && a[1] === "get") process.stdout.write(stopped ? '{"agent_status":"idle"}\\n' : '{"agent_status":"running"}\\n');
 else if (a[0] === "agent" && a[1] === "read") process.stdout.write("fake transcript\\n");
 else if (a[0] === "pane" && a[1] === "send-keys" && a[3] === "ctrl+c") fs.writeFileSync(process.env.FAKE_HERDR_STOP_FILE, "1");
@@ -50,6 +56,7 @@ async function executeScenario(scenario, aborted = false) {
   await writeFile(log, "");
   await rm(stopFile, { force: true });
   process.env.FAKE_HERDR_SCENARIO = scenario;
+  process.env.FAKE_HERDR_STARTS = "";
   const controller = new AbortController();
   if (aborted) controller.abort();
   const result = await pipeline.execute("test", { task: "routing test", approvedPlan: "approved", cwd: root, cleanupMode: "never" }, controller.signal, update => {
@@ -62,14 +69,22 @@ async function executeScenario(scenario, aborted = false) {
   return { result, metadata, calls };
 }
 
-for (const [scenario, expectedError] of [["startup", /startup deadline expired/], ["normal", /stage deadline expired/], ["failure", /process-info remained unavailable or invalid/]]) {
+for (const [scenario, expectedError] of [["startup", /startup deadline expired/], ["normal", /stage deadline expired/], ["failure", /process-info remained unavailable or invalid/], ["layout-failure", /Herdr pane layout failed/]]) {
   const { metadata, calls } = await executeScenario(scenario);
   const attempt = metadata.stages.implement.attempts[0];
   assert.equal(metadata.stages.implement.status, "failed");
   assert.equal(attempt.status, "failed");
+  assert.equal(metadata.outcome, "IMPLEMENTATION_FAILED");
+  if (scenario === "layout-failure") assert.match(metadata.layout.error, /Herdr pane layout failed/);
+  else assert.equal(metadata.layout.error, undefined);
+  assert.equal(metadata.panes[0].paneId, "fake:split1");
   assert.match(attempt.error, expectedError);
-  assert.equal(calls.filter(a => a[0] === "agent" && a[1] === "start").length, 1);
-  assert.deepEqual(calls.filter(a => a[0] === "pane" && a[1] === "send-keys").map(a => a.slice(2)), [["fake:pane", "ctrl+c"], ["fake:pane", "escape"]]);
+  assert.equal(calls.filter(a => a[0] === "agent" && a[1] === "start").length, 0);
+  assert.deepEqual(calls.filter(a => a[0] === "pane" && a[1] === "split").map(a => a.slice(2)), [["parent", "--direction", "right", "--ratio", "0.55", "--cwd", root, "--no-focus"]]);
+  assert.equal(calls.filter(a => a[0] === "pane" && a[1] === "run").length, 1);
+  assert.equal(calls.filter(a => a[0] === "pane" && a[1] === "layout").length, 1);
+  const interrupts = calls.filter(a => a[0] === "pane" && a[1] === "send-keys").map(a => a.slice(2));
+  assert.deepEqual(interrupts, scenario === "layout-failure" ? [] : [["fake:split1", "ctrl+c"], ["fake:split1", "escape"]]);
   assert.equal(calls.filter(a => a[0] === "pane" && a[1] === "close").length, 0);
 }
 
@@ -77,8 +92,8 @@ const inFlight = await executeScenario("abort");
 assert.equal(inFlight.metadata.stages.implement.status, "aborted");
 assert.equal(inFlight.metadata.stages.implement.attempts[0].status, "aborted");
 assert.match(inFlight.metadata.stages.implement.attempts[0].error, /pipeline aborted; active child stopped; pane preserved/);
-assert.equal(inFlight.calls.filter(a => a[0] === "agent" && a[1] === "start").length, 1);
-assert.deepEqual(inFlight.calls.filter(a => a[0] === "pane" && a[1] === "send-keys").map(a => a.slice(2)), [["fake:pane", "ctrl+c"], ["fake:pane", "escape"]]);
+assert.equal(inFlight.calls.filter(a => a[0] === "agent" && a[1] === "start").length, 0);
+assert.deepEqual(inFlight.calls.filter(a => a[0] === "pane" && a[1] === "send-keys").map(a => a.slice(2)), [["fake:split1", "ctrl+c"], ["fake:split1", "escape"]]);
 assert.equal(inFlight.calls.filter(a => a[0] === "pane" && a[1] === "close").length, 0);
 
 const before = await executeScenario("abort", true);
