@@ -1,0 +1,14 @@
+import assert from "node:assert/strict";
+const { finalizeStage, flowAfterVerification, flowAfterReview } = await import("../extensions/development-pipeline/pipeline-flow.ts");
+const fail = { valid: true, positive: false, verdict: "VERDICT: FAIL", text: "" };
+const malformed = { valid: false, positive: false, text: "" };
+const pass = { valid: true, positive: true, verdict: "VERDICT: PASS", text: "" };
+assert.deepEqual(flowAfterVerification(fail, 0, 1), ["implement", "verify"]);
+assert.deepEqual(flowAfterVerification(fail, 1, 1), ["terminal"]);
+assert.deepEqual(flowAfterVerification(malformed, 0, 1), ["terminal"]);
+assert.deepEqual(flowAfterVerification(pass, 0, 1), ["review"]);
+assert.deepEqual(flowAfterReview({ ...fail, verdict: "VERDICT: CHANGES_REQUESTED" }, 0, 1), ["implement", "verify", "review"]);
+assert.deepEqual(flowAfterReview({ ...fail, verdict: "VERDICT: CHANGES_REQUESTED" }, 1, 1), ["terminal"]);
+assert.equal(finalizeStage(pass, false).positive, false, "snapshot failure must prevent success");
+assert.equal(finalizeStage(pass, true).positive, true);
+console.log("integrated pipeline flow test passed");

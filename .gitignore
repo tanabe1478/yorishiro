@@ -9,6 +9,10 @@ AGENTS.local.md
 work/*
 !work/.gitkeep
 
+# Development pipeline run artifacts
+artifacts/*
+!artifacts/.gitkeep
+
 # Local environment and OS files
 .env
 .env.*

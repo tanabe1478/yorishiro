@@ -1,6 +1,15 @@
 {
   "name": "yorishiro",
   "private": true,
+  "scripts": {
+    "test:reporter": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/reporter-extension-load.mjs",
+    "test:pipeline-control": "node --experimental-strip-types ./test/pipeline-control.mjs",
+    "test:pipeline-flow": "node --experimental-strip-types ./test/pipeline-flow.mjs",
+    "test:verifier-boundary": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/verifier-boundary-load.mjs",
+    "test:verifier-runtime": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/verifier-runtime.mjs",
+    "test:sandbox-preflight": "node --experimental-strip-types ./test/sandbox-preflight.mjs",
+    "test": "npm run test:reporter && npm run test:pipeline-control && npm run test:pipeline-flow && npm run test:verifier-boundary && npm run test:verifier-runtime && npm run test:sandbox-preflight"
+  },
   "description": "A personal harness layered on top of pi",
   "keywords": ["pi-package"],
   "pi": {

@@ -36,6 +36,23 @@ cd work/example
 
 ランチャーは起動時のカレントディレクトリを維持したまま、yorishiroのSkillとExtensionを追加します。piのホームやセッション保存先は変更しません。
 
+## 開発パイプライン
+
+要件と実装計画が親Sol会話で承認済みの作業は `development_pipeline` ツールへ委譲できます。親エージェントが実装を重複して行わず、承認済みのタスクと計画を渡してください。計画用の子ペインは作りません。
+
+| 役割 | 固定モデル | 権限 |
+|---|---|---|
+| 計画・調査・要件（親Sol会話） | `openai-codex/gpt-5.6-sol` | 親会話で実施 |
+| 実装 | `openai-codex/gpt-5.6-luna` | coding tools |
+| 検証 | `openai-codex/gpt-5.6-terra` | read, grep, find, ls, sandboxed verification command |
+| レビュー | `openai-codex/gpt-5.6-sol` | read-only |
+
+パイプラインは **Herdr 上で起動した Pi からのみ**実行できます。計画は親Sol会話で承認済みである必要があり、実行時に `approvedPlan` として保存します。`HERDR_PANE_ID`、`HERDR_TAB_ID`、`HERDR_WORKSPACE_ID`、`HERDR_SOCKET_PATH` を検証し、現在のタブを右分割して各ステージの通常のインタラクティブ Pi TUI を表示します。親ペインは残り、自動フォーカス・ズーム・ペイン削除は行いません。各ペインのプロンプト、ツール呼び出し、編集、差分、テスト出力を直接確認できます。
+
+子ステージのペイン名は `Implement · Luna`、`Verify · Terra`、`Review · Sol` です。検証にはmacOSの`/usr/bin/sandbox-exec`、またはLinuxの`/usr/bin/bwrap`と利用可能なuser namespaceが必要です。その他のOS、sandbox未導入環境、`/tmp`配下の対象リポジトリは実装開始前に明確に拒否します。修復・再検証・再レビューは同じペインとPiセッションへ追加入力し、ペイン名を変えません。完了・失敗・中断後もペインは保持されるため、不要になったペインは Herdr で手動削除してください。Pi の公式 Herdr integration は現在未導入です。この実装は Herdr CLI 0.7.3 の画面・ペイン検出を使い、グローバル設定は変更しません。
+
+各ステージは、明示的にロードした `submit_stage_report` 拡張ツール（オーケストレータが選んだ pending パスだけへ原子的に書ける狭い報告機構）で、厳密な verdict を含む成果物を保存します。Verifyのコマンドはカーネル強制のread-only sandbox内で実行され、プロセスグループ単位でキャンセルされます。出力は64 KiBに制限され、ソースや報告を変更できません。Planは親Sol会話から供給し、子ペインを作りません。実行記録は `artifacts/<repository>/<run-id>/`（Git管理外）の `request.md`、レポート、`diffs/`、`run.json` にあり、ペイン ID と状態（pending/running/passed/failed/blocked/aborted）も記録されます。有効な検証 FAIL またはレビュー CHANGES_REQUESTED は最大1回だけ修復できます。欠落・不正レポート、プロセス失敗、タイムアウト、中断は終端失敗です。修復・再検証・再レビューは既存セッションで続行します。開始時の dirty tree は baseline として保存しますが、既存変更との帰属は完全には判定できません。
+
 ## 育て方
 
 1. まず `AGENTS.md` と設定だけで使う
