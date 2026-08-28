@@ -8,9 +8,11 @@
     "test:pipeline-flow": "node --experimental-strip-types ./test/pipeline-flow.mjs",
     "test:verifier-boundary": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/verifier-boundary-load.mjs",
     "test:verifier-runtime": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/verifier-runtime.mjs",
+    "test:pane-monitor": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/pane-monitor.mjs",
+    "test:pipeline-routing-extension": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/pipeline-routing-extension.mjs",
     "test:sandbox-preflight": "node --experimental-strip-types ./test/sandbox-preflight.mjs",
     "test:cleanup-policy": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/cleanup-policy.mjs",
-    "test": "npm run test:pi-extension-load && npm run test:reporter && npm run test:pipeline-control && npm run test:pipeline-flow && npm run test:verifier-boundary && npm run test:verifier-runtime && npm run test:sandbox-preflight && npm run test:cleanup-policy"
+    "test": "npm run test:pi-extension-load && npm run test:reporter && npm run test:pipeline-control && npm run test:pipeline-flow && npm run test:verifier-boundary && npm run test:verifier-runtime && npm run test:sandbox-preflight && npm run test:cleanup-policy && npm run test:pane-monitor && npm run test:pipeline-routing-extension"
   },
   "description": "A personal harness layered on top of pi",
   "keywords": ["pi-package"],

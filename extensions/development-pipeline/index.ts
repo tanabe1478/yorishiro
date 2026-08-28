@@ -9,6 +9,9 @@ import { preflightVerifierSandbox } from "./sandbox.ts";
 import { finalizeStage, flowAfterReview, flowAfterVerification } from "./pipeline-flow.ts";
 import { cleanupRun, registerCleanupTool, recordCleanupFailure } from "./cleanup.ts";
 import { shouldCleanup } from "./cleanup-policy.ts";
+import { monitorPane, routeMonitorFailure } from "./pane-monitor.ts";
+export { routeMonitorFailure } from "./pane-monitor.ts";
+export function abortBeforePaneStart() { return { status: "aborted" as const, evidence: "pipeline aborted before pane startup; no child was started; pane preserved" }; }
 
 const MODELS = { plan: "openai-codex/gpt-5.6-sol", implement: "openai-codex/gpt-5.6-luna", verify: "openai-codex/gpt-5.6-terra", review: "openai-codex/gpt-5.6-sol" } as const;
 type Stage = "plan" | "implement" | "verify" | "review";
@@ -18,7 +21,8 @@ type CommandResult = { code: number; stdout: string; stderr: string };
 type Attempt = { attempt: number; status: StageStatus; startedAt: string; finishedAt?: string; reportFile: string; paneId: string; verdict?: string; error?: string };
 type Pane = { paneId: string; name: string; model: string; attempts: Attempt[] };
 
-const STAGE_TIMEOUT_MS = 30 * 60 * 1000;
+const STAGE_TIMEOUT_MS = Number(process.env.YORISHIRO_STAGE_TIMEOUT_MS ?? 30 * 60 * 1000);
+const STARTUP_GRACE_MS = Number(process.env.YORISHIRO_STARTUP_GRACE_MS ?? 15 * 1000);
 const INFO: Record<Stage, { label: string; tools: string }> = {
   plan: { label: "Plan · Sol", tools: "read,grep,find,ls,submit_stage_report" },
   implement: { label: "Implement · Luna", tools: "read,grep,find,ls,bash,edit,write,submit_stage_report" },
@@ -44,10 +48,9 @@ function command(program: string, args: string[], cwd?: string, signal?: AbortSi
 function parse(value: CommandResult): any { try { return JSON.parse(value.stdout); } catch { return undefined; } }
 function field(value: unknown, name: string): string | undefined { if (!value || typeof value !== "object") return undefined; const r = value as Record<string, unknown>; if (typeof r[name] === "string") return r[name]; for (const v of Object.values(r)) { const x = field(v, name); if (x) return x; } return undefined; }
 function exactVerdict(text: string, choices: string[]): string | undefined { const lines = text.trim().split(/\r?\n/).map(x => x.trim()); if (!lines.length || lines.filter(x => /^VERDICT: /.test(x)).length !== 1) return undefined; const last = lines.at(-1)!; return choices.includes(last.slice("VERDICT: ".length)) ? last : undefined; }
-function hasPi(value: unknown): boolean { if (!value || typeof value !== "object") return false; const r = value as Record<string, unknown>; return r.argv0 === "pi" || Object.values(r).some(hasPi); }
 async function snapshot(cwd: string, dir: string, name: string) { const s = await command("git", ["status", "--short"], cwd), u = await command("git", ["diff", "--no-ext-diff"], cwd), st = await command("git", ["diff", "--cached", "--no-ext-diff"], cwd); if (s.code || u.code || st.code) throw new Error(`git snapshot failed: ${s.stderr || u.stderr || st.stderr}`); await atomicWrite(path.join(dir, `${name}-status.txt`), s.stdout); await atomicWrite(path.join(dir, `${name}-diff.patch`), `${u.stdout}\n\n# --- staged diff ---\n${st.stdout}`); }
 async function paneGet(id: string) { return parse(await command("herdr", ["pane", "get", id])); }
-async function interrupt(id: string): Promise<boolean> { for (let attempt = 0; attempt < 2; attempt++) { const ctrl = await command("herdr", ["pane", "send-keys", id, "ctrl-c"]); const esc = await command("herdr", ["pane", "send-keys", id, "escape"]); const waited = await command("herdr", ["agent", "wait", id, "--status", "idle", "--timeout", "2000"]); const pane = await paneGet(id); const status = field(pane, "agent_status"); if (!ctrl.code && !esc.code && !waited.code && (status === "idle" || status === "unknown")) return true; await new Promise(r => setTimeout(r, 250)); } return false; }
+export async function interrupt(id: string, run: (program: string, args: string[]) => Promise<CommandResult> = (program, args) => command(program, args), getPane: (paneId: string) => Promise<unknown> = paneGet): Promise<boolean> { for (let attempt = 0; attempt < 2; attempt++) { const ctrl = await run("herdr", ["pane", "send-keys", id, "ctrl+c"]); const esc = await run("herdr", ["pane", "send-keys", id, "escape"]); const waited = await run("herdr", ["agent", "wait", id, "--status", "idle", "--timeout", "2000"]); const pane = await getPane(id); const status = field(pane, "agent_status"); if (!ctrl.code && !esc.code && !waited.code && (status === "idle" || status === "unknown")) return true; await new Promise(r => setTimeout(r, 250)); } return false; }
 async function startPane(stage: Stage, name: string, cwd: string, tab: string, workspace: string, prompt: string, reportPath: string) {
   const reporter = path.join(rootDir(), "extensions", "development-pipeline", "stage-reporter.ts");
   const verifier = path.join(rootDir(), "extensions", "development-pipeline", "verifier-tools.ts");
@@ -60,17 +63,21 @@ async function startPane(stage: Stage, name: string, cwd: string, tab: string, w
 async function sendPrompt(id: string, prompt: string) { const sent = await command("herdr", ["pane", "send-text", id, prompt]); if (sent.code) throw new Error(`Could not send prompt: ${sent.stderr || sent.stdout}`); const enter = await command("herdr", ["pane", "send-keys", id, "enter"]); if (enter.code) throw new Error(`Could not submit prompt: ${enter.stderr || enter.stdout}`); }
 async function captureTranscript(id: string, file: string) { const result = await command("herdr", ["agent", "read", id, "--source", "recent-unwrapped", "--lines", "200", "--format", "text"]); if (result.code) throw new Error(`Herdr transcript capture failed: ${result.stderr || result.stdout}`); await atomicWrite(file, result.stdout); }
 async function waitPane(id: string, report: string, signal: AbortSignal | undefined, update: (s: string) => void) {
-  const deadline = Date.now() + STAGE_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    if (signal?.aborted) return "aborted" as const;
-    await command("herdr", ["agent", "wait", id, "--status", "idle", "--timeout", "1000"], undefined, signal);
-    const infoResult = await command("herdr", ["pane", "process-info", "--pane", id], undefined, signal);
-    const pane = await paneGet(id); const status = field(pane, "agent_status"); const info = parse(infoResult);
-    if (status === "idle" || status === "unknown") { if (!hasPi(info)) return "exited" as const; if (existsSync(report)) return "settled" as const; update(`pane ${id} is idle but report is not present yet`); }
-    else update(`pane ${id} is ${status ?? "starting"}`);
-    await new Promise(r => setTimeout(r, 1000));
-  }
-  return "timeout" as const;
+  return monitorPane({
+    reportExists: () => existsSync(report),
+    signal,
+    onUpdate: message => update(`pane ${id} ${message}`),
+    timeoutMs: STAGE_TIMEOUT_MS,
+    startupGraceMs: STARTUP_GRACE_MS,
+    pollIntervalMs: Number(process.env.YORISHIRO_POLL_INTERVAL_MS ?? 1000),
+    poll: async () => {
+      await command("herdr", ["agent", "wait", id, "--status", "idle", "--timeout", "1000"], undefined, signal);
+      const infoResult = await command("herdr", ["pane", "process-info", "--pane", id], undefined, signal);
+      const pane = await paneGet(id);
+      const processInfo = parse(infoResult);
+      return { status: field(pane, "agent_status"), processInfo, processInfoValid: !infoResult.code && processInfo !== undefined };
+    },
+  });
 }
 function promptFor(stage: Stage, task: string, dir: string, plan: string, verification: string, review: string, attempt: number) {
   const label = INFO[stage].label, report = path.join(dir, `${stage}-${attempt}.md`);
@@ -99,7 +106,7 @@ export default function (pi: ExtensionAPI) {
     const metadata: any = { targetRepository: path.basename(cwd), targetPath: cwd, startedAt: now(), parentPaneId: process.env.HERDR_PANE_ID, tabId: process.env.HERDR_TAB_ID, workspaceId: process.env.HERDR_WORKSPACE_ID, limitation: "Baseline captures pre-existing dirty changes; attribution is not perfect.", planning: { status: "passed", source: "parent Sol conversation", artifact: "approved-plan.md" }, stages: Object.fromEntries(stages.filter(s => s !== "plan").map(s => [s, { status: "pending", attempts: [] }])), panes: [], repairCycles: 0 };
     await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
     const emit = (stage: string, text: string) => onUpdate?.({ content: [{ type: "text", text: `${stage}: ${text}` }], details: { stage, artifactDir, panes: metadata.panes } });
-    let activePane: string | undefined, abortWork: Promise<void> | undefined, plan = approvedPlan, verification = "", review = "";
+    let activePane: string | undefined, abortWork: Promise<boolean> | undefined, plan = approvedPlan, verification = "", review = "";
     const runStage = async (stage: Stage, text: string, attempt: number): Promise<{ valid: boolean; positive: boolean; verdict?: string; text: string }> => {
       const reportFile = path.join(artifactDir, `${stage}-${attempt}.md`), pendingReport = path.join(artifactDir, `${stage}-pending.md`), terminalFile = path.join(artifactDir, `${stage}-${attempt}.terminal.txt`), record: Attempt = { attempt, status: "running", startedAt: now(), reportFile: path.basename(reportFile), paneId: "" }; let terminalCaptured = false, snapshotSucceeded = true; let stageResult: { valid: boolean; positive: boolean; verdict?: string; text: string } = { valid: false, positive: false, text: "" };
       const stageData = metadata.stages[stage]; stageData.status = "running"; stageData.attempts.push(record); let pane = metadata.panes.find((p: Pane) => p.name === INFO[stage].label) as Pane | undefined;
@@ -108,14 +115,15 @@ export default function (pi: ExtensionAPI) {
       const abortHandler = () => { if (pane?.paneId && !abortWork) abortWork = interrupt(pane.paneId); };
       signal?.addEventListener("abort", abortHandler, { once: true });
       try {
-        if (signal?.aborted) { record.status = "aborted"; return { valid: false, positive: false, text: "" }; }
+        if (signal?.aborted) { const result = abortBeforePaneStart(); record.status = result.status; stageData.status = result.status; record.error = result.evidence; return { valid: false, positive: false, text: "" }; }
         await fs.rm(pendingReport, { force: true });
         if (!pane.paneId) { pane.paneId = await startPane(stage, pane.name, cwd, process.env.HERDR_TAB_ID!, process.env.HERDR_WORKSPACE_ID!, text, pendingReport); record.paneId = pane.paneId; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); }
         else { record.paneId = pane.paneId; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); await sendPrompt(pane.paneId, text); }
-        if (signal?.aborted) { const stopped = abortWork ? await abortWork : await interrupt(pane.paneId); record.status = "aborted"; stageData.status = "aborted"; record.error = stopped ? "pipeline aborted; pane preserved" : "pipeline aborted; Herdr could not confirm idle; pane preserved"; return { valid: false, positive: false, text: "" }; }
+        if (signal?.aborted) { const result = await routeMonitorFailure("aborted", abortWork ? () => abortWork! : () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
         activePane = pane.paneId; emit(stage, `${pane.paneId} (${pane.name}), attempt ${attempt}`);
-        const state = await waitPane(pane.paneId, pendingReport, signal, m => emit(stage, m)); if (state === "aborted" || signal?.aborted) { const stopped = abortWork ? await abortWork : await interrupt(pane.paneId); record.status = "aborted"; stageData.status = "aborted"; record.error = stopped ? "pipeline aborted; pane preserved" : "pipeline aborted; Herdr could not confirm idle; pane preserved"; return { valid: false, positive: false, text: "" }; }
-        if (state !== "settled") { record.status = "failed"; stageData.status = "failed"; record.error = `pane ${state}`; return { valid: false, positive: false, text: "" }; }
+        const state = await waitPane(pane.paneId, pendingReport, signal, m => emit(stage, m)); if (state === "aborted" || signal?.aborted) { const result = await routeMonitorFailure("aborted", abortWork ? () => abortWork! : () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
+        if (state === "startup-timeout" || state === "timeout" || state === "process-info-failure") { const result = await routeMonitorFailure(state, () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
+        if (state !== "settled") { record.status = "failed"; stageData.status = "failed"; record.error = `pane ${state}; pane preserved`; return { valid: false, positive: false, text: "" }; }
         await captureTranscript(pane.paneId, terminalFile); terminalCaptured = true;
         const submitted = await fs.readFile(pendingReport, "utf8"); await atomicWrite(reportFile, `# ${stage} report (attempt ${attempt})\n\n${submitted.replace(/^# .*?\n\n/, "")}`); await fs.rm(pendingReport, { force: true });
         let report = ""; try { report = await fs.readFile(reportFile, "utf8"); } catch { record.error = "missing durable report"; }
@@ -124,7 +132,7 @@ export default function (pi: ExtensionAPI) {
       } catch (e) { record.status = signal?.aborted ? "aborted" : "failed"; stageData.status = record.status; record.error = e instanceof Error ? e.message : String(e); return { valid: false, positive: false, text: "" }; }
       finally { if (pane?.paneId && !terminalCaptured) { try { await captureTranscript(pane.paneId, terminalFile); } catch (e) { record.error = record.error || `terminal capture failed: ${e instanceof Error ? e.message : String(e)}`; } } record.finishedAt = now(); stageData.finishedAt = record.finishedAt; try { await snapshot(cwd, diffs, `${stage}-${attempt}`); } catch (e) { if (record.status !== "aborted") { record.status = "failed"; stageData.status = "failed"; snapshotSucceeded = false; record.error = `stage snapshot failed: ${e instanceof Error ? e.message : String(e)}`; stageResult.valid = false; stageResult.positive = false; stageResult.text = ""; } } if (signal?.aborted && pane?.paneId) { abortWork ??= interrupt(pane.paneId); const stopped = await abortWork; if (!stopped) record.error = record.error || "abort could not be confirmed"; } const finalized = finalizeStage(stageResult, snapshotSucceeded); stageResult.valid = finalized.valid; stageResult.positive = finalized.positive; stageResult.text = finalized.text; signal?.removeEventListener("abort", abortHandler); await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); }
     };
-    const finish = async (outcome: string) => { if (signal?.aborted) { if (activePane && !(await interrupt(activePane))) metadata.abortError = "Herdr could not confirm the active pane became idle"; outcome = "ABORTED"; } metadata.finishedAt = now(); metadata.outcome = outcome; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); return { content: [{ type: "text", text: `${outcome}\nArtifacts: ${artifactDir}\n${outcome === "SUCCESS" ? "Cleanup decision pending." : "Worker panes remain open."}` }], details: { outcome, artifactDir, panes: metadata.panes } }; };
+    const finish = async (outcome: string) => { if (signal?.aborted) { if (activePane) { const stopped = abortWork ? await abortWork : await interrupt(activePane); if (!stopped) metadata.abortError = "Herdr could not confirm the active pane became idle"; } outcome = "ABORTED"; } metadata.finishedAt = now(); metadata.outcome = outcome; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); return { content: [{ type: "text", text: `${outcome}\nArtifacts: ${artifactDir}\n${outcome === "SUCCESS" ? "Cleanup decision pending." : "Worker panes remain open."}` }], details: { outcome, artifactDir, panes: metadata.panes } }; };
     const implemented = await runStage("implement", promptFor("implement", task, artifactDir, plan, "", "", 1), 1); if (!implemented.positive) return finish(signal?.aborted ? "ABORTED" : "IMPLEMENTATION_FAILED");
     let cycle = 0;
     let verified = await runStage("verify", promptFor("verify", task, artifactDir, plan, "", "", 1), 1); verification = verified.text;
