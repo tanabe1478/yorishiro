@@ -142,5 +142,6 @@ export default function (pi: ExtensionAPI) {
       } else if (cleanupMode === "ask" && !ctx.hasUI) cleanupMessage = "Cleanup unavailable without a usable UI; all worker panes remain open. Use development_pipeline_cleanup later.";
     } catch (error) { const message = error instanceof Error ? error.message : String(error); await recordCleanupFailure(artifactDir, path.join(rootDir(), "artifacts"), message); cleanupMessage = `Cleanup confirmation failed; all worker panes remain open. ${message}`; finalResult.details.cleanupError = message; }
     finalResult.content[0].text = finalResult.content[0].text.replace("Cleanup decision pending.", cleanupMessage); return finalResult;
+    }
   });
 }
