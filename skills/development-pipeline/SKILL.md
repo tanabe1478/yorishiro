@@ -52,4 +52,4 @@ Workerへはsanitized findingだけを渡し、Reviewerのsummary、note、生�
 
 ## 人間レビュー
 
-希望時は開始前に親セッションからPlannotatorで計画を承認する。最終差分をdiffaiで確認する場合は`cleanupMode: never`で実行し、Reviewer対応後にdiffaiをforegroundで起動する。人間が承認してからcleanup、commit、pushする。Plannotator／diffaiの自動起動は現行toolへ接続されていない。
+`planReviewMode`と`diffReviewMode`は`ask`（既定）、`required`、`skip`から選びます。計画レビューは子ペイン起動前、差分レビューはReviewer完了後かつcleanup前にforegroundで実行されます。結果と計画SHA-256は`plan-review.json`／`diff-review.json`へ保存されます。`required`の拒否・利用不可・timeout・中断は安全側で停止し、差分の変更要求は`HUMAN_CHANGES_REQUESTED`になります。commit・pushは自動実行しません。

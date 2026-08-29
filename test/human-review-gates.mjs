@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { reviewPlan, reviewDiff, resolveReviewMode } from "../extensions/development-pipeline/human-review-gates.ts";
+import { reviewPlan, reviewDiff, resolveReviewMode, executeDiffProcess } from "../extensions/development-pipeline/human-review-gates.ts";
 
 assert.equal(resolveReviewMode(), "ask");
 assert.equal(resolveReviewMode("skip"), "skip");
@@ -27,7 +27,7 @@ assert.deepEqual(events.map(({ respond, ...event }) => event), [
   { name: "plannotator:request", requestId: "request-1", action: "review-status", payload: { reviewId: "review-1" } },
 ]);
 const rejected = await reviewPlan({ mode: "required", planContent: content, planFilePath: "plan.md", origin: "parent", eventBus: busFor([{ result: { status: "pending", reviewId: "r" } }, { result: { status: "completed", reviewId: "r", approved: false, feedback: "日本語feedback" } }]), pollIntervalMs: 0, sleep: async () => {} });
-assert.equal(rejected.decision, "rejected"); assert.equal(rejected.feedback, "日本語feedback");
+assert.equal(rejected.decision, "rejected", "PH1_PLAN_ASK_REJECT_GATE_DECISION"); assert.equal(rejected.feedback, "日本語feedback");
 const unavailablePlan = await reviewPlan({ mode: "required", planContent: content, planFilePath: "plan.md", origin: "parent", eventBus: busFor([{ result: { status: "pending", reviewId: "r" } }, { result: { status: "unavailable", reviewId: "r" } }]), pollIntervalMs: 0, sleep: async () => {} });
 assert.equal(unavailablePlan.decision, "unavailable");
 const errorPlan = await reviewPlan({ mode: "required", planContent: content, planFilePath: "plan.md", origin: "parent", eventBus: { emit: async () => { throw new Error("event failed"); } } });
@@ -43,5 +43,13 @@ const changes = await reviewDiff({ mode: "ask", confirm: () => true, cwd: "/repo
 for (const stdout of ["", "DIFFAI_REVIEW_RESULT=bad", 'DIFFAI_REVIEW_RESULT={"decision":"other"}']) assert.equal((await reviewDiff({ mode: "required", cwd: "/repo", exec: async () => ({ code: 0, stdout }) })).decision, "invalid");
 assert.equal((await reviewDiff({ mode: "required", cwd: "/repo", exec: async () => ({ code: 2, stdout: "", stderr: "failed" }) })).decision, "unavailable");
 const diffAbort = new AbortController(); diffAbort.abort(); assert.equal((await reviewDiff({ mode: "required", cwd: "/repo", signal: diffAbort.signal, exec: async () => ({ code: 0, stdout: "" }) })).decision, "aborted");
+let delayedStopped = false; const delayedStart = Date.now(); const delayedTimeout = await reviewDiff({ mode: "required", cwd: "/repo", timeoutMs: 10, exec: async (_command, _args, signal) => new Promise(resolve => signal.addEventListener("abort", () => setTimeout(() => { delayedStopped = true; resolve({ code: 143, stdout: "", stderr: "terminated" }); }, 25), { once: true })) });
+assert.equal(delayedTimeout.decision, "timeout", "PH1_DIFF_PROCESS_STOP_TIMEOUT_DECISION");
+assert.equal(delayedStopped, true, "PH1_DIFF_PROCESS_STOP_CLOSE_CONFIRMED");
+assert.ok(Date.now() - delayedStart >= 20, "PH1_DIFF_PROCESS_STOP_RETURN_WAITS_FOR_CLOSE");
+const uncooperativeStart = Date.now(); const uncooperative = await reviewDiff({ mode: "required", cwd: "/repo", timeoutMs: 5, stopTimeoutMs: 10, exec: async () => new Promise(() => {}) });
+assert.equal(uncooperative.decision, "error", "PH1_DIFF_UNCONFIRMED_STOP_FAILS_CLOSED");
+assert.ok(Date.now() - uncooperativeStart < 500, "PH1_DIFF_UNCONFIRMED_STOP_IS_BOUNDED");
+const processController = new AbortController(); const processStart = Date.now(); setTimeout(() => processController.abort(), 10); const processResult = await executeDiffProcess(process.execPath, ["-e", "setInterval(() => {}, 1000)"], "/tmp", processController.signal, 25); assert.equal(processResult.code !== 0, true, "PH1_DIFF_PROCESS_GROUP_TERMINATED"); assert.ok(Date.now() - processStart < 1000, "PH1_DIFF_PROCESS_GROUP_FINISHES");
 assert.equal((await reviewDiff({ mode: "skip", cwd: "/repo", exec: async () => { throw new Error("must not run"); } })).decision, "skipped");
 console.log("human review gates module tests passed");

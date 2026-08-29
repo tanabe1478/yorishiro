@@ -12,6 +12,7 @@ import { shouldCleanup } from "./cleanup-policy.ts";
 import { validateReviewerReport, validateWorkerReport, workerHandoffFromReviewer } from "./role-contracts.ts";
 import { transitionAfterReview } from "./three-role-flow.ts";
 import { monitorPane, routeMonitorFailure } from "./pane-monitor.ts";
+import { reviewPlan, reviewDiff, resolveReviewMode, executeDiffProcess, type PlanGateResult, type DiffGateResult } from "./human-review-gates.ts";
 export { routeMonitorFailure } from "./pane-monitor.ts";
 export function abortBeforePaneStart() { return { status: "aborted" as const, evidence: "pipeline aborted before pane startup; no child was started; pane preserved" }; }
 export function shouldSplitForAttempt(paneId: string) { return paneId.length === 0; }
@@ -19,7 +20,7 @@ export function shouldSplitForAttempt(paneId: string) { return paneId.length ===
 const MODELS = { implement: "openai-codex/gpt-5.6-luna", review: "openai-codex/gpt-5.6-sol" } as const;
 type Stage = "implement" | "review";
 type StageStatus = "pending" | "running" | "passed" | "failed" | "blocked" | "aborted";
-type Input = { task: string; approvedPlan: string; cwd?: string; maxRepairCycles?: number; maxReviewCycles?: number; cleanupMode?: "ask" | "on-success" | "never" };
+type Input = { task: string; approvedPlan: string; cwd?: string; maxRepairCycles?: number; maxReviewCycles?: number; cleanupMode?: "ask" | "on-success" | "never"; planReviewMode?: "ask" | "required" | "skip"; diffReviewMode?: "ask" | "required" | "skip" };
 type CommandResult = { code: number; stdout: string; stderr: string };
 type Attempt = { attempt: number; status: StageStatus; startedAt: string; finishedAt?: string; reportFile: string; paneId: string; verdict?: string; error?: string };
 type Pane = { paneId: string; name: string; model: string; attempts: Attempt[] };
@@ -37,6 +38,7 @@ const stages: Stage[] = ["implement", "review"];
 function rootDir() { return process.env.YORISHIRO_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.."); }
 function now() { return new Date().toISOString(); }
 function json(value: unknown) { return JSON.stringify(value, null, 2); }
+async function recordGate(dir: string, name: string, result: PlanGateResult | DiffGateResult) { await atomicWrite(path.join(dir, name), json(result)); }
 async function atomicWrite(file: string, content: string) { const tmp = `${file}.tmp-${process.pid}`; await fs.writeFile(tmp, content, { encoding: "utf8", mode: 0o600 }); await fs.rename(tmp, file); }
 export async function clearLaunchersAfterCleanup(artifactDir: string) {
   const runFile = path.join(artifactDir, "run.json");
@@ -147,11 +149,12 @@ function promptFor(stage: Stage, task: string, dir: string, plan: string, review
 
 export default function (pi: ExtensionAPI) {
   registerCleanupTool(pi, rootDir());
-  pi.registerTool({ name: "development_pipeline", label: "Development Pipeline", description: "可視のHerdrペインで監査可能な開発パイプラインを実行します。", parameters: Type.Object({ task: Type.String({ description: "User-approved development task" }), approvedPlan: Type.String({ description: "Plan approved in the parent Sol conversation" }), cwd: Type.Optional(Type.String()), maxReviewCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), maxRepairCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), cleanupMode: Type.Optional(Type.String({ description: "ask, on-success, or never; defaults to ask" })) }), async execute(_id, input: Input, signal, onUpdate, ctx) {
+  pi.registerTool({ name: "development_pipeline", label: "Development Pipeline", description: "可視のHerdrペインで監査可能な開発パイプラインを実行します。", parameters: Type.Object({ task: Type.String({ description: "User-approved development task" }), approvedPlan: Type.String({ description: "Plan approved in the parent Sol conversation" }), cwd: Type.Optional(Type.String()), maxReviewCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), maxRepairCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), cleanupMode: Type.Optional(Type.String({ description: "ask, on-success, or never; defaults to ask" })), planReviewMode: Type.Optional(Type.String({ description: "計画レビュー: ask, required, skip（既定 ask）" })), diffReviewMode: Type.Optional(Type.String({ description: "差分レビュー: ask, required, skip（既定 ask）" })) }), async execute(_id, input: Input, signal, onUpdate, ctx) {
     const task = input.task?.trim(), approvedPlan = input.approvedPlan?.trim(), cwd = path.resolve(input.cwd?.trim() || ctx.cwd);
     if (!task) throw new Error("task must not be empty");
     if (!approvedPlan) throw new Error("approvedPlan must not be empty; planning is expected in the parent Sol conversation");
     const cleanupMode = input.cleanupMode ?? "ask"; if (!["ask", "on-success", "never"].includes(cleanupMode)) throw new Error("cleanupMode must be ask, on-success, or never");
+    const planReviewMode = resolveReviewMode(input.planReviewMode), diffReviewMode = resolveReviewMode(input.diffReviewMode);
     for (const key of ["HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_SOCKET_PATH"]) if (!process.env[key]) throw new Error(`Herdr context is required (${key} is missing)`);
     if (!existsSync(process.env.HERDR_SOCKET_PATH!)) throw new Error(`Herdr socket is unavailable: ${process.env.HERDR_SOCKET_PATH}`);
     const herdr = await command("herdr", ["status"]); if (herdr.code) throw new Error(`Herdr is unavailable: ${herdr.stderr || herdr.stdout}`);
@@ -159,7 +162,7 @@ export default function (pi: ExtensionAPI) {
     await preflightVerifierSandbox(cwd);
     const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`, artifactDir = path.join(rootDir(), "artifacts", path.basename(cwd) || "repository", id), diffs = path.join(artifactDir, "diffs"); await fs.mkdir(diffs, { recursive: true });
     await atomicWrite(path.join(artifactDir, "request.md"), `# 依頼\n\n${task}\n\n対象: ${cwd}\n`); await atomicWrite(path.join(artifactDir, "approved-plan.md"), `# 承認済み計画\n\n${approvedPlan}\n`); await snapshot(cwd, diffs, "baseline");
-    const metadata: any = { targetRepository: path.basename(cwd), targetPath: cwd, startedAt: now(), parentPaneId: process.env.HERDR_PANE_ID, tabId: process.env.HERDR_TAB_ID, workspaceId: process.env.HERDR_WORKSPACE_ID, limitation: "baselineは既存のdirty変更を含むため、変更の帰属を完全には判定できません。", planning: { status: "passed", source: "親Plannerセッション", artifact: "approved-plan.md" }, stages: Object.fromEntries(stages.filter(s => s !== "plan").map(s => [s, { status: "pending", attempts: [] }])), panes: [], repairCycles: 0 };
+    const metadata: any = { targetRepository: path.basename(cwd), targetPath: cwd, startedAt: now(), parentPaneId: process.env.HERDR_PANE_ID, tabId: process.env.HERDR_TAB_ID, workspaceId: process.env.HERDR_WORKSPACE_ID, limitation: "baselineは既存のdirty変更を含むため、変更の帰属を完全には判定できません。", planning: { status: "pending", mode: planReviewMode, source: "親Plannerセッション", artifact: "approved-plan.md" }, humanReview: { planMode: planReviewMode, diffMode: diffReviewMode }, stages: Object.fromEntries(stages.filter(s => s !== "plan").map(s => [s, { status: "pending", attempts: [] }])), panes: [], repairCycles: 0 };
     await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
     const parentPaneId = metadata.parentPaneId as string;
     const emit = (stage: string, text: string) => onUpdate?.({ content: [{ type: "text", text: `${stage}: ${text}` }], details: { stage, artifactDir, panes: metadata.panes } });
@@ -206,8 +209,21 @@ export default function (pi: ExtensionAPI) {
       } catch (e) { record.status = signal?.aborted ? "aborted" : "failed"; stageData.status = record.status; record.error = e instanceof Error ? e.message : String(e); return { valid: false, positive: false, text: "" }; }
       finally { if (pane?.paneId && !terminalCaptured) { try { await captureTranscript(pane.paneId, terminalFile); } catch (e) { record.error = record.error || `terminal capture failed: ${e instanceof Error ? e.message : String(e)}`; } } record.finishedAt = now(); stageData.finishedAt = record.finishedAt; try { await snapshot(cwd, diffs, `${stage}-${attempt}`); } catch (e) { if (record.status !== "aborted") { record.status = "failed"; stageData.status = "failed"; snapshotSucceeded = false; record.error = `stage snapshot failed: ${e instanceof Error ? e.message : String(e)}`; stageResult.valid = false; stageResult.positive = false; stageResult.text = ""; } } if (signal?.aborted && pane?.paneId) { abortWork ??= interrupt(pane.paneId); const stopped = await abortWork; if (!stopped) record.error = record.error || "abort could not be confirmed"; } const finalized = finalizeStage(stageResult, snapshotSucceeded); stageResult.valid = finalized.valid; stageResult.positive = finalized.positive; stageResult.text = finalized.text; signal?.removeEventListener("abort", abortHandler); await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); }
     };
-    const finish = async (outcome: string) => { if (signal?.aborted) { if (activePane) { const stopped = abortWork ? await abortWork : await interrupt(activePane); if (!stopped) metadata.abortError = "Herdr could not confirm the active pane became idle"; } outcome = "ABORTED"; } metadata.finishedAt = now(); metadata.outcome = outcome; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); return { content: [{ type: "text", text: `${outcome}\n成果物: ${artifactDir}\n${outcome === "SUCCESS" ? "cleanupの判断待ちです。" : "子ペインを保持しました。"}` }], details: { outcome, artifactDir, panes: metadata.panes } }; };
+    const finish = async (outcome: string) => { if (signal?.aborted) { if (activePane) { const stopped = abortWork ? await abortWork : await interrupt(activePane); if (!stopped) metadata.abortError = "Herdr could not confirm the active pane became idle"; } outcome = "ABORTED"; } if (outcome === "ABORTED" && !metadata.cleanup) metadata.cleanup = { status: "aborted", results: (metadata.panes ?? []).map((pane: Pane) => ({ paneId: pane.paneId, name: pane.name, status: "skipped", reason: "cleanupは中断されました" })) }; metadata.finishedAt = now(); metadata.outcome = outcome; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); return { content: [{ type: "text", text: `${outcome}\n成果物: ${artifactDir}\n${outcome === "SUCCESS" ? "cleanupの判断待ちです。" : "子ペインを保持しました。"}` }], details: { outcome, artifactDir, panes: metadata.panes } }; };
     let cycle = 0;
+    const hasReviewEventBus = !!(pi as any).events;
+    const reviewEventBus = (pi as any).events ?? { emit: async () => { throw new Error("review event bus is unavailable"); } };
+    if (signal?.aborted) {
+      await runStage("implement", promptFor("implement", task, artifactDir, plan, "", 1), 1);
+      return finish("ABORTED");
+    }
+    const planGate = await reviewPlan({ mode: planReviewMode, planContent: approvedPlan, planFilePath: path.join(artifactDir, "approved-plan.md"), origin: "親Plannerセッション", eventBus: reviewEventBus, signal, confirm: ctx.hasUI && hasReviewEventBus ? () => ctx.ui.confirm("計画を人間に確認してもらいますか？", "承認されるまで子ペインは起動しません。") : undefined });
+    await recordGate(artifactDir, "plan-review.json", planGate);
+    metadata.planning = { ...metadata.planning, status: planGate.decision, hash: planGate.hash, reviewId: planGate.reviewId, approvedAt: planGate.approvedAt, feedback: planGate.feedback, error: planGate.error, artifact: "plan-review.json" };
+    await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
+    if (signal?.aborted || planGate.decision === "aborted") return finish("ABORTED");
+    if (planGate.decision === "rejected") return finish("PLAN_REJECTED");
+    if (planReviewMode === "required" && planGate.decision !== "approved") return finish("PLAN_REVIEW_UNAVAILABLE");
     let implemented = await runStage("implement", promptFor("implement", task, artifactDir, plan, "", 1), 1);
     if (!implemented.positive) return finish(signal?.aborted ? "ABORTED" : implemented.valid ? "IMPLEMENTATION_BLOCKED" : "IMPLEMENTATION_FAILED");
     let reviewed = await runStage("review", promptFor("review", task, artifactDir, plan, "", 1, path.join(artifactDir, "implement-1.json"), implemented.text), 1); review = reviewed.text;
@@ -229,6 +245,13 @@ export default function (pi: ExtensionAPI) {
     const finalReview = JSON.parse(reviewed.text); const finalTransition = transitionAfterReview(finalReview, metadata.reviewIds ?? [], cycle, { maxReviewCycles: input.maxReviewCycles, maxRepairCycles: input.maxRepairCycles });
     metadata.reviewIds = finalTransition.reviewIds; metadata.reviewBudget = finalTransition.budget; metadata.repeatedIds = finalTransition.repeatedIds;
     if (signal?.aborted) return finish("ABORTED");
+    const diffGate = await reviewDiff({ mode: diffReviewMode, cwd, signal, confirm: ctx.hasUI && hasReviewEventBus ? () => ctx.ui.confirm("最終差分を人間に確認してもらいますか？", "承認されるまでcleanupは実行しません。") : undefined, exec: (program, args, reviewSignal) => executeDiffProcess(program, args, cwd, reviewSignal) });
+    await recordGate(artifactDir, "diff-review.json", diffGate);
+    metadata.humanReview.diff = { ...diffGate, artifact: "diff-review.json", argv: ["--yes", "github:tanabe1478/diffai", "--cwd", cwd] };
+    await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
+    if (diffGate.decision === "aborted" || signal?.aborted) return finish("ABORTED");
+    if (diffGate.decision === "changes_requested") return finish("HUMAN_CHANGES_REQUESTED");
+    if (diffReviewMode === "required" && diffGate.decision !== "approved") return finish(diffGate.decision === "timeout" ? "HUMAN_DIFF_REVIEW_TIMEOUT" : `HUMAN_DIFF_REVIEW_${diffGate.decision.toUpperCase()}`);
     const finalResult: any = await finish("SUCCESS"); let cleanupMessage = cleanupMode === "never" ? "cleanupは無効です。子ペインを保持しました。" : "cleanupは実行されませんでした。子ペインを保持しました。";
     let confirmed = false;
     try {

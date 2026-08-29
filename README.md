@@ -54,7 +54,7 @@ WorkerとReviewerは中央validatorが検証する構造化JSONで報告しま�
 
 Reviewerの検証コマンドはmacOSの`sandbox-exec`またはLinuxのbubblewrap/user namespaceによるread-only sandboxで実行します。未対応環境、sandbox未導入環境、`/tmp`配下の対象は作業開始前に拒否します。
 
-成果物は`artifacts/<repository>/<run-id>/`に保存されます。主な内容は依頼、承認済み計画、各attemptの構造化report、baselineと各stageのstatus/diff、`run.json`です。既存のdirty変更はbaselineとして保持しますが、変更の帰属を完全には判定できません。
+成果物は`artifacts/<repository>/<run-id>/`に保存されます。主な内容は依頼、承認済み計画、`plan-review.json`、`diff-review.json`、各attemptの構造化report、baselineと各stageのstatus/diff、`run.json`です。既存のdirty変更はbaselineとして保持しますが、変更の帰属を完全には判定できません。
 
 成功時の整理は`cleanupMode`で制御します。
 
@@ -64,7 +64,7 @@ Reviewerの検証コマンドはmacOSの`sandbox-exec`またはLinuxのbubblewra
 
 後から`development_pipeline_cleanup`へrunディレクトリを渡して整理できます。新構成はReviewer→Worker、旧構成はReview→Verify→Implementの順に閉じます。親ペイン、非idleペイン、別runのペインは保護されます。
 
-計画を画面で確認したい場合は、パイプライン開始前にPlannotatorを親セッションから利用します。最終差分を確認したい場合は`cleanupMode: never`で成功させ、Reviewer対応後にdiffaiをforegroundで実行し、承認後にcleanup・commit・pushします。これらの自動起動は現在の`development_pipeline`には接続していません。
+人間レビューは`planReviewMode`と`diffReviewMode`で制御します（`ask`既定、`required`、`skip`）。計画レビューは子ペイン起動前、差分レビューはReviewer完了後かつcleanup前に実行し、結果と計画SHA-256をrun artifactへ保存します。変更要求や必須レビューの失敗では安全側で停止し、commit・pushは行いません。
 
 ## 育て方
 
