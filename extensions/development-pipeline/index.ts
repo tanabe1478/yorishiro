@@ -54,6 +54,7 @@ function shellQuote(value: string) { return "'" + value.replaceAll("'", "'\\''")
 
 const STAGE_TIMEOUT_MS = Number(process.env.YORISHIRO_STAGE_TIMEOUT_MS ?? 30 * 60 * 1000);
 const STARTUP_GRACE_MS = Number(process.env.YORISHIRO_STARTUP_GRACE_MS ?? 15 * 1000);
+const REPORT_SETTLEMENT_GRACE_MS = Number(process.env.YORISHIRO_REPORT_SETTLEMENT_GRACE_MS ?? 5 * 1000);
 const INFO: Record<Stage, { label: string; tools: string; thinking: "high" | "medium" }> = {
   implement: { label: "Worker · Luna", tools: "read,grep,find,ls,bash,edit,write,submit_stage_report", thinking: "high" },
   review: { label: "Reviewer · Sol", tools: "read,grep,find,ls,run_verification_command,submit_stage_report", thinking: "medium" },
@@ -170,13 +171,14 @@ async function startPane(stage: Stage, name: string, cwd: string, parent: string
 }
 async function sendPrompt(id: string, prompt: string) { const sent = await command("herdr", ["pane", "send-text", id, prompt]); if (sent.code) throw new Error(`Could not send prompt: ${sent.stderr || sent.stdout || `exit ${sent.code}`}`); const enter = await command("herdr", ["pane", "send-keys", id, "enter"]); if (enter.code) throw new Error(`Could not submit prompt: ${enter.stderr || enter.stdout}`); }
 async function captureTranscript(id: string, file: string) { const result = await command("herdr", ["agent", "read", id, "--source", "recent-unwrapped", "--lines", "200", "--format", "text"]); if (result.code) throw new Error(`Herdr transcript capture failed: ${result.stderr || result.stdout}`); await atomicWrite(file, result.stdout); }
-async function waitPane(id: string, report: string, signal: AbortSignal | undefined, update: (s: string) => void) {
+async function waitPane(id: string, report: string, signal: AbortSignal | undefined, update: (s: string) => void | Promise<void>) {
   return monitorPane({
     reportExists: () => existsSync(report),
     signal,
     onUpdate: message => update(`pane ${id} ${message}`),
     timeoutMs: STAGE_TIMEOUT_MS,
     startupGraceMs: STARTUP_GRACE_MS,
+    reportSettlementGraceMs: REPORT_SETTLEMENT_GRACE_MS,
     pollIntervalMs: Number(process.env.YORISHIRO_POLL_INTERVAL_MS ?? 1000),
     poll: async () => {
       await command("herdr", ["agent", "wait", id, "--status", "idle", "--timeout", "1000"], undefined, signal);
@@ -268,7 +270,14 @@ export default function (pi: ExtensionAPI) {
         } else { record.paneId = pane.paneId; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); await sendPrompt(pane.paneId, text); }
         if (signal?.aborted) { const result = await routeMonitorFailure("aborted", abortWork ? () => abortWork! : () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
         activePane = pane.paneId; await heartbeat(stage, attempt, `${pane.paneId}（${pane.name}）の完了を待機しています`);
-        const state = await waitPane(pane.paneId, pendingReport, signal, m => emit(stage, m)); if (state === "aborted" || signal?.aborted) { const result = await routeMonitorFailure("aborted", abortWork ? () => abortWork! : () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
+        let lastHeartbeatAt = 0;
+        const state = await waitPane(pane.paneId, pendingReport, signal, async message => {
+          const current = Date.now();
+          if (current - lastHeartbeatAt >= 5000 || message.includes("durable report")) {
+            lastHeartbeatAt = current;
+            await heartbeat(stage, attempt, message);
+          } else emit(stage, message);
+        }); if (state === "aborted" || signal?.aborted) { const result = await routeMonitorFailure("aborted", abortWork ? () => abortWork! : () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
         if (state === "startup-timeout" || state === "timeout" || state === "process-info-failure") { const result = await routeMonitorFailure(state, () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
         if (state !== "settled") { record.status = "failed"; stageData.status = "failed"; record.error = `pane ${state}; pane preserved`; return { valid: false, positive: false, text: "" }; }
         await renameDetectedPane(pane.paneId, pane.name);

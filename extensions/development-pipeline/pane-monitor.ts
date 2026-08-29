@@ -22,30 +22,37 @@ export function hasExactPiIdentity(value: unknown): boolean {
   return Object.values(record).some(hasExactPiIdentity);
 }
 
+export function isQuiescentAgentStatus(status?: string): boolean {
+  return status === undefined || ["idle", "done", "completed", "unknown"].includes(status.toLowerCase());
+}
+
 export async function monitorPane(options: {
   reportExists: () => boolean;
   poll: () => Promise<PanePoll>;
   signal?: AbortSignal;
-  onUpdate: (message: string) => void;
+  onUpdate: (message: string) => void | Promise<void>;
   now?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
   timeoutMs: number;
   startupGraceMs: number;
   pollIntervalMs?: number;
+  reportSettlementGraceMs?: number;
 }): Promise<PaneMonitorState> {
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? ((milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds)));
   const deadline = now() + options.timeoutMs;
   const startupDeadline = now() + options.startupGraceMs;
   const pollIntervalMs = options.pollIntervalMs ?? 1000;
+  const reportSettlementGraceMs = options.reportSettlementGraceMs ?? 5000;
   let state: "startup" | "monitoring" = "startup";
   let invalidProcessInfoPolls = 0;
+  let reportObservedAt: number | undefined;
   while (now() < deadline) {
     if (options.signal?.aborted) return "aborted";
     const observation = await options.poll();
     if (!observation.processInfoValid) {
       invalidProcessInfoPolls++;
-      options.onUpdate(`process-info unavailable or invalid (attempt ${invalidProcessInfoPolls})`);
+      await options.onUpdate(`process-info unavailable or invalid (attempt ${invalidProcessInfoPolls})`);
       if (invalidProcessInfoPolls >= 3) return "process-info-failure";
       await sleep(pollIntervalMs);
       continue;
@@ -55,12 +62,17 @@ export async function monitorPane(options: {
     if (hasPi) state = "monitoring";
     if (state === "monitoring") {
       if (!hasPi) return "exited";
-      if ((observation.status === "idle" || observation.status === "unknown") && options.reportExists()) return "settled";
-      options.onUpdate(`pane is ${observation.status ?? "running"}`);
+      const hasReport = options.reportExists();
+      if (hasReport && reportObservedAt === undefined) {
+        reportObservedAt = now();
+        await options.onUpdate("durable reportを検出し、Piの完了状態を確認しています");
+      }
+      if (hasReport && (isQuiescentAgentStatus(observation.status) || now() - reportObservedAt! >= reportSettlementGraceMs)) return "settled";
+      await options.onUpdate(`pane is ${observation.status ?? "running"}`);
     } else if (now() >= startupDeadline) {
       return "startup-timeout";
     } else {
-      options.onUpdate(`pane is starting; waiting for exact Pi identity`);
+      await options.onUpdate(`pane is starting; waiting for exact Pi identity`);
     }
     await sleep(pollIntervalMs);
   }

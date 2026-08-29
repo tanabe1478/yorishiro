@@ -46,13 +46,13 @@ cd work/example
 | Worker · Luna | `openai-codex/gpt-5.6-luna`（既定thinking: `high`） | 実装、テスト、ビルド、動作確認、修正 |
 | Reviewer · Sol | `openai-codex/gpt-5.6-sol`（既定thinking: `medium`） | read-onlyレビュー、sandbox内の独立検証 |
 
-パイプラインはHerdr内で起動したPiからのみ実行できます。現在のタブを、親55%、右45%のWorker／Reviewer上下2段へ分割します。子は通常のPi TUIとして表示され、修正と再レビューでは同じペインを再利用します。子からパイプラインを再帰起動することはできません。
+パイプラインはHerdr内で起動したPiからのみ実行できます。通常実行では別タブを作らず、呼出元の現在タブを、親55%、右45%のWorker／Reviewer上下2段へ分割します。子は通常のPi TUIとして表示され、修正と再レビューでは同じペインを再利用します。子からパイプラインを再帰起動することはできません。修正版Extensionを新規ロードする使い捨てE2Eだけは隔離タブを使用し、確認後にタブ全体を削除します。
 
 WorkerとReviewerは中央validatorが検証する構造化JSONで報告します。`development_pipeline`には必須の`qualityContract`（承認項目、独立check、任意の変更path prefix）を渡します。契約はSHA-256とともに`quality-contract.json`／`run.json`へ保存されます。`COMPLETED`は`completedPlanItems`のcontract ID exact一致、`changedPaths`の実diff exact一致、prefix遵守、独立checks成功が必須です。`BLOCKED`は完了済みcontract IDのsubset（unknown／duplicate不可）とactual `changedPaths` exact一致、prefix遵守を必須とし、独立checksとReviewerを起動せず`IMPLEMENTATION_BLOCKED`で終わります。BLOCKEDでも虚偽ID／path／prefix違反は許しません。
 
 Quality evidence不一致の初回だけ、Reviewerを起動せず同じWorkerペインへpath本文を除いたsanitized findingを送り、quality repairを1回行います。signatureは違反種別とcontract item/check IDで安定化します。同じsignatureの再発はSol Workerへの切替理由をartifactへ残して`NEEDS_PLANNER`、異なる2回目の違反は`WORKER_EVIDENCE_MISMATCH`で停止し、loopしません。COMPLETEDのReviewer開始前にはrequiredChecksをread-only sandboxで順次実行し、失敗・timeout・cancelは`QUALITY_GATE_FAILED`として停止します。Reviewerの判定は`APPROVED`、`APPROVED_WITH_NOTES`、`CHANGES_REQUESTED`、`NEEDS_PLANNER`です。Workerへ戻す情報はsanitized blocking findingだけに制限し、Reviewerの生出力やtranscriptは渡しません。同じ指摘IDの再発や、修正後に理由なく追加されたblockingは`NEEDS_PLANNER`で止まります。
 
-修正回数は`maxReviewCycles`で指定でき、既定2、上限3です。旧`maxRepairCycles`も互換入力として受理し、両方指定時は`maxReviewCycles`を優先します。欠落・不正レポート、プロセス失敗、timeout、中断は安全側で停止します。失敗・中断・Planner判断待ちでは子ペインを残します。
+修正回数は`maxReviewCycles`で指定でき、既定2、上限3です。旧`maxRepairCycles`も互換入力として受理し、両方指定時は`maxReviewCycles`を優先します。欠落・不正レポート、プロセス失敗、timeout、中断は安全側で停止します。失敗・中断・Planner判断待ちでは子ペインを残します。監視はHerdrの特定status名だけに依存せず、exact Pi identityとdurable reportを完了根拠にします。`idle`／`done`／`completed`は即時settleし、未知・active statusが残ってもreport検出後5秒で待機を打ち切ります。監視中のheartbeatは`run.json`へ継続記録します。
 
 Reviewerの検証コマンドはmacOSの`sandbox-exec`またはLinuxのbubblewrap/user namespaceによるread-only sandboxで実行します。未対応環境、sandbox未導入環境、`/tmp`配下の対象は作業開始前に拒否します。
 

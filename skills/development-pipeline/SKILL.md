@@ -17,7 +17,7 @@ description: Run the approved development pipeline in stable Herdr worker panes 
 - Worker · Luna: `openai-codex/gpt-5.6-luna`、既定thinking `high`。実装、テスト、ビルド、動作確認、修正を行う。
 - Reviewer · Sol: `openai-codex/gpt-5.6-sol`、既定thinking `medium`。read-onlyレビューとsandbox検証を行う。
 
-親55%、右45%とし、右列をWorker上／Reviewer下へ分割する。子は可視の通常Pi TUIであり、修正・再レビューでは同じペインを再利用する。子はYorishiroのSkillとExtensionを自動ロードせず、再帰起動できない。
+通常実行では別タブを作らず、呼出元の現在タブを親55%、右45%とし、右列をWorker上／Reviewer下へ分割する。子は可視の通常Pi TUIであり、修正・再レビューでは同じペインを再利用する。子はYorishiroのSkillとExtensionを自動ロードせず、再帰起動できない。修正版Extensionを新規ロードする隔離E2Eだけは使い捨てタブを許可し、確認後に閉じる。
 
 ## 報告と判定
 
@@ -44,7 +44,7 @@ Workerへはsanitized findingだけを渡し、Reviewerのsummary、note、生�
 
 `artifacts/<repository>/<run-id>/`へ依頼、承認済み計画、quality contract、各attemptのreport、quality gate、terminal記録、baseline／stage別status・diff・fingerprint、`run.json`を保存する。baseline fingerprintとの差分で既存dirty pathの内容変更、untracked・deleted・renameも検出する。
 
-起動、process-info、timeout、中断、欠落・不正reportはfail closedで扱う。中断時は`ctrl+c`と`escape`で停止を試み、証跡とペインを残す。Reviewerのコマンドはread-only sandbox内だけで実行する。
+起動、process-info、timeout、中断、欠落・不正reportはfail closedで扱う。監視はHerdrの特定status名だけに依存しない。exact Pi identityとdurable reportを必須とし、既知のquiescent statusは即時settle、未知またはactive statusもreport検出後5秒の有限猶予でsettleする。待機理由と時刻を`run.json` heartbeatへ継続記録する。中断時は`ctrl+c`と`escape`で停止を試み、証跡とペインを残す。Reviewerのコマンドはread-only sandbox内だけで実行する。
 
 ## cleanup
 

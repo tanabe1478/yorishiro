@@ -21,6 +21,22 @@ assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 2_0
 
 fake = fakeHerdr([
   { status: "running", processInfo: { argv0: "pi" } },
+  { status: "done", processInfo: { argv0: "pi" } },
+], true);
+assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 2_000, onUpdate() {} }), "settled", "Herdr 0.7.3 done status with a durable report must settle immediately");
+
+fake = fakeHerdr([
+  { status: "working", processInfo: { argv0: "pi" } },
+], true);
+assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 2_000, reportSettlementGraceMs: 2, pollIntervalMs: 1, onUpdate: async () => {} }), "settled", "a durable final report must bound waiting even when Herdr keeps an active status");
+
+fake = fakeHerdr([
+  { status: "future-finished-status", processInfo: { argv0: "pi" } },
+], true);
+assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 2_000, reportSettlementGraceMs: 2, pollIntervalMs: 1, onUpdate() {} }), "settled", "unknown future Herdr statuses must not cause an unbounded wait after a durable report");
+
+fake = fakeHerdr([
+  { status: "running", processInfo: { argv0: "pi" } },
   { status: "idle", processInfo: {} },
 ], true);
 assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 2_000, onUpdate() {} }), "exited", "only an observed-then-missing Pi is an exit");
