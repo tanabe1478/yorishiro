@@ -7,7 +7,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { preflightVerifierSandbox } from "./sandbox.ts";
 import { finalizeStage, flowAfterReview, flowAfterVerification } from "./pipeline-flow.ts";
-import { cleanupRun, registerCleanupTool, recordCleanupFailure } from "./cleanup.ts";
+import { cleanupRun, markRunAborted, registerCleanupTool, recordCleanupFailure } from "./cleanup.ts";
 import { shouldCleanup } from "./cleanup-policy.ts";
 import { monitorPane, routeMonitorFailure } from "./pane-monitor.ts";
 export { routeMonitorFailure } from "./pane-monitor.ts";
@@ -215,13 +215,19 @@ export default function (pi: ExtensionAPI) {
     if (signal?.aborted) return finish("ABORTED");
     const finalResult: any = await finish("SUCCESS"); let cleanupMessage = cleanupMode === "never" ? "Cleanup disabled; all worker panes remain open." : "Cleanup declined; all worker panes remain open.";
     let confirmed = false;
-    try { confirmed = cleanupMode === "ask" && ctx.hasUI ? await ctx.ui.confirm("Close pipeline panes?", "Close only this run's idle worker panes?") : false;
-      if (shouldCleanup("SUCCESS", cleanupMode, ctx.hasUI, confirmed)) {
-        try { const cleanup = await cleanupRun(artifactDir, path.join(rootDir(), "artifacts"), parentPaneId); const allClosed = cleanup.results.length > 0 && cleanup.results.every((r: any) => r.status === "closed"); cleanupMessage = allClosed ? "Cleanup complete; all worker panes were closed." : `Cleanup partial; worker panes remain where not closed. ${cleanup.summary}`; finalResult.details.cleanup = cleanup; if (allClosed) { const audited = await clearLaunchersAfterCleanup(artifactDir); metadata.cleanup = audited.cleanup; metadata.launchers = []; } }
+    try {
+      if (signal?.aborted) { await markRunAborted(artifactDir, path.join(rootDir(), "artifacts")); cleanupMessage = "Cleanup cancelled; all worker panes remain open."; }
+      else confirmed = cleanupMode === "ask" && ctx.hasUI ? await ctx.ui.confirm("Close pipeline panes?", "Close only this run's idle worker panes?") : false;
+      if (signal?.aborted) { await markRunAborted(artifactDir, path.join(rootDir(), "artifacts")); cleanupMessage = "Cleanup cancelled; all worker panes remain open."; }
+      else if (shouldCleanup("SUCCESS", cleanupMode, ctx.hasUI, confirmed)) {
+        try { const cleanup = await cleanupRun(artifactDir, path.join(rootDir(), "artifacts"), parentPaneId, signal); const allClosed = cleanup.results.length > 0 && cleanup.results.every((r: any) => r.status === "closed"); cleanupMessage = allClosed ? "Cleanup complete; all worker panes were closed." : `Cleanup partial; worker panes remain where not closed. ${cleanup.summary}`; finalResult.details.cleanup = cleanup; if (allClosed) { const audited = await clearLaunchersAfterCleanup(artifactDir); metadata.cleanup = audited.cleanup; metadata.launchers = []; } }
         catch (error) { const message = error instanceof Error ? error.message : String(error); await recordCleanupFailure(artifactDir, path.join(rootDir(), "artifacts"), message); cleanupMessage = `Cleanup failed; all worker panes remain open where not already closed. ${message}`; finalResult.details.cleanupError = message; }
       } else if (cleanupMode === "ask" && !ctx.hasUI) cleanupMessage = "Cleanup unavailable without a usable UI; all worker panes remain open. Use development_pipeline_cleanup later.";
     } catch (error) { const message = error instanceof Error ? error.message : String(error); await recordCleanupFailure(artifactDir, path.join(rootDir(), "artifacts"), message); cleanupMessage = `Cleanup confirmation failed; all worker panes remain open. ${message}`; finalResult.details.cleanupError = message; }
-    finalResult.content[0].text = finalResult.content[0].text.replace("Cleanup decision pending.", cleanupMessage); return finalResult;
+    if (signal?.aborted) { try { await markRunAborted(artifactDir, path.join(rootDir(), "artifacts")); } catch (error) { finalResult.details.cleanupError = error instanceof Error ? error.message : String(error); } }
+    const durable = JSON.parse(await fs.readFile(path.join(artifactDir, "run.json"), "utf8"));
+    finalResult.details.outcome = durable.outcome;
+    finalResult.content[0].text = finalResult.content[0].text.replace("SUCCESS", durable.outcome).replace("Cleanup decision pending.", durable.outcome === "ABORTED" ? "Cleanup cancelled; all worker panes remain open." : cleanupMessage); return finalResult;
     }
   });
 }
