@@ -4,6 +4,8 @@
   "scripts": {
     "test:pi-extension-load": "node ./test/pi-extension-load.mjs",
     "test:reporter": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/reporter-extension-load.mjs",
+    "test:role-contracts": "node --experimental-strip-types ./test/role-contracts.mjs",
+    "test:three-role-flow": "node --experimental-strip-types ./test/three-role-flow.mjs",
     "test:pipeline-control": "node --experimental-strip-types ./test/pipeline-control.mjs",
     "test:pipeline-layout": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/pipeline-layout.mjs",
     "test:pipeline-layout-real-probe": "YORISHIRO_RUN_REAL_HERDR_PROBE=1 node --experimental-strip-types ./test/pipeline-layout-real-probe.mjs",
@@ -15,7 +17,7 @@
     "test:pipeline-cleanup-cancellation-extension": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/pipeline-cleanup-cancellation-extension.mjs",
     "test:sandbox-preflight": "node --experimental-strip-types ./test/sandbox-preflight.mjs",
     "test:cleanup-policy": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/cleanup-policy.mjs",
-    "test": "npm run test:pi-extension-load && npm run test:reporter && npm run test:pipeline-control && npm run test:pipeline-layout && npm run test:pipeline-flow && npm run test:verifier-boundary && npm run test:verifier-runtime && npm run test:sandbox-preflight && npm run test:cleanup-policy && npm run test:pane-monitor && npm run test:pipeline-routing-extension && npm run test:pipeline-cleanup-cancellation-extension"
+    "test": "npm run test:pi-extension-load && npm run test:reporter && npm run test:role-contracts && npm run test:three-role-flow && npm run test:pipeline-control && npm run test:pipeline-layout && npm run test:pipeline-flow && npm run test:verifier-boundary && npm run test:verifier-runtime && npm run test:sandbox-preflight && npm run test:cleanup-policy && npm run test:pane-monitor && npm run test:pipeline-routing-extension && npm run test:pipeline-cleanup-cancellation-extension"
   },
   "description": "A personal harness layered on top of pi",
   "keywords": ["pi-package"],
