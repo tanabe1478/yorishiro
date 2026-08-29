@@ -52,6 +52,10 @@ export function assertScenario(events, expected = {}) {
   requiredSource(events, "dispatch", "herdr-command-log:pane-run");
   requiredSource(events, "outcome", "production-return");
   requiredSource(events, "cleanupDecision", "production-return");
+  if (expected.outcome !== undefined) {
+    const observedOutcome = events.find(entry => entry.kind === "outcome" && entry.source === "production-return");
+    assert.equal(observedOutcome.value, expected.outcome, "production return outcome does not match the scenario contract");
+  }
   const settlements = events.filter(entry => entry.kind === "settlement");
   assert.ok(settlements.length > 0, "settlement must contain an observation");
   if (expected.attempts) for (const [stage, count] of Object.entries(expected.attempts)) assert.equal(settlements.filter(entry => entry.stage === stage).length, count);

@@ -13,9 +13,20 @@ import { validateReviewerReport, validateWorkerReport, workerHandoffFromReviewer
 import { transitionAfterReview } from "./three-role-flow.ts";
 import { monitorPane, routeMonitorFailure } from "./pane-monitor.ts";
 import { reviewPlan, reviewDiff, resolveReviewMode, executeDiffProcess, type PlanGateResult, type DiffGateResult } from "./human-review-gates.ts";
+import { assertSuccessQualityState, captureFingerprintMap, changedPathsBetween, compareWorkerEvidence, hashQualityContract, validateQualityContract, qualityContractArtifact, type QualityContract, type FingerprintMap } from "./quality-contract.ts";
+import { runSandboxedVerification } from "./verifier-tools.ts";
+import { createHash } from "node:crypto";
 export { routeMonitorFailure } from "./pane-monitor.ts";
 export function abortBeforePaneStart() { return { status: "aborted" as const, evidence: "pipeline aborted before pane startup; no child was started; pane preserved" }; }
 export function shouldSplitForAttempt(paneId: string) { return paneId.length === 0; }
+export async function assertSuccessQualityEvidence(metadata: any, artifactDir: string, contract: QualityContract) {
+  const artifactNames = await fs.readdir(artifactDir).catch(() => []);
+  const gate = assertSuccessQualityState(metadata, contract, artifactNames);
+  const expectedIds = contract.requiredChecks.map(item => item.id).sort();
+  let artifact: any;
+  try { artifact = JSON.parse(await fs.readFile(path.join(artifactDir, gate.artifact), "utf8")); } catch { throw new Error("SUCCESS quality gate artifact is missing or invalid"); }
+  if (artifact.status !== "passed" || JSON.stringify(artifact.checks?.map((item: any) => item.id).sort()) !== JSON.stringify(expectedIds)) throw new Error("SUCCESS quality gate artifact does not prove the required checks");
+}
 export function assertInitialLayout(layout: any, parentPaneId: string) {
   const ids = Array.isArray(layout?.panes) ? layout.panes.map((pane: any) => pane?.pane_id) : [];
   if (ids.length !== 1 || ids[0] !== parentPaneId || !Array.isArray(layout?.splits) || layout.splits.length !== 0) {
@@ -31,8 +42,10 @@ export async function rollbackPane(paneId: string, run: LayoutCommand = (program
 const MODELS = { implement: "openai-codex/gpt-5.6-luna", review: "openai-codex/gpt-5.6-sol" } as const;
 type Stage = "implement" | "review";
 type StageStatus = "pending" | "running" | "passed" | "failed" | "blocked" | "aborted";
-type Input = { task: string; approvedPlan: string; cwd?: string; maxRepairCycles?: number; maxReviewCycles?: number; cleanupMode?: "ask" | "on-success" | "never"; planReviewMode?: "ask" | "required" | "skip"; diffReviewMode?: "ask" | "required" | "skip" };
+type Input = { task: string; approvedPlan: string; qualityContract: QualityContract; cwd?: string; maxRepairCycles?: number; maxReviewCycles?: number; cleanupMode?: "ask" | "on-success" | "never"; planReviewMode?: "ask" | "required" | "skip"; diffReviewMode?: "ask" | "required" | "skip" };
 type CommandResult = { code: number; stdout: string; stderr: string };
+type QualityGateResult = { gate: number; status: "passed" | "failed" | "cancelled"; checks: Array<{ id: string; argv: string[]; exit: number; exitCode: number; timeout: boolean; timedOut: boolean; cancelled: boolean; outputHash: string; summary: string }> };
+type QualityMismatch = { signature: string; errors: string[]; actualPaths: string[]; reportedPaths: string[]; violations: Array<{ type: string; contractId: string }> };
 type Attempt = { attempt: number; status: StageStatus; startedAt: string; finishedAt?: string; reportFile: string; paneId: string; verdict?: string; error?: string };
 type Pane = { paneId: string; name: string; model: string; attempts: Attempt[] };
 type LayoutCommand = (program: string, args: string[]) => Promise<CommandResult>;
@@ -74,6 +87,21 @@ function parse(value: CommandResult): any { try { return JSON.parse(value.stdout
 function field(value: unknown, name: string): string | undefined { if (!value || typeof value !== "object") return undefined; const r = value as Record<string, unknown>; if (typeof r[name] === "string") return r[name]; for (const v of Object.values(r)) { const x = field(v, name); if (x) return x; } return undefined; }
 function exactVerdict(text: string, choices: string[]): string | undefined { const lines = text.trim().split(/\r?\n/).map(x => x.trim()); if (!lines.length || lines.filter(x => /^VERDICT: /.test(x)).length !== 1) return undefined; const last = lines.at(-1)!; return choices.includes(last.slice("VERDICT: ".length)) ? last : undefined; }
 async function snapshot(cwd: string, dir: string, name: string) { const s = await command("git", ["status", "--short"], cwd), u = await command("git", ["diff", "--no-ext-diff"], cwd), st = await command("git", ["diff", "--cached", "--no-ext-diff"], cwd); if (s.code || u.code || st.code) throw new Error(`git snapshot failed: ${s.stderr || u.stderr || st.stderr}`); await atomicWrite(path.join(dir, `${name}-status.txt`), s.stdout); await atomicWrite(path.join(dir, `${name}-diff.patch`), `${u.stdout}\n\n# --- staged diff ---\n${st.stdout}`); }
+async function fingerprintSnapshot(cwd: string, dir: string, name: string): Promise<FingerprintMap> { const map = await captureFingerprintMap(cwd); await atomicWrite(path.join(dir, `${name}-fingerprint.json`), json(map)); return map; }
+function hashOutput(text: string) { return createHash("sha256").update(text, "utf8").digest("hex"); }
+async function runQualityGate(contract: QualityContract, cwd: string, gate: number, signal?: AbortSignal): Promise<QualityGateResult> {
+  const checks: QualityGateResult["checks"] = [];
+  for (const check of contract.requiredChecks) {
+    const timeoutMs = check.timeoutMs ?? 120000;
+    let result: { code: number; stdout: string; stderr: string; truncated: boolean; cancelled: boolean; timedOut: boolean };
+    try { result = await runSandboxedVerification(check.program, check.args, cwd, timeoutMs, signal); }
+    catch (error) { result = { code: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error), truncated: false, cancelled: !!signal?.aborted, timedOut: false }; }
+    const output = `${result.stdout}${result.stderr}`;
+    const status = result.timedOut ? "タイムアウトしました" : result.cancelled ? "キャンセルされました" : `終了コード${result.code}`;
+    checks.push({ id: check.id, argv: [check.program, ...check.args], exit: result.code, exitCode: result.code, timeout: result.timedOut, timedOut: result.timedOut, cancelled: result.cancelled, outputHash: hashOutput(output), summary: `独立check「${check.id}」は${status}。出力はSHA-256で記録しました。` });
+  }
+  return { gate, status: checks.every(check => check.exitCode === 0 && !check.timeout && !check.cancelled) ? "passed" : signal?.aborted ? "cancelled" : "failed", checks };
+}
 async function paneGet(id: string) { return parse(await command("herdr", ["pane", "get", id])); }
 function herdrEnvelope(result: CommandResult, operation: string): any {
   if (result.code) throw new Error(`Herdr ${operation} failed: ${result.stderr || result.stdout || `exit ${result.code}`}`);
@@ -159,18 +187,21 @@ async function waitPane(id: string, report: string, signal: AbortSignal | undefi
     },
   });
 }
-function promptFor(stage: Stage, task: string, dir: string, plan: string, review: string, attempt: number, workerReportPath = "", workerReportContent = "") {
+function promptFor(stage: Stage, task: string, dir: string, plan: string, review: string, attempt: number, workerReportPath = "", workerReportContent = "", contractJson = "", qualityGatePath = "", qualityGateContent = "", workerSnapshotAttempt = attempt) {
   const label = INFO[stage].label, report = path.join(dir, `${stage}-${attempt}.json`);
   const common = `あなたは${label}です。可視化された逐次pipelineの一員として、現在のrepositoryで作業してください。\n作業内容：\n${task}\n\nartifact保存先：${dir}。今回のattempt：${attempt}。`;
   const reportInstruction = `最後に必ずsubmit_stage_reportを呼び出し、structured JSON契約で報告してください。orchestratorが指定したpending先は${report}（attempt ${attempt}）です。`;
-  if (stage === "implement") return `${common}\n承認済み計画：\n${plan}\n${review ? `\nReviewerからの修正依頼（このstructured finding dataだけを使用）：\n${review}\n` : ""}承認済み計画の範囲だけを実装してください。sourceを変更し、実装・test・動作確認を行った結果を、COMPLETEDまたはBLOCKEDと日本語のsummary、changedScope、evidenceで報告してください。${reportInstruction}`;
-  return `${common}\n承認済み計画：\n${plan}\n現在のWorker report path：${workerReportPath}\nvalidator済みWorker report JSON本文：\n${workerReportContent}\n今回のattemptのsnapshot：${path.join(dir, `diffs/implement-${attempt}-status.txt`)} / ${path.join(dir, `diffs/implement-${attempt}-diff.patch`)}\nbaseline：${path.join(dir, "diffs/baseline-status.txt")} / ${path.join(dir, "diffs/baseline-diff.patch")}\nread-onlyの確認手段だけを使い、sourceを変更しないでください。独立した確認として、APPROVED、APPROVED_WITH_NOTES、CHANGES_REQUESTED、NEEDS_PLANNERとstructuredな日本語fieldを報告してください。${reportInstruction}`;
+  if (stage === "implement") return `${common}\n承認済み計画：\n${plan}\nquality contract（このJSONを厳守）：\n${contractJson}\n${review ? `\norchestratorからのsanitized修正finding（このstructured dataだけを使用）：\n${review}\n` : ""}承認済み計画の範囲だけを実装してください。sourceを変更し、実装・test・動作確認を行った結果を、COMPLETEDまたはBLOCKEDと日本語のsummary、changedScope、evidenceで報告してください。COMPLETEDのcompletedPlanItemsは契約の全planItemsをidごとに一度ずつ、BLOCKEDは実際に完了したcontract IDのsubsetだけを含め、日本語のevidenceを付けてください。どちらもchangedPathsにはbaseline以後のgit実diffを正確に列挙し、allowedPathPrefixesを守ってください。${reportInstruction}`;
+  return `${common}\n承認済み計画：\n${plan}\nquality contract（validator済み）：\n${contractJson}\n現在のWorker report path：${workerReportPath}\nvalidator済みWorker report JSON本文：\n${workerReportContent}\ncurrent quality-gate artifact path：${qualityGatePath}\nvalidator済みquality-gate内容：\n${qualityGateContent}\n今回のWorker attemptのactual snapshot：${path.join(dir, `diffs/implement-${workerSnapshotAttempt}-status.txt`)} / ${path.join(dir, `diffs/implement-${workerSnapshotAttempt}-diff.patch`)} / ${path.join(dir, `diffs/implement-${workerSnapshotAttempt}-fingerprint.json`)}\nbaseline：${path.join(dir, "diffs/baseline-status.txt")} / ${path.join(dir, "diffs/baseline-diff.patch")} / ${path.join(dir, "diffs/baseline-fingerprint.json")}\nread-onlyの確認手段だけを使い、sourceを変更しないでください。Workerの自己申告ではなくactual changed pathsと独立check結果を確認し、APPROVED、APPROVED_WITH_NOTES、CHANGES_REQUESTED、NEEDS_PLANNERとstructuredな日本語fieldを報告してください。${reportInstruction}`;
 }
 
 export default function (pi: ExtensionAPI) {
   registerCleanupTool(pi, rootDir());
   registerResetTool(pi, rootDir());
-  pi.registerTool({ name: "development_pipeline", label: "Development Pipeline", description: "可視のHerdrペインで監査可能な開発パイプラインを実行します。", parameters: Type.Object({ task: Type.String({ description: "User-approved development task" }), approvedPlan: Type.String({ description: "Plan approved in the parent Sol conversation" }), cwd: Type.Optional(Type.String()), maxReviewCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), maxRepairCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), cleanupMode: Type.Optional(Type.String({ description: "ask, on-success, or never; defaults to ask" })), planReviewMode: Type.Optional(Type.String({ description: "計画レビュー: ask, required, skip（既定 ask）" })), diffReviewMode: Type.Optional(Type.String({ description: "差分レビュー: ask, required, skip（既定 ask）" })) }), async execute(_id, input: Input, signal, onUpdate, ctx) {
+  pi.registerTool({ name: "development_pipeline", label: "Development Pipeline", description: "可視のHerdrペインで監査可能な開発パイプラインを実行します。", parameters: Type.Object({ task: Type.String({ description: "User-approved development task" }), approvedPlan: Type.String({ description: "Plan approved in the parent Sol conversation" }), qualityContract: Type.Object({ planItems: Type.Array(Type.Object({ id: Type.String(), description: Type.String() })), requiredChecks: Type.Array(Type.Object({ id: Type.String(), program: Type.String(), args: Type.Array(Type.String()), timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 300000 })) })), allowedPathPrefixes: Type.Optional(Type.Array(Type.String())) }), cwd: Type.Optional(Type.String()), maxReviewCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), maxRepairCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), cleanupMode: Type.Optional(Type.String({ description: "ask, on-success, or never; defaults to ask" })), planReviewMode: Type.Optional(Type.String({ description: "計画レビュー: ask, required, skip（既定 ask）" })), diffReviewMode: Type.Optional(Type.String({ description: "差分レビュー: ask, required, skip（既定 ask）" })) }), async execute(_id, input: Input, signal, onUpdate, ctx) {
+    const contractCheck = validateQualityContract(input?.qualityContract);
+    if (!contractCheck.valid) throw new Error(`Invalid qualityContract: ${contractCheck.error}`);
+    const qualityContract = contractCheck.value;
     const task = input.task?.trim(), approvedPlan = input.approvedPlan?.trim(), cwd = path.resolve(input.cwd?.trim() || ctx.cwd);
     if (!task) throw new Error("task must not be empty");
     if (!approvedPlan) throw new Error("approvedPlan must not be empty; planning is expected in the parent Sol conversation");
@@ -182,8 +213,10 @@ export default function (pi: ExtensionAPI) {
     try { if (!(await fs.stat(cwd)).isDirectory()) throw new Error(); } catch { throw new Error(`cwd does not exist: ${cwd}`); }
     await preflightVerifierSandbox(cwd);
     const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`, artifactDir = path.join(rootDir(), "artifacts", path.basename(cwd) || "repository", id), diffs = path.join(artifactDir, "diffs"); await fs.mkdir(diffs, { recursive: true });
-    await atomicWrite(path.join(artifactDir, "request.md"), `# 依頼\n\n${task}\n\n対象: ${cwd}\n`); await atomicWrite(path.join(artifactDir, "approved-plan.md"), `# 承認済み計画\n\n${approvedPlan}\n`); await snapshot(cwd, diffs, "baseline");
-    const metadata: any = { targetRepository: path.basename(cwd), targetPath: cwd, startedAt: now(), parentPaneId: process.env.HERDR_PANE_ID, tabId: process.env.HERDR_TAB_ID, workspaceId: process.env.HERDR_WORKSPACE_ID, limitation: "baselineは既存のdirty変更を含むため、変更の帰属を完全には判定できません。", planning: { status: "pending", mode: planReviewMode, source: "親Plannerセッション", artifact: "approved-plan.md" }, humanReview: { planMode: planReviewMode, diffMode: diffReviewMode }, stages: Object.fromEntries(stages.filter(s => s !== "plan").map(s => [s, { status: "pending", attempts: [] }])), panes: [], repairCycles: 0 };
+    await atomicWrite(path.join(artifactDir, "request.md"), `# 依頼\n\n${task}\n\n対象: ${cwd}\n`); await atomicWrite(path.join(artifactDir, "approved-plan.md"), `# 承認済み計画\n\n${approvedPlan}\n`); await atomicWrite(path.join(artifactDir, "quality-contract.json"), json(qualityContractArtifact(qualityContract))); await snapshot(cwd, diffs, "baseline");
+    const baselineFingerprint = await fingerprintSnapshot(cwd, diffs, "baseline");
+    const qualityContractHash = hashQualityContract(qualityContract);
+    const metadata: any = { targetRepository: path.basename(cwd), targetPath: cwd, startedAt: now(), qualityContractHash, qualityContract: { sha256: qualityContractHash, artifact: "quality-contract.json" }, baselineFingerprint: "diffs/baseline-fingerprint.json", parentPaneId: process.env.HERDR_PANE_ID, tabId: process.env.HERDR_TAB_ID, workspaceId: process.env.HERDR_WORKSPACE_ID, limitation: "baseline fingerprintとの差分で今回変化したpathを機械的に照合します。", planning: { status: "pending", mode: planReviewMode, source: "親Plannerセッション", artifact: "approved-plan.md" }, humanReview: { planMode: planReviewMode, diffMode: diffReviewMode }, stages: Object.fromEntries(stages.filter(s => s !== "plan").map(s => [s, { status: "pending", attempts: [] }])), panes: [], repairCycles: 0, qualityGates: [], qualityContractBaselineCount: Object.keys(baselineFingerprint).length };
     await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
     const parentPaneId = metadata.parentPaneId as string;
     const emit = (stage: string, text: string) => onUpdate?.({ content: [{ type: "text", text: `${stage}: ${text}` }], details: { stage, artifactDir, panes: metadata.panes } });
@@ -193,8 +226,8 @@ export default function (pi: ExtensionAPI) {
       emit(stage, `進捗: 試行${attempt}、${reason}`);
     };
     let activePane: string | undefined, abortWork: Promise<boolean> | undefined, plan = approvedPlan, verification = "", review = "";
-    const runStage = async (stage: Stage, text: string, attempt: number): Promise<{ valid: boolean; positive: boolean; verdict?: string; text: string }> => {
-      const reportFile = path.join(artifactDir, `${stage}-${attempt}.json`), pendingReport = path.join(artifactDir, `${stage}-pending.json`), terminalFile = path.join(artifactDir, `${stage}-${attempt}.terminal.txt`), record: Attempt = { attempt, status: "running", startedAt: now(), reportFile: path.basename(reportFile), paneId: "" }; let terminalCaptured = false, snapshotSucceeded = true; let stageResult: { valid: boolean; positive: boolean; verdict?: string; text: string } = { valid: false, positive: false, text: "" };
+    const runStage = async (stage: Stage, text: string, attempt: number): Promise<{ valid: boolean; positive: boolean; verdict?: string; text: string; qualityMismatch?: QualityMismatch }> => {
+      const reportFile = path.join(artifactDir, `${stage}-${attempt}.json`), pendingReport = path.join(artifactDir, `${stage}-pending.json`), terminalFile = path.join(artifactDir, `${stage}-${attempt}.terminal.txt`), record: Attempt = { attempt, status: "running", startedAt: now(), reportFile: path.basename(reportFile), paneId: "" }; let terminalCaptured = false, snapshotSucceeded = true, parsed: any, report = ""; let stageResult: { valid: boolean; positive: boolean; verdict?: string; text: string; qualityMismatch?: QualityMismatch } = { valid: false, positive: false, text: "" };
       const stageData = metadata.stages[stage]; stageData.status = "running"; stageData.attempts.push(record); let pane = metadata.panes.find((p: Pane) => p.name === INFO[stage].label) as Pane | undefined;
       if (!pane) { pane = { paneId: "", name: INFO[stage].label, model: MODELS[stage], attempts: [] }; metadata.panes.push(pane); }
       pane.attempts.push(record); await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
@@ -241,10 +274,11 @@ export default function (pi: ExtensionAPI) {
         await renameDetectedPane(pane.paneId, pane.name);
         await captureTranscript(pane.paneId, terminalFile); terminalCaptured = true;
         const submitted = await fs.readFile(pendingReport, "utf8"); await atomicWrite(reportFile, submitted); await fs.rm(pendingReport, { force: true });
-        let report = ""; try { report = await fs.readFile(reportFile, "utf8"); } catch { record.error = "missing durable report"; }
-        let parsed: any; try { parsed = JSON.parse(report); } catch { parsed = undefined; }
+        try { report = await fs.readFile(reportFile, "utf8"); } catch { record.error = "missing durable report"; }
+        try { parsed = JSON.parse(report); } catch { parsed = undefined; }
         const checked = stage === "implement" ? (parsed ? validateWorkerReport(parsed) : { valid: false as const, error: "missing or malformed worker report" }) : (parsed ? validateReviewerReport(parsed) : { valid: false as const, error: "missing or malformed reviewer report" });
         const v = parsed?.verdict ? `VERDICT: ${parsed.verdict}` : undefined, valid = checked.valid, positive = valid && (stage === "implement" ? parsed.verdict === "COMPLETED" : parsed.verdict === "APPROVED" || parsed.verdict === "APPROVED_WITH_NOTES"); record.verdict = v;
+        if (stage === "implement") metadata.workerValidations = [...(metadata.workerValidations ?? []), { attempt, accepted: valid, verdict: parsed?.verdict, validator: "validateWorkerReport" }];
         record.status = valid ? (positive ? "passed" : "failed") : "failed"; stageData.status = record.status; if (!valid) record.error = record.error || (checked as any).error; stageResult.valid = valid; stageResult.positive = positive; stageResult.verdict = v; stageResult.text = report; return stageResult;
       } catch (e) {
         record.status = signal?.aborted ? "aborted" : "failed"; stageData.status = record.status; record.error = e instanceof Error ? e.message : String(e);
@@ -256,14 +290,53 @@ export default function (pi: ExtensionAPI) {
         }
         return { valid: false, positive: false, text: "" };
       }
-      finally { if (pane?.paneId && !terminalCaptured) { try { await captureTranscript(pane.paneId, terminalFile); } catch (e) { record.error = record.error || `terminal capture failed: ${e instanceof Error ? e.message : String(e)}`; } } record.finishedAt = now(); stageData.finishedAt = record.finishedAt; try { await snapshot(cwd, diffs, `${stage}-${attempt}`); } catch (e) { if (record.status !== "aborted") { record.status = "failed"; stageData.status = "failed"; snapshotSucceeded = false; record.error = `stage snapshot failed: ${e instanceof Error ? e.message : String(e)}`; stageResult.valid = false; stageResult.positive = false; stageResult.text = ""; } } if (signal?.aborted && pane?.paneId) { abortWork ??= interrupt(pane.paneId); const stopped = await abortWork; if (!stopped) record.error = record.error || "abort could not be confirmed"; } const finalized = finalizeStage(stageResult, snapshotSucceeded); stageResult.valid = finalized.valid; stageResult.positive = finalized.positive; stageResult.text = finalized.text; signal?.removeEventListener("abort", abortHandler); await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); }
+      finally { if (pane?.paneId && !terminalCaptured) { try { await captureTranscript(pane.paneId, terminalFile); } catch (e) { record.error = record.error || `terminal capture failed: ${e instanceof Error ? e.message : String(e)}`; } } record.finishedAt = now(); stageData.finishedAt = record.finishedAt; try { await snapshot(cwd, diffs, `${stage}-${attempt}`); const currentFingerprint = await fingerprintSnapshot(cwd, diffs, `${stage}-${attempt}`); stageData.fingerprint = `diffs/${stage}-${attempt}-fingerprint.json`; if (stage === "implement" && stageResult.valid && parsed) { const actualPaths = changedPathsBetween(baselineFingerprint, currentFingerprint); const evidence = compareWorkerEvidence(parsed, qualityContract, actualPaths); if (!evidence.valid) { const mismatch = { signature: evidence.signature, errors: evidence.errors, actualPaths, reportedPaths: parsed.changedPaths ?? [], violations: evidence.violations }; stageResult.qualityMismatch = mismatch; stageResult.valid = false; stageResult.positive = false; record.status = "failed"; stageData.status = "failed"; record.error = "WORKER_EVIDENCE_MISMATCH: " + evidence.errors.join("。 "); await atomicWrite(path.join(artifactDir, `quality-gate-${attempt}.json`), json({ gate: attempt, status: "failed", code: "WORKER_EVIDENCE_MISMATCH", details: "Workerの自己申告と実diffまたはquality contractが一致しません。", errors: evidence.errors, actualPaths, reportedPaths: parsed.changedPaths ?? [] })); } } } catch (e) { if (record.status !== "aborted") { record.status = "failed"; stageData.status = "failed"; snapshotSucceeded = false; record.error = `stage fingerprint failed: ${e instanceof Error ? e.message : String(e)}`; stageResult.valid = false; stageResult.positive = false; stageResult.text = ""; } } if (signal?.aborted && pane?.paneId) { abortWork ??= interrupt(pane.paneId); const stopped = await abortWork; if (!stopped) record.error = record.error || "abort could not be confirmed"; } const finalized = finalizeStage(stageResult, snapshotSucceeded); stageResult.valid = finalized.valid; stageResult.positive = finalized.positive; stageResult.text = finalized.text; signal?.removeEventListener("abort", abortHandler); await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); }
+    };
+    const qualityAfterWorker = async (worker: { qualityMismatch?: QualityMismatch }, attempt: number): Promise<string | undefined> => {
+      if (worker.qualityMismatch) {
+        const mismatch = worker.qualityMismatch;
+        const history = metadata.qualityContractViolations ?? (metadata.qualityContractViolations = []);
+        const repeated = history.some((entry: any) => entry.signature === mismatch.signature);
+        const sanitizedFinding = { code: "WORKER_EVIDENCE_MISMATCH", signature: mismatch.signature, violations: mismatch.violations.map(item => ({ type: item.type, contractId: item.contractId })), instruction: "quality contractと実diffに一致するreportへ修正してください。" };
+        history.push({ attempt, signature: mismatch.signature, violations: sanitizedFinding.violations, errors: mismatch.errors, actualPaths: mismatch.actualPaths, reportedPaths: mismatch.reportedPaths });
+        if (repeated) {
+          metadata.plannerReason = "同一signatureのquality evidence違反がquality repair後も再発したため、Planner裁定でLunaからSol Workerへ切り替える必要があります。";
+          metadata.qualityFallback = { reason: metadata.plannerReason, from: "Luna", to: "Sol Worker", automatic: false, trigger: "QC_REPEAT_UNREACHABLE" };
+          await atomicWrite(path.join(artifactDir, "quality-planner-escalation.json"), json(metadata.qualityFallback));
+          return "NEEDS_PLANNER";
+        }
+        if (history.length > 1) return "WORKER_EVIDENCE_MISMATCH";
+        metadata.qualityRepair = { status: "requested", sourceAttempt: attempt, nextAttempt: attempt + 1, paneId: metadata.panes.find((p: Pane) => p.name === INFO.implement.label)?.paneId, artifact: `quality-repair-${attempt}.json`, finding: sanitizedFinding };
+        await atomicWrite(path.join(artifactDir, `quality-repair-${attempt}.json`), json(sanitizedFinding));
+        await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
+        return "QUALITY_REPAIR";
+      }
+      const gate = await runQualityGate(qualityContract, cwd, attempt, signal);
+      const gateFile = `quality-gate-${attempt}.json`;
+      await atomicWrite(path.join(artifactDir, gateFile), json(gate));
+      metadata.qualityGates = [...(metadata.qualityGates ?? []), { ...gate, artifact: gateFile }];
+      await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
+      return gate.status === "passed" ? undefined : "QUALITY_GATE_FAILED";
+    };
+    let implementAttempt = 0;
+    const resolveQualityMismatch = async (worker: Awaited<ReturnType<typeof runStage>>, repairContext: string) => {
+      if (!worker.qualityMismatch) return { worker };
+      const decision = await qualityAfterWorker(worker, implementAttempt);
+      if (decision !== "QUALITY_REPAIR") return { worker, outcome: decision };
+      implementAttempt++;
+      const finding = json(metadata.qualityRepair.finding);
+      const repaired = await runStage("implement", promptFor("implement", task, artifactDir, plan, finding, implementAttempt, "", "", json(qualityContract)), implementAttempt);
+      metadata.qualityRepair = { ...metadata.qualityRepair, status: repaired.qualityMismatch ? "failed" : "completed", completedAttempt: implementAttempt, context: repairContext };
+      await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
+      if (!repaired.qualityMismatch) return { worker: repaired };
+      return { worker: repaired, outcome: await qualityAfterWorker(repaired, implementAttempt) };
     };
     const finish = async (outcome: string) => { if (signal?.aborted) { if (activePane) { const stopped = abortWork ? await abortWork : await interrupt(activePane); if (!stopped) metadata.abortError = "Herdr could not confirm the active pane became idle"; } outcome = "ABORTED"; } if (outcome === "ABORTED" && !metadata.cleanup) metadata.cleanup = { status: "aborted", results: (metadata.panes ?? []).map((pane: Pane) => ({ paneId: pane.paneId, name: pane.name, status: "skipped", reason: "cleanupは中断されました" })) }; metadata.finishedAt = now(); metadata.outcome = outcome; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); return { content: [{ type: "text", text: `${outcome}\n成果物: ${artifactDir}\n${outcome === "SUCCESS" ? "cleanupの判断待ちです。" : "子ペインを保持しました。"}` }], details: { outcome, cleanupDecision: cleanupMode, artifactDir, panes: metadata.panes } }; };
     let cycle = 0;
     const hasReviewEventBus = !!(pi as any).events;
     const reviewEventBus = (pi as any).events ?? { emit: async () => { throw new Error("review event bus is unavailable"); } };
     if (signal?.aborted) {
-      await runStage("implement", promptFor("implement", task, artifactDir, plan, "", 1), 1);
+      await runStage("implement", promptFor("implement", task, artifactDir, plan, "", 1, "", "", json(qualityContract)), 1);
       return finish("ABORTED");
     }
     const planGate = await reviewPlan({ mode: planReviewMode, planContent: approvedPlan, planFilePath: path.join(artifactDir, "approved-plan.md"), origin: "親Plannerセッション", eventBus: reviewEventBus, signal, confirm: ctx.hasUI && hasReviewEventBus ? () => ctx.ui.confirm("計画を人間に確認してもらいますか？", "承認されるまで子ペインは起動しません。") : undefined });
@@ -273,9 +346,14 @@ export default function (pi: ExtensionAPI) {
     if (signal?.aborted || planGate.decision === "aborted") return finish("ABORTED");
     if (planGate.decision === "rejected") return finish("PLAN_REJECTED");
     if (planReviewMode === "required" && planGate.decision !== "approved") return finish("PLAN_REVIEW_UNAVAILABLE");
-    let implemented = await runStage("implement", promptFor("implement", task, artifactDir, plan, "", 1), 1);
+    implementAttempt = 1;
+    let implemented = await runStage("implement", promptFor("implement", task, artifactDir, plan, "", implementAttempt, "", "", json(qualityContract)), implementAttempt);
+    let qualityResolution = await resolveQualityMismatch(implemented, "initial"); implemented = qualityResolution.worker;
+    if (qualityResolution.outcome) return finish(signal?.aborted ? "ABORTED" : qualityResolution.outcome);
     if (!implemented.positive) return finish(signal?.aborted ? "ABORTED" : implemented.valid ? "IMPLEMENTATION_BLOCKED" : "IMPLEMENTATION_FAILED");
-    let reviewed = await runStage("review", promptFor("review", task, artifactDir, plan, "", 1, path.join(artifactDir, "implement-1.json"), implemented.text), 1); review = reviewed.text;
+    const initialQualityOutcome = await qualityAfterWorker(implemented, implementAttempt); if (initialQualityOutcome) return finish(initialQualityOutcome);
+    const initialGateContent = await fs.readFile(path.join(artifactDir, `quality-gate-${implementAttempt}.json`), "utf8");
+    let reviewed = await runStage("review", promptFor("review", task, artifactDir, plan, "", 1, path.join(artifactDir, `implement-${implementAttempt}.json`), implemented.text, json(qualityContract), path.join(artifactDir, `quality-gate-${implementAttempt}.json`), initialGateContent, implementAttempt), 1); review = reviewed.text;
     if (!reviewed.valid) return finish(signal?.aborted ? "ABORTED" : "REVIEW_FAILED");
     while (!reviewed.positive) {
       const reviewData = (() => { try { return JSON.parse(reviewed.text); } catch { return undefined; } })();
@@ -286,9 +364,14 @@ export default function (pi: ExtensionAPI) {
       if (transition.outcome === "CHANGES_REQUIRED") return finish("CHANGES_REQUIRED");
       cycle++; metadata.repairCycles = cycle;
       const handoff = JSON.stringify(workerHandoffFromReviewer(reviewData));
-      implemented = await runStage("implement", promptFor("implement", task, artifactDir, plan, handoff, cycle + 1), cycle + 1);
-      if (!implemented.positive) return finish(signal?.aborted ? "ABORTED" : "IMPLEMENTATION_BLOCKED");
-      reviewed = await runStage("review", promptFor("review", task, artifactDir, plan, handoff, cycle + 1, path.join(artifactDir, `implement-${cycle + 1}.json`), implemented.text), cycle + 1); review = reviewed.text;
+      implementAttempt++;
+      implemented = await runStage("implement", promptFor("implement", task, artifactDir, plan, handoff, implementAttempt, "", "", json(qualityContract)), implementAttempt);
+      qualityResolution = await resolveQualityMismatch(implemented, `review-${cycle}`); implemented = qualityResolution.worker;
+      if (qualityResolution.outcome) return finish(signal?.aborted ? "ABORTED" : qualityResolution.outcome);
+      if (!implemented.positive) return finish(signal?.aborted ? "ABORTED" : implemented.valid ? "IMPLEMENTATION_BLOCKED" : "IMPLEMENTATION_FAILED");
+      const repairQualityOutcome = await qualityAfterWorker(implemented, implementAttempt); if (repairQualityOutcome) return finish(repairQualityOutcome);
+      const repairGateContent = await fs.readFile(path.join(artifactDir, `quality-gate-${implementAttempt}.json`), "utf8");
+      reviewed = await runStage("review", promptFor("review", task, artifactDir, plan, handoff, cycle + 1, path.join(artifactDir, `implement-${implementAttempt}.json`), implemented.text, json(qualityContract), path.join(artifactDir, `quality-gate-${implementAttempt}.json`), repairGateContent, implementAttempt), cycle + 1); review = reviewed.text;
       if (!reviewed.valid) return finish(signal?.aborted ? "ABORTED" : "REVIEW_FAILED");
     }
     const finalReview = JSON.parse(reviewed.text); const finalTransition = transitionAfterReview(finalReview, metadata.reviewIds ?? [], cycle, { maxReviewCycles: input.maxReviewCycles, maxRepairCycles: input.maxRepairCycles });
@@ -301,6 +384,7 @@ export default function (pi: ExtensionAPI) {
     if (diffGate.decision === "aborted" || signal?.aborted) return finish("ABORTED");
     if (diffGate.decision === "changes_requested") return finish("HUMAN_CHANGES_REQUESTED");
     if (diffReviewMode === "required" && diffGate.decision !== "approved") return finish(diffGate.decision === "timeout" ? "HUMAN_DIFF_REVIEW_TIMEOUT" : `HUMAN_DIFF_REVIEW_${diffGate.decision.toUpperCase()}`);
+    await assertSuccessQualityEvidence(metadata, artifactDir, qualityContract);
     const finalResult: any = await finish("SUCCESS"); let cleanupMessage = cleanupMode === "never" ? "cleanupは無効です。子ペインを保持しました。" : "cleanupは実行されませんでした。子ペインを保持しました。";
     let confirmed = false;
     try {

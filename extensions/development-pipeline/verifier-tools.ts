@@ -33,6 +33,17 @@ export function run(program: string, args: string[], cwd: string, timeout: numbe
   });
 }
 
+export function sandboxCommand(program: string, args: string[], cwd: string): string[] {
+  if (process.platform === "darwin") return ["/usr/bin/sandbox-exec", "-p", `(version 1) (deny default) (allow process*) (allow file-read*) (allow network*) (allow file-write* (subpath "/tmp"))`, "--", program, ...args];
+  if (process.platform === "linux") return ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--chdir", cwd, "--", program, ...args];
+  throw new Error(`Verifier sandbox is unsupported on ${process.platform}`);
+}
+export async function runSandboxedVerification(program: string, args: string[], cwd: string, timeoutMs: number, signal?: AbortSignal) {
+  await preflightVerifierSandbox(cwd);
+  const command = sandboxCommand(program, args, cwd);
+  return run(command[0], command.slice(1), cwd, timeoutMs, signal);
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "run_verification_command",
@@ -42,13 +53,8 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, input: { program: string; args: string[]; timeoutMs?: number }, signal: AbortSignal) {
       const cwd = process.env.YORISHIRO_TARGET_CWD;
       if (!cwd) throw new Error("Verifier sandbox is not configured");
-      await preflightVerifierSandbox(cwd);
       const timeout = input.timeoutMs ?? 120000;
-      let command: string[];
-      if (process.platform === "darwin") command = ["/usr/bin/sandbox-exec", "-p", `(version 1) (deny default) (allow process*) (allow file-read*) (allow network*) (allow file-write* (subpath \"/tmp\"))`, "--", input.program, ...input.args];
-      else if (process.platform === "linux") command = ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--chdir", cwd, "--", input.program, ...input.args];
-      else throw new Error(`Verifier sandbox is unsupported on ${process.platform}`);
-      const result = await run(command[0], command.slice(1), cwd, timeout, signal);
+      const result = await runSandboxedVerification(input.program, input.args, cwd, timeout, signal);
       const status = result.timedOut ? "TIMEOUT" : result.cancelled ? "CANCELLED" : "EXIT";
       const statusLine = `\n[verification ${status} exit=${result.code}]`;
       const raw = `${result.stdout}${result.stderr}`;

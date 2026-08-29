@@ -48,13 +48,15 @@ cd work/example
 
 パイプラインはHerdr内で起動したPiからのみ実行できます。現在のタブを、親55%、右45%のWorker／Reviewer上下2段へ分割します。子は通常のPi TUIとして表示され、修正と再レビューでは同じペインを再利用します。子からパイプラインを再帰起動することはできません。
 
-WorkerとReviewerは中央validatorが検証する構造化JSONで報告します。Reviewerの判定は`APPROVED`、`APPROVED_WITH_NOTES`、`CHANGES_REQUESTED`、`NEEDS_PLANNER`です。Workerへ戻す情報はblocking findingだけに制限し、Reviewerの生出力やtranscriptは渡しません。同じ指摘IDの再発や、修正後に理由なく追加されたblockingは`NEEDS_PLANNER`で止まります。
+WorkerとReviewerは中央validatorが検証する構造化JSONで報告します。`development_pipeline`には必須の`qualityContract`（承認項目、独立check、任意の変更path prefix）を渡します。契約はSHA-256とともに`quality-contract.json`／`run.json`へ保存されます。`COMPLETED`は`completedPlanItems`のcontract ID exact一致、`changedPaths`の実diff exact一致、prefix遵守、独立checks成功が必須です。`BLOCKED`は完了済みcontract IDのsubset（unknown／duplicate不可）とactual `changedPaths` exact一致、prefix遵守を必須とし、独立checksとReviewerを起動せず`IMPLEMENTATION_BLOCKED`で終わります。BLOCKEDでも虚偽ID／path／prefix違反は許しません。
+
+Quality evidence不一致の初回だけ、Reviewerを起動せず同じWorkerペインへpath本文を除いたsanitized findingを送り、quality repairを1回行います。signatureは違反種別とcontract item/check IDで安定化します。同じsignatureの再発はSol Workerへの切替理由をartifactへ残して`NEEDS_PLANNER`、異なる2回目の違反は`WORKER_EVIDENCE_MISMATCH`で停止し、loopしません。COMPLETEDのReviewer開始前にはrequiredChecksをread-only sandboxで順次実行し、失敗・timeout・cancelは`QUALITY_GATE_FAILED`として停止します。Reviewerの判定は`APPROVED`、`APPROVED_WITH_NOTES`、`CHANGES_REQUESTED`、`NEEDS_PLANNER`です。Workerへ戻す情報はsanitized blocking findingだけに制限し、Reviewerの生出力やtranscriptは渡しません。同じ指摘IDの再発や、修正後に理由なく追加されたblockingは`NEEDS_PLANNER`で止まります。
 
 修正回数は`maxReviewCycles`で指定でき、既定2、上限3です。旧`maxRepairCycles`も互換入力として受理し、両方指定時は`maxReviewCycles`を優先します。欠落・不正レポート、プロセス失敗、timeout、中断は安全側で停止します。失敗・中断・Planner判断待ちでは子ペインを残します。
 
 Reviewerの検証コマンドはmacOSの`sandbox-exec`またはLinuxのbubblewrap/user namespaceによるread-only sandboxで実行します。未対応環境、sandbox未導入環境、`/tmp`配下の対象は作業開始前に拒否します。
 
-成果物は`artifacts/<repository>/<run-id>/`に保存されます。主な内容は依頼、承認済み計画、`plan-review.json`、`diff-review.json`、各attemptの構造化report、baselineと各stageのstatus/diff、`run.json`です。既存のdirty変更はbaselineとして保持しますが、変更の帰属を完全には判定できません。
+成果物は`artifacts/<repository>/<run-id>/`に保存されます。主な内容は依頼、承認済み計画、`quality-contract.json`、`plan-review.json`、`diff-review.json`、各attemptの構造化report、quality gate結果、baselineと各Worker stageのstatus/diff/fingerprint、`run.json`です。baseline fingerprintとの差分で既存dirty pathの内容変更、untracked・deleted・renameも検出します。
 
 成功時の整理は`cleanupMode`で制御します。
 

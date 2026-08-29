@@ -20,7 +20,7 @@ try {
   assert.match(await readFile(report, "utf8"), /VERDICT: PASS\n$/);
   await assert.rejects(() => tools[0].execute("test", { verdict: "READY", summary: "bad", evidence: "bad" }));
   process.env.YORISHIRO_REPORT_SCHEMA = "worker";
-  const workerReport = { verdict: "BLOCKED", summary: "日本語の作業報告", changedScope: "変更なし", evidence: "テスト未実行" };
+  const workerReport = { verdict: "BLOCKED", summary: "日本語の作業報告", changedScope: "変更なし", evidence: "テスト未実行", completedPlanItems: [{ id: "PLAN-1", evidence: "項目を確認しました" }], changedPaths: [] };
   await tools[0].execute("test", workerReport);
   assert.deepEqual(JSON.parse(await readFile(report, "utf8")), workerReport);
   await assert.rejects(() => tools[0].execute("test", { ...workerReport, summary: "blocked" }));

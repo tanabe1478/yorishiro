@@ -60,7 +60,7 @@ async function executeScenario(scenario, aborted = false) {
   process.env.FAKE_HERDR_STARTS = "";
   const controller = new AbortController();
   if (aborted) controller.abort();
-  const result = await pipeline.execute("test", { task: "routing test", approvedPlan: "approved", cwd: root, cleanupMode: "never" }, controller.signal, update => {
+  const result = await pipeline.execute("test", { task: "routing test", approvedPlan: "approved", qualityContract: { planItems: [{ id: "PLAN-1", description: "実装する" }], requiredChecks: [{ id: "CHECK-1", program: "/usr/bin/true", args: [] }] }, cwd: root, cleanupMode: "never" }, controller.signal, update => {
     if (scenario === "abort" && update?.content?.[0]?.text.includes("pane is running")) controller.abort();
   }, { cwd: root, hasUI: false });
   const artifact = result.details.artifactDir;

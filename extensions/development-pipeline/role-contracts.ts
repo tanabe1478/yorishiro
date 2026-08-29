@@ -1,7 +1,11 @@
 export type WorkerVerdict = "COMPLETED" | "BLOCKED";
 export type FindingRoute = "worker" | "planner";
 export type ReviewerVerdict = "APPROVED" | "APPROVED_WITH_NOTES" | "CHANGES_REQUESTED" | "NEEDS_PLANNER";
-export type WorkerReport = { verdict: WorkerVerdict; summary: string; changedScope: string; evidence: string };
+import type { QualityContract } from "./quality-contract.ts";
+import { isRepositoryRelativePath } from "./quality-contract.ts";
+
+export type WorkerPlanItem = { id: string; evidence: string };
+export type WorkerReport = { verdict: WorkerVerdict; summary: string; changedScope: string; evidence: string; completedPlanItems: WorkerPlanItem[]; changedPaths: string[] };
 export type FindingDiscovery = "initial" | "repair_regression" | "previously_missed";
 export type FindingSeverity = "critical" | "high" | "medium" | "low";
 export type BlockingFinding = { id: string; severity: "critical" | "high"; target: string; reproduction: string; userImpact: string; expectedOutcome: string; route: FindingRoute; discovery: FindingDiscovery; missedReason?: string };
@@ -16,11 +20,20 @@ function fail(error: string): Validation { return { valid: false, error }; }
 function plain(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
 function exact(value: Record<string, unknown>, keys: readonly string[]) { const actual=Reflect.ownKeys(value); return actual.length === keys.length && keys.every(key=>Object.prototype.hasOwnProperty.call(value,key)) && actual.every(key=>typeof key === "string" && keys.includes(key)); }
 
-export function validateWorkerReport(value: unknown): Validation {
-  if (!plain(value) || !exact(value,["verdict","summary","changedScope","evidence"])) return fail("worker report must be a plain object with exact fields");
-  const r=value as Record<string, unknown>;
+export function validateWorkerReport(value: unknown, contract?: QualityContract): Validation {
+  if (!plain(value) || !exact(value,["verdict","summary","changedScope","evidence","completedPlanItems","changedPaths"])) return fail("worker report must be a plain object with exact fields");
+  const r=value as Record<string, unknown>, items=r.completedPlanItems, paths=r.changedPaths;
   if (r.verdict !== "COMPLETED" && r.verdict !== "BLOCKED") return fail("worker verdict is invalid");
   if (!japanese(r.summary) || !japanese(r.changedScope) || !japanese(r.evidence)) return fail("worker summary, changedScope, and evidence must be Japanese and nonempty");
+  if (!Array.isArray(items) || !items.every(item => plain(item) && exact(item,["id","evidence"]) && text(item.id) && japanese(item.evidence))) return fail("completedPlanItems must contain exact canonical IDs and Japanese evidence");
+  const planIds=(items as Record<string,unknown>[]).map(item=>item.id as string);
+  if (new Set(planIds).size !== planIds.length) return fail("completedPlanItems IDs must be unique");
+  if (!Array.isArray(paths) || !paths.every(isRepositoryRelativePath) || new Set(paths).size !== paths.length) return fail("changedPaths must be unique repository-relative paths");
+  if (contract) {
+    const contractIds=new Set(contract.planItems.map(item=>item.id));
+    if (planIds.some(item=>!contractIds.has(item))) return fail("completedPlanItems contains an unknown quality contract ID");
+    if (r.verdict === "COMPLETED" && planIds.length !== contractIds.size) return fail("COMPLETED completedPlanItems IDs must exactly match the quality contract");
+  }
   return {valid:true};
 }
 

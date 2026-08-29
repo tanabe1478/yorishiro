@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 const { validateWorkerReport, validateReviewerReport, workerHandoffFromReviewer } = await import("../extensions/development-pipeline/role-contracts.ts");
 
-const worker = { verdict: "COMPLETED", summary: "日本語の完了報告", changedScope: "ソース変更のみ", evidence: "テスト成功" };
+const worker = { verdict: "COMPLETED", summary: "日本語の完了報告", changedScope: "ソース変更のみ", evidence: "テスト成功", completedPlanItems: [{ id: "PLAN-1", evidence: "計画項目を確認しました" }], changedPaths: [] };
 assert.equal(validateWorkerReport(worker).valid, true);
 for (const key of ["summary", "changedScope", "evidence"]) assert.equal(validateWorkerReport({ ...worker, [key]: "" }).valid, false);
 assert.equal(validateWorkerReport({ ...worker, verdict: "BLOCKED" }).valid, true);

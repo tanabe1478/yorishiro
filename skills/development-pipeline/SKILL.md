@@ -21,7 +21,13 @@ description: Run the approved development pipeline in stable Herdr worker panes 
 
 ## 報告と判定
 
-WorkerとReviewerは`submit_stage_report`で構造化JSONを提出する。中央validatorを通過しない報告は失敗として扱う。
+WorkerとReviewerは`submit_stage_report`で構造化JSONを提出する。中央validatorを通過しない報告は失敗として扱う。`development_pipeline`の必須`qualityContract`は、非空でIDが一意な`planItems`／`requiredChecks`と任意の`allowedPathPrefixes`から成ります。契約はSHA-256で`quality-contract.json`と`run.json`へ記録します。
+
+`COMPLETED` reportは契約の全項目を一度ずつ示す日本語の`completedPlanItems`、repository-relativeで一意な`changedPaths`、allowed prefix遵守を必須とする。baselineとWorker終了時のgit fingerprint差分をexact set照合する。`BLOCKED`は`completedPlanItems`を完了済みcontract IDのsubsetとし（unknown／duplicate禁止）、`changedPaths`はactual exact、prefixは必須とする。正当なBLOCKEDでは独立checksとReviewerを起動せず`IMPLEMENTATION_BLOCKED`とするが、unknown item、虚偽path、prefix違反は`WORKER_EVIDENCE_MISMATCH`である。
+
+Quality evidence不一致の初回だけ、違反種別とcontract item/check IDから作るstable signatureおよびpath本文を含まないsanitized findingを、同じWorkerペインへ送りquality repairを1回許可する。この時点ではReviewerを起動しない。同じsignatureが再発したらLunaからSol Workerへ切り替えるPlanner理由をartifactに記録して`NEEDS_PLANNER`、異なる違反が2回目に出たら`WORKER_EVIDENCE_MISMATCH`で終端する。追加fallbackや無限loopは禁止する。
+
+COMPLETEDのWorker終了後、Reviewer開始前にrequiredChecksをshellなしのread-only sandboxで順次実行します。結果（argv、exit、timeout/cancel、出力SHA-256、要約）は`quality-gate-N.json`へ保存し、1件でも失敗すれば`QUALITY_GATE_FAILED`です。修正attemptごとに再実行します。validator通過したCOMPLETED event、当該attemptのquality gate eventとartifactが揃わない限り`SUCCESS`にしてはならない。
 
 Reviewer判定:
 
@@ -36,7 +42,7 @@ Workerへはsanitized findingだけを渡し、Reviewerのsummary、note、生�
 
 ## 証跡と安全性
 
-`artifacts/<repository>/<run-id>/`へ依頼、承認済み計画、各attemptのreport、terminal記録、baseline／stage別status・diff、`run.json`を保存する。開始時のdirty treeはbaselineとして残すが、変更の帰属は完全には判定できない。
+`artifacts/<repository>/<run-id>/`へ依頼、承認済み計画、quality contract、各attemptのreport、quality gate、terminal記録、baseline／stage別status・diff・fingerprint、`run.json`を保存する。baseline fingerprintとの差分で既存dirty pathの内容変更、untracked・deleted・renameも検出する。
 
 起動、process-info、timeout、中断、欠落・不正reportはfail closedで扱う。中断時は`ctrl+c`と`escape`で停止を試み、証跡とペインを残す。Reviewerのコマンドはread-only sandbox内だけで実行する。
 
