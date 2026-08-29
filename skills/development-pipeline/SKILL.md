@@ -14,8 +14,8 @@ description: Run the approved development pipeline in stable Herdr worker panes 
 ## 役割とペイン
 
 - Planner: 親セッション。要件、計画、Reviewer指摘の採否を判断する。
-- Worker · Luna: `openai-codex/gpt-5.6-luna`。実装、テスト、ビルド、動作確認、修正を行う。
-- Reviewer · Sol: `openai-codex/gpt-5.6-sol`。read-onlyレビューとsandbox検証を行う。
+- Worker · Luna: `openai-codex/gpt-5.6-luna`、既定thinking `high`。実装、テスト、ビルド、動作確認、修正を行う。
+- Reviewer · Sol: `openai-codex/gpt-5.6-sol`、既定thinking `medium`。read-onlyレビューとsandbox検証を行う。
 
 親55%、右45%とし、右列をWorker上／Reviewer下へ分割する。子は可視の通常Pi TUIであり、修正・再レビューでは同じペインを再利用する。子はYorishiroのSkillとExtensionを自動ロードせず、再帰起動できない。
 
@@ -48,7 +48,7 @@ Workerへはsanitized findingだけを渡し、Reviewerのsummary、note、生�
 - `on-success`: 成功時に閉じる
 - `never`: 残す
 
-失敗、中断、`NEEDS_PLANNER`、`CHANGES_REQUIRED`では自動cleanupしない。後から`development_pipeline_cleanup`を使える。新構成はReviewer→Worker、旧構成はReview→Verify→Implementの順で処理し、親、非idle、別runのペインを保護する。
+失敗、中断、`NEEDS_PLANNER`、`CHANGES_REQUIRED`では自動cleanupしない。成功用cleanupとは別の`development_pipeline_reset`を、canonical runDir・記録済みpane identity・workspace/tab・親保護・idle確認・明示confirmを満たす場合だけ使える。開始時に親以外のペインがある場合は`LAYOUT_OCCUPIED`として対象pane IDを記録して安全停止し、他人のペインを自動削除しない。後から`development_pipeline_cleanup`を使える。新構成はReviewer→Worker、旧構成はReview→Verify→Implementの順で処理し、親、非idle、別runのペインを保護する。
 
 ## 人間レビュー
 

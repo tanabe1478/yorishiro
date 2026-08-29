@@ -70,4 +70,44 @@ export async function cleanupRun(runDir: string, root: string, currentPane?: str
   metadata.cleanup={ requestedAt:metadata.cleanup.requestedAt, finishedAt:new Date().toISOString(), status:aborted?"aborted":results.every(r=>r.status==="closed")?"completed":"partial", results }; await atomic(runFile,metadata);
   return {results,summary:results.map(r=>`${r.name}: ${r.status}${r.reason?` (${r.reason})`:""}`).join("; ")};
 }
-export function registerCleanupTool(pi: ExtensionAPI, root: string) { pi.registerTool({ name:"development_pipeline_cleanup", label:"Development Pipeline Cleanup", description:"Safely close idle worker panes from a successful pipeline run.", parameters:Type.Object({runDir:Type.String({description:"Pipeline artifact run directory"})}), async execute(_id,input:{runDir:string},signal,_update,ctx) { const result=await cleanupRun(input.runDir,path.join(root,"artifacts"),process.env.HERDR_PANE_ID,signal); const durable=JSON.parse(await fs.readFile(path.join(await canonicalRun(input.runDir,path.join(root,"artifacts")),"run.json"),"utf8")); return {content:[{type:"text",text:`Cleanup: ${result.summary}`}],details:{...result,status:durable.cleanup?.status,outcome:durable.outcome}}; } }); }
+const RESETTABLE_OUTCOMES = new Set([
+  "ABORTED", "PLAN_REJECTED", "PLAN_REVIEW_UNAVAILABLE", "IMPLEMENTATION_BLOCKED", "IMPLEMENTATION_FAILED", "REVIEW_FAILED", "NEEDS_PLANNER", "CHANGES_REQUIRED", "HUMAN_CHANGES_REQUESTED", "HUMAN_DIFF_REVIEW_TIMEOUT", "HUMAN_DIFF_REVIEW_REJECTED", "HUMAN_DIFF_REVIEW_SKIPPED", "HUMAN_DIFF_REVIEW_UNAVAILABLE", "HUMAN_DIFF_REVIEW_ERROR", "HUMAN_DIFF_REVIEW_INVALID",
+]);
+export async function resetRun(runDir: string, root: string, context: { paneId?: string; workspaceId?: string; tabId?: string }, confirm: boolean, signal?: AbortSignal): Promise<{ results: Result[]; summary: string }> {
+  if (!confirm) throw new Error("resetには明示的なconfirm=trueが必要です");
+  const canonical = await canonicalRun(runDir, root), file = path.join(canonical, "run.json");
+  const metadata = JSON.parse(await fs.readFile(file, "utf8"));
+  if (!RESETTABLE_OUTCOMES.has(metadata.outcome)) throw new Error("resetはcanonicalな非SUCCESS終端outcomeだけに許可されます");
+  if (typeof metadata.finishedAt !== "string" || !metadata.finishedAt.trim()) throw new Error("reset runは未完了です");
+  const runIdentity = [metadata.parentPaneId, metadata.workspaceId, metadata.tabId];
+  const currentIdentity = [context.paneId, context.workspaceId, context.tabId];
+  if (![...runIdentity, ...currentIdentity].every(value => typeof value === "string" && value.length > 0)) throw new Error("run/current identityが不完全です");
+  if (context.paneId !== metadata.parentPaneId || context.workspaceId !== metadata.workspaceId || context.tabId !== metadata.tabId) throw new Error("現在のpane/workspace/tab identityがrun親と一致しません");
+  const panes = (metadata.panes ?? []) as Array<{ paneId?: string; name?: string }>;
+  const modern = MODERN_CLEANUP_ORDER.some(name => panes.some(pane => pane.name === name));
+  const legacy = CLEANUP_ORDER.some(name => panes.some(pane => pane.name === name));
+  const allowed = new Set<string>(modern && !legacy ? MODERN_CLEANUP_ORDER : !modern && legacy ? CLEANUP_ORDER : []);
+  const paneIds = panes.map(pane => pane.paneId).filter((paneId): paneId is string => typeof paneId === "string" && paneId.length > 0);
+  const duplicatePaneId = new Set(paneIds).size !== paneIds.length;
+  if (panes.length > 0 && (!allowed.size || panes.some(pane => !allowed.has(pane.name ?? "") || !pane.paneId) || [...allowed].some(name => panes.filter(pane => pane.name === name).length > 1) || duplicatePaneId)) throw new Error("reset対象のrole/pane identityが混在・不明・重複しています。close前に安全停止しました");
+  const results: Result[] = [];
+  const orderedPanes = [...allowed].flatMap(name => panes.filter(pane => pane.name === name));
+  for (const pane of orderedPanes) {
+    if (!pane.paneId || pane.paneId === metadata.parentPaneId || pane.paneId === context.paneId) { results.push({ paneId: pane.paneId ?? "", name: pane.name ?? "", status: "skipped", reason: "parent/current pane protected" }); continue; }
+    if (signal?.aborted) { results.push(cancelledResult(pane, pane.name ?? "")); continue; }
+    const infoResult = await command(["pane", "get", pane.paneId], signal), info = parse(infoResult.stdout);
+    if (infoResult.code || !info) { results.push({ paneId: pane.paneId, name: pane.name ?? "", status: "skipped", reason: "pane unavailable" }); continue; }
+    const workspace = field(info, ["workspace_id", "workspaceId"]), tab = field(info, ["tab_id", "tabId"]), actualName = field(info, ["name", "title", "label"]), state = field(info, ["agent_status", "agentStatus"]);
+    if (workspace !== metadata.workspaceId || tab !== metadata.tabId || actualName !== pane.name) { results.push({ paneId: pane.paneId, name: pane.name ?? "", status: "skipped", reason: "pane identity changed or incomplete" }); continue; }
+    if (!["idle", "done"].includes(state ?? "")) { results.push({ paneId: pane.paneId, name: pane.name ?? "", status: "skipped", reason: `pane is ${state ?? "unknown"}` }); continue; }
+    const closed = await command(["pane", "close", pane.paneId], signal);
+    results.push(closed.code === 0 ? { paneId: pane.paneId, name: pane.name ?? "", status: "closed" } : { paneId: pane.paneId, name: pane.name ?? "", status: "failed", reason: closed.stderr || "close failed" });
+  }
+  metadata.reset = { status: results.length > 0 && results.every(result => result.status === "closed") ? "completed" : "partial", finishedAt: new Date().toISOString(), results };
+  await atomic(file, metadata);
+  return { results, summary: results.map(result => `${result.name}: ${result.status}${result.reason ? ` (${result.reason})` : ""}`).join("; ") };
+}
+export function registerCleanupTool(pi: ExtensionAPI, root: string) {
+  pi.registerTool({ name:"development_pipeline_cleanup", label:"Development Pipeline Cleanup", description:"Safely close idle worker panes from a successful pipeline run.", parameters:Type.Object({runDir:Type.String({description:"Pipeline artifact run directory"})}), async execute(_id,input:{runDir:string},signal,_update,ctx) { const result=await cleanupRun(input.runDir,path.join(root,"artifacts"),process.env.HERDR_PANE_ID,signal); const durable=JSON.parse(await fs.readFile(path.join(await canonicalRun(input.runDir,path.join(root,"artifacts")),"run.json"),"utf8")); return {content:[{type:"text",text:`Cleanup: ${result.summary}`}],details:{...result,status:durable.cleanup?.status,outcome:durable.outcome}}; } });
+}
+export function registerResetTool(pi: ExtensionAPI, root: string) { pi.registerTool({ name:"development_pipeline_reset", label:"Development Pipeline Reset", description:"failed/aborted runのidle子ペインを明示確認後に安全に閉じます。", parameters:Type.Object({ runDir: Type.String({ description:"canonical pipeline artifact run directory" }), confirm: Type.Boolean({ description:"必ずtrueを明示する" }) }), async execute(_id, input:{runDir:string;confirm:boolean}, signal) { const result=await resetRun(input.runDir, path.join(root,"artifacts"), { paneId: process.env.HERDR_PANE_ID, workspaceId: process.env.HERDR_WORKSPACE_ID, tabId: process.env.HERDR_TAB_ID }, input.confirm, signal); return { content:[{type:"text",text:`Reset: ${result.summary}`}], details: result }; } }); }

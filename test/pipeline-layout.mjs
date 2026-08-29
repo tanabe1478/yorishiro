@@ -2,9 +2,14 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-const { splitPane, inspectLayout, validateGeometry, shouldSplitForAttempt, clearLaunchersAfterCleanup } = await import("../extensions/development-pipeline/index.ts");
+const { splitPane, inspectLayout, validateGeometry, assertInitialLayout, renameDetectedPane, shouldSplitForAttempt, clearLaunchersAfterCleanup } = await import("../extensions/development-pipeline/index.ts");
 assert.equal(shouldSplitForAttempt(""), true);
 assert.equal(shouldSplitForAttempt("existing-worker"), false, "retries reuse geometry and do not split again");
+assertInitialLayout({ panes: [{ pane_id: "parent" }], splits: [], zoomed: false }, "parent");
+assert.throws(() => assertInitialLayout({ panes: [{ pane_id: "parent" }, { pane_id: "other" }], splits: [{ direction: "right", ratio: 0.5 }], zoomed: false }, "parent"), /LAYOUT_OCCUPIED.*other/);
+await renameDetectedPane("worker", "Worker · Luna", async () => ({ code: 0, stdout: JSON.stringify({ result: { type: "pane_info", pane: { pane_id: "worker" } } }), stderr: "" }));
+await renameDetectedPane("worker", "Worker · Luna", async () => ({ code: 0, stdout: JSON.stringify({ result: { type: "ok", pane: { pane_id: "worker" } } }), stderr: "" }));
+await assert.rejects(() => renameDetectedPane("worker", "Worker · Luna", async () => ({ code: 0, stdout: JSON.stringify({ result: { type: "pane_info", pane: { pane_id: "other" } } }), stderr: "" })), /matching pane ID/);
 const calls = [];
 const layouts = [
   { panes: [{ pane_id: "parent" }, { pane_id: "implement" }], splits: [{ direction: "right", ratio: 0.55 }], zoomed: false },

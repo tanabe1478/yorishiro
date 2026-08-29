@@ -12,7 +12,7 @@ const id=n=>"fake:split"+n, count=()=>fs.readFileSync(log,"utf8").split("\\n").f
 if(a[0]==="status") process.stdout.write("{}\\n");
 else if(a[0]==="pane"&&a[1]==="split") process.stdout.write(JSON.stringify({result:{pane:{pane_id:id(count())}}})+"\\n");
 else if(a[0]==="pane"&&a[1]==="run") { const f=(a[3]||a[2]).replace(/^['"]|['"]$/g,""); const stage=f.split("/").pop().split("-")[0], body=stage==="implement"?JSON.stringify({verdict:"COMPLETED",summary:"日本語の実装報告",changedScope:"変更なし",evidence:"確認済み"}):JSON.stringify({verdict:"APPROVED",summary:"日本語のレビュー報告",blockingFindings:[],nonBlockingNotes:[],plannerQuestions:[]}); fs.writeFileSync(f.replace(/-launcher\\.sh$/, "-pending.json"), body); }
-else if(a[0]==="pane"&&a[1]==="rename") process.stdout.write(JSON.stringify({result:{type:"ok"}})+"\\n");
+else if(a[0]==="pane"&&a[1]==="rename") process.stdout.write(JSON.stringify({result:{type:"pane_info",pane:{pane_id:a[2]}}})+"\\n");
 else if(a[0]==="pane"&&a[1]==="layout") { const n=count(); process.stdout.write(JSON.stringify({result:{layout:{panes:["parent",...Array.from({length:n},(_,i)=>id(i+1))].map(pane_id=>({pane_id})),splits:[{direction:"right",ratio:.55},{direction:"down",ratio:.5},{direction:"down",ratio:.5}].slice(0,n),zoomed:false}}})+"\\n"); }
 else if(a[0]==="pane"&&a[1]==="get") { const n=Number(a[2].replace("fake:split","")), names=["Worker · Luna","Reviewer · Sol"]; process.stdout.write(JSON.stringify({workspace_id:process.env.HERDR_WORKSPACE_ID,tab_id:process.env.HERDR_TAB_ID,name:names[n-1],agent_status:"idle"})+"\\n"); }
 else if(a[0]==="pane"&&a[1]==="process-info") process.stdout.write('{"argv0":"pi"}\\n');

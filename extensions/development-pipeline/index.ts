@@ -7,7 +7,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { preflightVerifierSandbox } from "./sandbox.ts";
 import { finalizeStage, flowAfterReview, flowAfterVerification } from "./pipeline-flow.ts";
-import { cleanupRun, markRunAborted, registerCleanupTool, recordCleanupFailure } from "./cleanup.ts";
+import { cleanupRun, markRunAborted, registerCleanupTool, registerResetTool, recordCleanupFailure } from "./cleanup.ts";
 import { shouldCleanup } from "./cleanup-policy.ts";
 import { validateReviewerReport, validateWorkerReport, workerHandoffFromReviewer } from "./role-contracts.ts";
 import { transitionAfterReview } from "./three-role-flow.ts";
@@ -16,6 +16,17 @@ import { reviewPlan, reviewDiff, resolveReviewMode, executeDiffProcess, type Pla
 export { routeMonitorFailure } from "./pane-monitor.ts";
 export function abortBeforePaneStart() { return { status: "aborted" as const, evidence: "pipeline aborted before pane startup; no child was started; pane preserved" }; }
 export function shouldSplitForAttempt(paneId: string) { return paneId.length === 0; }
+export function assertInitialLayout(layout: any, parentPaneId: string) {
+  const ids = Array.isArray(layout?.panes) ? layout.panes.map((pane: any) => pane?.pane_id) : [];
+  if (ids.length !== 1 || ids[0] !== parentPaneId || !Array.isArray(layout?.splits) || layout.splits.length !== 0) {
+    const occupied = ids.filter((id: unknown): id is string => typeof id === "string" && id !== parentPaneId);
+    throw new Error(`LAYOUT_OCCUPIED: 現在のタブには既存ペインがあります（対象pane: ${occupied.join(", ") || "不明"}）。他人のペインは削除せず、安全停止しました。`);
+  }
+}
+export async function rollbackPane(paneId: string, run: LayoutCommand = (program, args) => command(program, args)) {
+  const result = await run("herdr", ["pane", "close", paneId]);
+  if (result.code) throw new Error(`Herdr pane rollback ${paneId} failed: ${result.stderr || result.stdout || `exit ${result.code}`}`);
+}
 
 const MODELS = { implement: "openai-codex/gpt-5.6-luna", review: "openai-codex/gpt-5.6-sol" } as const;
 type Stage = "implement" | "review";
@@ -30,9 +41,9 @@ function shellQuote(value: string) { return "'" + value.replaceAll("'", "'\\''")
 
 const STAGE_TIMEOUT_MS = Number(process.env.YORISHIRO_STAGE_TIMEOUT_MS ?? 30 * 60 * 1000);
 const STARTUP_GRACE_MS = Number(process.env.YORISHIRO_STARTUP_GRACE_MS ?? 15 * 1000);
-const INFO: Record<Stage, { label: string; tools: string }> = {
-  implement: { label: "Worker · Luna", tools: "read,grep,find,ls,bash,edit,write,submit_stage_report" },
-  review: { label: "Reviewer · Sol", tools: "read,grep,find,ls,run_verification_command,submit_stage_report" },
+const INFO: Record<Stage, { label: string; tools: string; thinking: "high" | "medium" }> = {
+  implement: { label: "Worker · Luna", tools: "read,grep,find,ls,bash,edit,write,submit_stage_report", thinking: "high" },
+  review: { label: "Reviewer · Sol", tools: "read,grep,find,ls,run_verification_command,submit_stage_report", thinking: "medium" },
 };
 const stages: Stage[] = ["implement", "review"];
 function rootDir() { return process.env.YORISHIRO_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.."); }
@@ -89,9 +100,12 @@ export function validateGeometry(layout: any, parent: string, workers: string[],
   expectedDirections.forEach((direction, i) => { const split = splits[i]; if (split.direction !== direction || Math.abs(split.ratio - expectedRatios[i]) > 0.01) throw new Error(`Herdr layout split ${i} was not ${direction} at the requested ratio`); });
   if (layout.zoomed !== false) throw new Error("Herdr layout unexpectedly changed zoom state");
 }
-async function renameDetectedPane(id: string, label: string) {
-  const payload = herdrEnvelope(await command("herdr", ["pane", "rename", id, label]), `pane rename ${id}`);
-  if (payload.type !== "ok") throw new Error(`Herdr pane rename ${id} was not confirmed`);
+export async function renameDetectedPane(id: string, label: string, run: LayoutCommand = (program, args) => command(program, args)) {
+  const payload = herdrEnvelope(await run("herdr", ["pane", "rename", id, label]), `pane rename ${id}`);
+  const responseType = payload.type;
+  const returnedId = payload.pane?.pane_id;
+  if (!((responseType === "ok" || responseType === "pane_info") && returnedId === id)) throw new Error(`Herdr pane rename ${id} was not confirmed with matching pane ID`);
+  return payload;
 }
 async function writeLauncher(dir: string, stage: Stage, name: string, prompt: string, cwd: string, reportPath: string) {
   const promptFile = path.join(dir, `${stage}-prompt.md`), launcher = path.join(dir, `${stage}-launcher.sh`);
@@ -101,7 +115,7 @@ async function writeLauncher(dir: string, stage: Stage, name: string, prompt: st
   const role = stage === "implement" ? "Worker · Luna" : "Reviewer · Sol";
   const schema = stage === "implement" ? "worker" : "reviewer";
   const target = `export YORISHIRO_REPORT_SCHEMA=${shellQuote(schema)}\nexport YORISHIRO_REPORT_STAGE=${shellQuote(stage)}\nexport YORISHIRO_ROLE=${shellQuote(role)}\nexport YORISHIRO_REPORT_PATH=${shellQuote(reportPath)}\nexport YORISHIRO_PROMPT_PATH=${shellQuote(promptFile)}\n${stage === "review" ? `export YORISHIRO_TARGET_CWD=${shellQuote(cwd)}\n` : ""}`;
-  const script = `#!/bin/sh\nset -eu\n${target}prompt=$(cat -- ${shellQuote(promptFile)})\nexec pi --name ${shellQuote(name)} --model ${shellQuote(MODELS[stage])} --tools ${shellQuote(INFO[stage].tools)} --no-extensions --no-skills -e ${shellQuote(reporter)}${stage === "review" ? ` -e ${shellQuote(verifier)}` : ""} "$prompt"\n`;
+  const script = `#!/bin/sh\nset -eu\n${target}prompt=$(cat -- ${shellQuote(promptFile)})\nexec pi --name ${shellQuote(name)} --model ${shellQuote(MODELS[stage])} --thinking ${shellQuote(INFO[stage].thinking)} --tools ${shellQuote(INFO[stage].tools)} --no-extensions --no-skills -e ${shellQuote(reporter)}${stage === "review" ? ` -e ${shellQuote(verifier)}` : ""} "$prompt"\n`;
   await fs.writeFile(launcher, script, { encoding: "utf8", mode: 0o700 });
   return { promptFile, launcher };
 }
@@ -111,13 +125,19 @@ async function startPane(stage: Stage, name: string, cwd: string, parent: string
   const target = layoutIndex === 0 ? parent : workers.at(-1)!;
   const direction = layoutIndex === 0 ? "right" as const : "down" as const;
   const ratio = layoutIndex === 0 ? "0.55" : "0.5";
-  const files = await writeLauncher(artifactDir, stage, name, prompt, cwd, reportPath);
   const split = await splitPane(target, direction, ratio, cwd);
+  let layout: any;
+  try {
+    layout = await inspectLayout(parent);
+    validateGeometry(layout, parent, [...workers, split.paneId], ["right", ...(layoutIndex > 0 ? ["down"] : [])], [0.55, ...(layoutIndex > 0 ? [0.5] : [])]);
+  } catch (error) {
+    try { await rollbackPane(split.paneId); } catch (rollbackError) { throw new Error(`${error instanceof Error ? error.message : String(error)}; rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`); }
+    throw error;
+  }
+  const files = await writeLauncher(artifactDir, stage, name, prompt, cwd, reportPath);
   await onPaneCreated(split.paneId, files);
   const launched = await command("herdr", ["pane", "run", split.paneId, shellQuote(files.launcher)]);
   if (launched.code) throw new Error(`Herdr pane run ${split.paneId} failed: ${launched.stderr || launched.stdout || `exit ${launched.code}`}`);
-  const layout = await inspectLayout(parent);
-  validateGeometry(layout, parent, [...workers, split.paneId], ["right", ...(layoutIndex > 0 ? ["down"] : [])], [0.55, ...(layoutIndex > 0 ? [0.5] : [])]);
   return { paneId: split.paneId, layout, files };
 }
 async function sendPrompt(id: string, prompt: string) { const sent = await command("herdr", ["pane", "send-text", id, prompt]); if (sent.code) throw new Error(`Could not send prompt: ${sent.stderr || sent.stdout || `exit ${sent.code}`}`); const enter = await command("herdr", ["pane", "send-keys", id, "enter"]); if (enter.code) throw new Error(`Could not submit prompt: ${enter.stderr || enter.stdout}`); }
@@ -149,6 +169,7 @@ function promptFor(stage: Stage, task: string, dir: string, plan: string, review
 
 export default function (pi: ExtensionAPI) {
   registerCleanupTool(pi, rootDir());
+  registerResetTool(pi, rootDir());
   pi.registerTool({ name: "development_pipeline", label: "Development Pipeline", description: "可視のHerdrペインで監査可能な開発パイプラインを実行します。", parameters: Type.Object({ task: Type.String({ description: "User-approved development task" }), approvedPlan: Type.String({ description: "Plan approved in the parent Sol conversation" }), cwd: Type.Optional(Type.String()), maxReviewCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), maxRepairCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), cleanupMode: Type.Optional(Type.String({ description: "ask, on-success, or never; defaults to ask" })), planReviewMode: Type.Optional(Type.String({ description: "計画レビュー: ask, required, skip（既定 ask）" })), diffReviewMode: Type.Optional(Type.String({ description: "差分レビュー: ask, required, skip（既定 ask）" })) }), async execute(_id, input: Input, signal, onUpdate, ctx) {
     const task = input.task?.trim(), approvedPlan = input.approvedPlan?.trim(), cwd = path.resolve(input.cwd?.trim() || ctx.cwd);
     if (!task) throw new Error("task must not be empty");
@@ -166,6 +187,11 @@ export default function (pi: ExtensionAPI) {
     await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
     const parentPaneId = metadata.parentPaneId as string;
     const emit = (stage: string, text: string) => onUpdate?.({ content: [{ type: "text", text: `${stage}: ${text}` }], details: { stage, artifactDir, panes: metadata.panes } });
+    const heartbeat = async (stage: string, attempt: number, reason: string) => {
+      metadata.heartbeat = { stage, attempt, updatedAt: now(), waitingReason: reason };
+      await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
+      emit(stage, `進捗: 試行${attempt}、${reason}`);
+    };
     let activePane: string | undefined, abortWork: Promise<boolean> | undefined, plan = approvedPlan, verification = "", review = "";
     const runStage = async (stage: Stage, text: string, attempt: number): Promise<{ valid: boolean; positive: boolean; verdict?: string; text: string }> => {
       const reportFile = path.join(artifactDir, `${stage}-${attempt}.json`), pendingReport = path.join(artifactDir, `${stage}-pending.json`), terminalFile = path.join(artifactDir, `${stage}-${attempt}.terminal.txt`), record: Attempt = { attempt, status: "running", startedAt: now(), reportFile: path.basename(reportFile), paneId: "" }; let terminalCaptured = false, snapshotSucceeded = true; let stageResult: { valid: boolean; positive: boolean; verdict?: string; text: string } = { valid: false, positive: false, text: "" };
@@ -177,7 +203,21 @@ export default function (pi: ExtensionAPI) {
       try {
         if (signal?.aborted) { const result = abortBeforePaneStart(); record.status = result.status; stageData.status = result.status; record.error = result.evidence; return { valid: false, positive: false, text: "" }; }
         await fs.rm(pendingReport, { force: true });
+        await heartbeat(stage, attempt, "子ペインの準備を開始しています");
         if (shouldSplitForAttempt(pane.paneId)) {
+          if (metadata.panes.every((p: Pane) => !p.paneId)) {
+            const initialLayout = await inspectLayout(parentPaneId);
+            try { assertInitialLayout(initialLayout, parentPaneId); }
+            catch (error) {
+              const occupiedPaneIds = initialLayout.panes.map((p: any) => p.pane_id).filter((id: string) => id !== parentPaneId);
+              metadata.occupiedPaneIds = occupiedPaneIds;
+              metadata.layout = { ...(metadata.layout ?? {}), initial: initialLayout, status: "LAYOUT_OCCUPIED", occupiedPaneIds, error: error instanceof Error ? error.message : String(error) };
+              await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
+              throw error;
+            }
+            metadata.layout = { ...(metadata.layout ?? {}), initial: initialLayout, intended: { parentPaneId, roleOrder: ROLE_LABELS } };
+            await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
+          }
           const workerIds = metadata.panes.filter((p: Pane) => p.paneId).map((p: Pane) => p.paneId);
           try {
             const started = await startPane(stage, pane.name, cwd, parentPaneId, process.env.HERDR_TAB_ID!, text, pendingReport, workerIds, artifactDir, async (paneId, files) => {
@@ -194,7 +234,7 @@ export default function (pi: ExtensionAPI) {
           await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
         } else { record.paneId = pane.paneId; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); await sendPrompt(pane.paneId, text); }
         if (signal?.aborted) { const result = await routeMonitorFailure("aborted", abortWork ? () => abortWork! : () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
-        activePane = pane.paneId; emit(stage, `${pane.paneId}（${pane.name}）、試行 ${attempt}`);
+        activePane = pane.paneId; await heartbeat(stage, attempt, `${pane.paneId}（${pane.name}）の完了を待機しています`);
         const state = await waitPane(pane.paneId, pendingReport, signal, m => emit(stage, m)); if (state === "aborted" || signal?.aborted) { const result = await routeMonitorFailure("aborted", abortWork ? () => abortWork! : () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
         if (state === "startup-timeout" || state === "timeout" || state === "process-info-failure") { const result = await routeMonitorFailure(state, () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
         if (state !== "settled") { record.status = "failed"; stageData.status = "failed"; record.error = `pane ${state}; pane preserved`; return { valid: false, positive: false, text: "" }; }
@@ -206,10 +246,19 @@ export default function (pi: ExtensionAPI) {
         const checked = stage === "implement" ? (parsed ? validateWorkerReport(parsed) : { valid: false as const, error: "missing or malformed worker report" }) : (parsed ? validateReviewerReport(parsed) : { valid: false as const, error: "missing or malformed reviewer report" });
         const v = parsed?.verdict ? `VERDICT: ${parsed.verdict}` : undefined, valid = checked.valid, positive = valid && (stage === "implement" ? parsed.verdict === "COMPLETED" : parsed.verdict === "APPROVED" || parsed.verdict === "APPROVED_WITH_NOTES"); record.verdict = v;
         record.status = valid ? (positive ? "passed" : "failed") : "failed"; stageData.status = record.status; if (!valid) record.error = record.error || (checked as any).error; stageResult.valid = valid; stageResult.positive = positive; stageResult.verdict = v; stageResult.text = report; return stageResult;
-      } catch (e) { record.status = signal?.aborted ? "aborted" : "failed"; stageData.status = record.status; record.error = e instanceof Error ? e.message : String(e); return { valid: false, positive: false, text: "" }; }
+      } catch (e) {
+        record.status = signal?.aborted ? "aborted" : "failed"; stageData.status = record.status; record.error = e instanceof Error ? e.message : String(e);
+        if (pane?.paneId && (record.status === "aborted" || record.paneId === pane.paneId)) {
+          abortWork ??= interrupt(pane.paneId);
+          const stopped = await abortWork;
+          if (!stopped) record.error += "; 子ペインをidleにできませんでした";
+          else if (!record.error.includes("pane preserved")) record.error += "; active child stopped; pane preserved";
+        }
+        return { valid: false, positive: false, text: "" };
+      }
       finally { if (pane?.paneId && !terminalCaptured) { try { await captureTranscript(pane.paneId, terminalFile); } catch (e) { record.error = record.error || `terminal capture failed: ${e instanceof Error ? e.message : String(e)}`; } } record.finishedAt = now(); stageData.finishedAt = record.finishedAt; try { await snapshot(cwd, diffs, `${stage}-${attempt}`); } catch (e) { if (record.status !== "aborted") { record.status = "failed"; stageData.status = "failed"; snapshotSucceeded = false; record.error = `stage snapshot failed: ${e instanceof Error ? e.message : String(e)}`; stageResult.valid = false; stageResult.positive = false; stageResult.text = ""; } } if (signal?.aborted && pane?.paneId) { abortWork ??= interrupt(pane.paneId); const stopped = await abortWork; if (!stopped) record.error = record.error || "abort could not be confirmed"; } const finalized = finalizeStage(stageResult, snapshotSucceeded); stageResult.valid = finalized.valid; stageResult.positive = finalized.positive; stageResult.text = finalized.text; signal?.removeEventListener("abort", abortHandler); await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); }
     };
-    const finish = async (outcome: string) => { if (signal?.aborted) { if (activePane) { const stopped = abortWork ? await abortWork : await interrupt(activePane); if (!stopped) metadata.abortError = "Herdr could not confirm the active pane became idle"; } outcome = "ABORTED"; } if (outcome === "ABORTED" && !metadata.cleanup) metadata.cleanup = { status: "aborted", results: (metadata.panes ?? []).map((pane: Pane) => ({ paneId: pane.paneId, name: pane.name, status: "skipped", reason: "cleanupは中断されました" })) }; metadata.finishedAt = now(); metadata.outcome = outcome; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); return { content: [{ type: "text", text: `${outcome}\n成果物: ${artifactDir}\n${outcome === "SUCCESS" ? "cleanupの判断待ちです。" : "子ペインを保持しました。"}` }], details: { outcome, artifactDir, panes: metadata.panes } }; };
+    const finish = async (outcome: string) => { if (signal?.aborted) { if (activePane) { const stopped = abortWork ? await abortWork : await interrupt(activePane); if (!stopped) metadata.abortError = "Herdr could not confirm the active pane became idle"; } outcome = "ABORTED"; } if (outcome === "ABORTED" && !metadata.cleanup) metadata.cleanup = { status: "aborted", results: (metadata.panes ?? []).map((pane: Pane) => ({ paneId: pane.paneId, name: pane.name, status: "skipped", reason: "cleanupは中断されました" })) }; metadata.finishedAt = now(); metadata.outcome = outcome; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); return { content: [{ type: "text", text: `${outcome}\n成果物: ${artifactDir}\n${outcome === "SUCCESS" ? "cleanupの判断待ちです。" : "子ペインを保持しました。"}` }], details: { outcome, cleanupDecision: cleanupMode, artifactDir, panes: metadata.panes } }; };
     let cycle = 0;
     const hasReviewEventBus = !!(pi as any).events;
     const reviewEventBus = (pi as any).events ?? { emit: async () => { throw new Error("review event bus is unavailable"); } };

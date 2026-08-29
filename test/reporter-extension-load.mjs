@@ -14,6 +14,7 @@ const report = path.join(dir, "fixed-report.md");
 process.env.YORISHIRO_REPORT_PATH = report;
 process.env.YORISHIRO_REPORT_ROOT = dir;
 process.env.YORISHIRO_REPORT_STAGE = "verify";
+delete process.env.YORISHIRO_REPORT_SCHEMA;
 try {
   await tools[0].execute("test", { verdict: "PASS", summary: "loaded", evidence: "focused test" });
   assert.match(await readFile(report, "utf8"), /VERDICT: PASS\n$/);

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -20,8 +20,9 @@ if (a[0] === "status") process.stdout.write("{}\\n");
 else if (a[0] === "agent" && a[1] === "start") process.stdout.write(JSON.stringify({pane_id:"fake:" + a[2].toLowerCase()}) + "\\n");
 else if (a[0] === "pane" && a[1] === "split") { const id = "fake:split" + (fs.readFileSync(log, "utf8").split("\\n").filter(Boolean).map(line => JSON.parse(line)).filter(args => args[0] === "pane" && args[1] === "split").length); process.stdout.write(JSON.stringify({id:"cli:pane:split",result:{pane:{pane_id:id}}}) + "\\n"); }
 else if (a[0] === "pane" && a[1] === "run") process.stdout.write("");
-else if (a[0] === "pane" && a[1] === "rename") process.stdout.write(JSON.stringify({id:"cli:pane:rename",result:{type:"ok"}}) + "\\n");
-else if (a[0] === "pane" && a[1] === "layout" && scenario === "layout-failure") process.exit(8);
+else if (a[0] === "pane" && a[1] === "rename") process.stdout.write(JSON.stringify({id:"cli:pane:rename",result:{type:"pane_info",pane:{pane_id:a[2]}}}) + "\\n");
+else if (a[0] === "pane" && a[1] === "layout" && scenario === "layout-occupied") process.stdout.write(JSON.stringify({result:{layout:{panes:[{pane_id:"parent"},{pane_id:"existing-pane"}],splits:[{direction:"right",ratio:0.5}],zoomed:false}}}) + "\\n");
+else if (a[0] === "pane" && a[1] === "layout" && scenario === "layout-failure" && fs.readFileSync(log, "utf8").split("\\n").filter(Boolean).map(line => JSON.parse(line)).filter(args => args[0] === "pane" && args[1] === "split").length > 0) process.exit(8);
 else if (a[0] === "pane" && a[1] === "layout") { const n = fs.readFileSync(log, "utf8").split("\\n").filter(Boolean).map(line => JSON.parse(line)).filter(args => args[0] === "pane" && args[1] === "split").length; const panes = ["parent",...Array.from({length:n}, (_, i) => "fake:split" + (i + 1))]; const splits = [{direction:"right",ratio:0.55},{direction:"down",ratio:0.33333334},{direction:"down",ratio:0.5}].slice(0,n); process.stdout.write(JSON.stringify({id:"cli:pane:layout",result:{layout:{panes:panes.map(pane_id => ({pane_id})),splits,zoomed:false}}}) + "\\n"); }
 else if (a[0] === "pane" && a[1] === "get") process.stdout.write(stopped ? '{"agent_status":"idle"}\\n' : '{"agent_status":"running"}\\n');
 else if (a[0] === "agent" && a[1] === "read") process.stdout.write("fake transcript\\n");
@@ -65,8 +66,9 @@ async function executeScenario(scenario, aborted = false) {
   const artifact = result.details.artifactDir;
   const metadata = JSON.parse(await readFile(path.join(artifact, "run.json"), "utf8"));
   const calls = (await readFile(log, "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+  const artifactFiles = await readdir(artifact);
   await rm(artifact, { recursive: true, force: true });
-  return { result, metadata, calls };
+  return { result, metadata, calls, artifactFiles };
 }
 
 for (const [scenario, expectedError] of [["startup", /startup deadline expired/], ["normal", /stage deadline expired/], ["failure", /process-info remained unavailable or invalid/], ["layout-failure", /Herdr pane layout failed/]]) {
@@ -77,16 +79,27 @@ for (const [scenario, expectedError] of [["startup", /startup deadline expired/]
   assert.equal(metadata.outcome, "IMPLEMENTATION_FAILED");
   if (scenario === "layout-failure") assert.match(metadata.layout.error, /Herdr pane layout failed/);
   else assert.equal(metadata.layout.error, undefined);
-  assert.equal(metadata.panes[0].paneId, "fake:split1");
+  if (scenario === "layout-failure") assert.equal(metadata.panes[0].paneId, "");
+  else assert.equal(metadata.panes[0].paneId, "fake:split1");
   assert.match(attempt.error, expectedError);
   assert.equal(calls.filter(a => a[0] === "agent" && a[1] === "start").length, 0);
   assert.deepEqual(calls.filter(a => a[0] === "pane" && a[1] === "split").map(a => a.slice(2)), [["parent", "--direction", "right", "--ratio", "0.55", "--cwd", root, "--no-focus"]]);
-  assert.equal(calls.filter(a => a[0] === "pane" && a[1] === "run").length, 1);
-  assert.equal(calls.filter(a => a[0] === "pane" && a[1] === "layout").length, 1);
+  assert.equal(calls.filter(a => a[0] === "pane" && a[1] === "run").length, scenario === "layout-failure" ? 0 : 1);
+  assert.equal(calls.filter(a => a[0] === "pane" && a[1] === "layout").length, 2);
   const interrupts = calls.filter(a => a[0] === "pane" && a[1] === "send-keys").map(a => a.slice(2));
   assert.deepEqual(interrupts, scenario === "layout-failure" ? [] : [["fake:split1", "ctrl+c"], ["fake:split1", "escape"]]);
-  assert.equal(calls.filter(a => a[0] === "pane" && a[1] === "close").length, 0);
+  assert.equal(calls.filter(a => a[0] === "pane" && a[1] === "close").length, scenario === "layout-failure" ? 1 : 0);
 }
+
+const occupied = await executeScenario("layout-occupied");
+assert.equal(occupied.metadata.outcome, "IMPLEMENTATION_FAILED");
+assert.deepEqual(occupied.metadata.occupiedPaneIds, ["existing-pane"]);
+assert.deepEqual(occupied.metadata.layout.occupiedPaneIds, ["existing-pane"]);
+assert.equal(occupied.calls.filter(a => a[0] === "pane" && a[1] === "split").length, 0);
+assert.equal(occupied.calls.filter(a => a[0] === "pane" && a[1] === "run").length, 0);
+assert.equal(occupied.calls.filter(a => a[0] === "agent" && a[1] === "start").length, 0);
+assert.equal(occupied.artifactFiles.filter(file => file.endsWith("-launcher.sh")).length, 0);
+assert.equal(occupied.artifactFiles.filter(file => /^(implement|review)-(pending|\d+)\.json$/.test(file)).length, 0);
 
 const inFlight = await executeScenario("abort");
 assert.equal(inFlight.metadata.stages.implement.status, "aborted");

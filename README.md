@@ -43,8 +43,8 @@ cd work/example
 | 役割 | 固定モデル | 担当 |
 |---|---|---|
 | Planner（親） | 親セッションのモデル | 要件、計画、Reviewer指摘の採否 |
-| Worker · Luna | `openai-codex/gpt-5.6-luna` | 実装、テスト、ビルド、動作確認、修正 |
-| Reviewer · Sol | `openai-codex/gpt-5.6-sol` | read-onlyレビュー、sandbox内の独立検証 |
+| Worker · Luna | `openai-codex/gpt-5.6-luna`（既定thinking: `high`） | 実装、テスト、ビルド、動作確認、修正 |
+| Reviewer · Sol | `openai-codex/gpt-5.6-sol`（既定thinking: `medium`） | read-onlyレビュー、sandbox内の独立検証 |
 
 パイプラインはHerdr内で起動したPiからのみ実行できます。現在のタブを、親55%、右45%のWorker／Reviewer上下2段へ分割します。子は通常のPi TUIとして表示され、修正と再レビューでは同じペインを再利用します。子からパイプラインを再帰起動することはできません。
 
@@ -62,7 +62,7 @@ Reviewerの検証コマンドはmacOSの`sandbox-exec`またはLinuxのbubblewra
 - `on-success`: 成功時だけ整理する
 - `never`: ペインを残す
 
-後から`development_pipeline_cleanup`へrunディレクトリを渡して整理できます。新構成はReviewer→Worker、旧構成はReview→Verify→Implementの順に閉じます。親ペイン、非idleペイン、別runのペインは保護されます。
+後から`development_pipeline_cleanup`へrunディレクトリを渡して整理できます。失敗・中断runは成功用cleanupと分離された`development_pipeline_reset`で、canonical runDirと現在のworkspace/tab、明示confirm、記録済みpane identity、idle状態を検証してから安全にresetします。新構成はReviewer→Worker、旧構成はReview→Verify→Implementの順に閉じます。親ペイン、非idleペイン、別runのペインは保護されます。開始時に現在タブへ親以外のペインがある場合は`LAYOUT_OCCUPIED`として停止し、他人のペインを自動削除しません。
 
 人間レビューは`planReviewMode`と`diffReviewMode`で制御します（`ask`既定、`required`、`skip`）。計画レビューは子ペイン起動前、差分レビューはReviewer完了後かつcleanup前に実行し、結果と計画SHA-256をrun artifactへ保存します。変更要求や必須レビューの失敗では安全側で停止し、commit・pushは行いません。
 
