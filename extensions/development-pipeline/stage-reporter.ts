@@ -22,18 +22,20 @@ function json(value: unknown) { return JSON.stringify(value, null, 2); }
 export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "submit_stage_report", label: "Submit Stage Report", description: "Write the final scoped pipeline report. This is the only durable write available to read-only stages.",
-    parameters: Type.Object({ verdict: Type.String({ description: "The exact verdict for this stage" }), summary: Type.String({ description: "Concise summary" }), evidence: Type.Optional(Type.String({ description: "Concise evidence and limitations" })), changedScope: Type.Optional(Type.String({ description: "Worker changed-scope summary" })), findings: Type.Optional(Type.Array(Type.Object({ id: Type.String(), priority: Type.String(), target: Type.String(), problem: Type.String(), expectedOutcome: Type.String(), route: Type.String() }))), plannerQuestions: Type.Optional(Type.Array(Type.String())) }),
+    parameters: Type.Object({ verdict: Type.String({ description: "The exact verdict for this stage" }), summary: Type.String({ description: "Japanese human-readable summary" }), changedScope: Type.Optional(Type.String({ description: "Worker changed-scope summary" })), evidence: Type.Optional(Type.String({ description: "Worker evidence and limitations" })), blockingFindings: Type.Optional(Type.Array(Type.Object({ id: Type.String(), severity: Type.String(), target: Type.String(), reproduction: Type.String(), userImpact: Type.String(), expectedOutcome: Type.String(), route: Type.String(), discovery: Type.String(), missedReason: Type.Optional(Type.String()) }))), nonBlockingNotes: Type.Optional(Type.Array(Type.Object({ id: Type.String(), severity: Type.String(), target: Type.String(), note: Type.String() }))), plannerQuestions: Type.Optional(Type.Array(Type.String())) }),
     async execute(_id, input: any) {
-      const file = process.env.YORISHIRO_REPORT_PATH, stage = process.env.YORISHIRO_REPORT_STAGE, schema = process.env.YORISHIRO_REPORT_SCHEMA ?? "legacy";
+      const file = process.env.YORISHIRO_REPORT_PATH, stage = process.env.YORISHIRO_REPORT_STAGE, requestedSchema = process.env.YORISHIRO_REPORT_SCHEMA;
+      const schema = requestedSchema === undefined ? "legacy" : requestedSchema;
       if (!file || !stage) throw new Error("Scoped stage reporting is not configured");
+      if (!["legacy", "worker", "reviewer"].includes(schema)) throw new Error("Unknown report schema");
       const target=await canonicalTarget(file);
       if (schema === "worker") {
         const checked=validateWorkerReport(input); if (!checked.valid) throw new Error(checked.error); const report=input;
-        const text=`# worker report\n\n## Summary\n${report.summary.trim()}\n\n## Changed scope\n${report.changedScope.trim()}\n\n## Evidence\n${report.evidence.trim()}\n\nVERDICT: ${report.verdict}\n`; await atomicWrite(target,text); return {content:[{type:"text",text:"Submitted worker report."}],details:{file,schema}};
+        await atomicWrite(target,json(report)); return {content:[{type:"text",text:"Submitted worker report."}],details:{file,schema}};
       }
       if (schema === "reviewer") {
         const checked=validateReviewerReport(input); if (!checked.valid) throw new Error(checked.error); const report=input;
-        const text=`# reviewer report\n\n## Summary\n${report.summary.trim()}\n\n## Findings\n${json(report.findings)}\n\n## Planner questions\n${json(report.plannerQuestions)}\n\nVERDICT: ${report.verdict}\n`; await atomicWrite(target,text); return {content:[{type:"text",text:"Submitted reviewer report."}],details:{file,schema}};
+        await atomicWrite(target,json(report)); return {content:[{type:"text",text:"Submitted reviewer report."}],details:{file,schema}};
       }
       if (!VERDICTS[stage] || !VERDICTS[stage].includes(input.verdict)) throw new Error(`Invalid ${stage} verdict`);
       const report=`# ${stage} report\n\n## Summary\n${input.summary.trim()}\n\n## Evidence\n${input.evidence.trim()}\n\nVERDICT: ${input.verdict}\n`; await atomicWrite(target,report); return {content:[{type:"text",text:`Submitted ${stage} report.`}],details:{file}};

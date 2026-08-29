@@ -20,7 +20,7 @@ export function validateWorkerReport(value: unknown): Validation {
   if (!plain(value) || !exact(value,["verdict","summary","changedScope","evidence"])) return fail("worker report must be a plain object with exact fields");
   const r=value as Record<string, unknown>;
   if (r.verdict !== "COMPLETED" && r.verdict !== "BLOCKED") return fail("worker verdict is invalid");
-  if (!text(r.summary) || !text(r.changedScope) || !text(r.evidence)) return fail("worker summary, changedScope, and evidence are required");
+  if (!japanese(r.summary) || !japanese(r.changedScope) || !japanese(r.evidence)) return fail("worker summary, changedScope, and evidence must be Japanese and nonempty");
   return {valid:true};
 }
 
