@@ -3,29 +3,53 @@ name: development-pipeline
 description: Run the approved development pipeline in stable Herdr worker panes with auditable reports and cleanup safeguards.
 ---
 
-# Development pipeline
+# 開発パイプライン
 
-Use `development_pipeline` only after requirements and an implementation plan are approved in the parent Sol conversation. Pass both the task and approved plan; the tool does not spawn a duplicate planner. Do not duplicate implementation in the parent agent.
+親セッションで要件と実装計画を合意した後だけ`development_pipeline`を使う。Plannerは親セッション自身であり、子Plannerは起動しない。親で実装を重複しない。
 
-## Herdr requirement
+## 実行条件
 
-The parent Pi must be running inside Herdr. The extension requires `HERDR_PANE_ID`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID`, and `HERDR_SOCKET_PATH`; it fails clearly when Herdr is absent. It constructs the **current tab** layout with explicit `pane split` calls, leaves the parent pane intact, launches each interactive Pi in its allocated shell pane, uses `--no-focus`, and never closes or zooms panes. The user can focus, resize, zoom, or manually close completed panes in Herdr. The official Pi Herdr integration is optional and is not installed or changed by Yorishiro.
+親PiがHerdr内で動作し、`HERDR_PANE_ID`、`HERDR_TAB_ID`、`HERDR_WORKSPACE_ID`、`HERDR_SOCKET_PATH`が利用できること。対象リポジトリはread-only検証sandboxを利用できる必要がある。未対応環境や`/tmp`配下の対象は開始前に拒否される。
 
-## Visible stages
+## 役割とペイン
 
-Each worker stage is a normal interactive Pi TUI in a visible pane (not `--mode json`, `-p`, or a hidden subprocess): Implement/Luna, Verify/Terra, and Review/Sol. The approved parent plan is saved as an artifact before workers start. Repair attempts reuse the existing `Implement · Luna`, `Verify · Terra`, and `Review · Sol` panes and sessions; pane labels remain stable. Child Pis load no Yorishiro extensions or skills, so the pipeline cannot recursively invoke itself. Models are exact IDs:
+- Planner: 親セッション。要件、計画、Reviewer指摘の採否を判断する。
+- Worker · Luna: `openai-codex/gpt-5.6-luna`。実装、テスト、ビルド、動作確認、修正を行う。
+- Reviewer · Sol: `openai-codex/gpt-5.6-sol`。read-onlyレビューとsandbox検証を行う。
 
-- Plan: supplied by the parent Sol conversation; no Plan child is started
-- Implement/repair: `openai-codex/gpt-5.6-luna`, coding tools
-- Verify: `openai-codex/gpt-5.6-terra`, `read,grep,find,ls,run_verification_command`, no source writes; the command tool runs only inside a preflight-checked kernel-enforced read-only sandbox (macOS sandbox-exec or Linux bubblewrap/user namespaces; `/tmp` targets are rejected)
-- Review: `openai-codex/gpt-5.6-sol`, read-only tools
+親55%、右45%とし、右列をWorker上／Reviewer下へ分割する。子は可視の通常Pi TUIであり、修正・再レビューでは同じペインを再利用する。子はYorishiroのSkillとExtensionを自動ロードせず、再帰起動できない。
 
-Agents receive self-contained prompts. Verify uses only the explicitly loaded, sandboxed `run_verification_command` for commands and cannot write the repository; Verify/Review (and the implementation handoff) submit reports through the explicitly loaded `submit_stage_report`, which writes only the orchestrator-selected pending path. The orchestrator materializes reports with stage/attempt metadata. Verify must end with `VERDICT: PASS|FAIL`, and Review with `VERDICT: APPROVED|CHANGES_REQUESTED`. A stage cannot pass without its durable report, strict verdict (where required), a settled Herdr state, and a still-running interactive Pi. Missing reports, exits, timeouts, and aborts are failures and can never become `SUCCESS`.
+## 報告と判定
 
-Pane monitoring has an explicit `startup` state with a bounded 15-second grace period. Normal monitoring begins only after a valid process-info snapshot reports exact `argv0: "pi"`; only a later valid snapshot without that Pi can mean `exited`. Process-info command or parse failures are retried and never count as absence; repeated failures are recorded distinctly. Startup timeout, the normal 30-minute timeout, and abort all send supported `ctrl+c` followed by `escape`, confirm idle, and preserve the pane. Abort before pane creation records an aborted stage with no child started, so no orphan is possible.
+WorkerとReviewerは`submit_stage_report`で構造化JSONを提出する。中央validatorを通過しない報告は失敗として扱う。
 
-The tool records pane IDs and explicit stage states in `artifacts/<repository>/<run-id>/run.json`. It also saves baseline and stage-end status/diff snapshots in `diffs/`; pre-existing dirty changes remain difficult to attribute perfectly. A valid verification FAIL or review CHANGES_REQUESTED can trigger at most one repair cycle; malformed/missing reports, process failures, timeouts, and aborts are terminal. Repairs are sent as follow-up prompts to the existing panes. Verification output is capped at 64 KiB including model-visible status and truncation notices, cancellation terminates the sandbox process group, every command reports its exit status (including distinct TIMEOUT/CANCELLED states), and preflight rejects unsupported platforms, unavailable sandbox binaries/user namespaces, and `/tmp` checkouts. All panes and artifacts are preserved on failure or abort.
+Reviewer判定:
 
-After SUCCESS, worker-pane cleanup defaults to `ask`; `on-success` closes only validated idle panes without confirmation, and `never` leaves them open. Failures, aborts, and CHANGES_REQUIRED never auto-close panes. Deferred cleanup is available through `development_pipeline_cleanup`; it canonicalizes real paths to prevent symlink escape, accepts only `SUCCESS` runs, enforces artifacts containment, parent/current-pane protection, role/workspace/tab identity, idle status, and Review → Verify → Implement order, recording partial failures atomically.
+- `APPROVED`: 成功
+- `APPROVED_WITH_NOTES`: noteを残して成功
+- `CHANGES_REQUESTED`: blocking findingだけをWorkerへ渡す
+- `NEEDS_PLANNER`: 自動処理を止め、親Plannerへ戻す
 
-Review and approval remain an explicit boundary: use the tool for a user-approved task, inspect its outcome, and do not treat an unapproved repair as permission to broaden scope.
+Workerへはsanitized findingだけを渡し、Reviewerのsummary、note、生出力、transcriptを渡さない。同じ指摘IDが続いた場合や、修正後に`discovery: initial`の新規blockingが追加された場合は`NEEDS_PLANNER`で止める。`repair_regression`と、理由を明示した`previously_missed`は新規指摘として許可する。
+
+`maxReviewCycles`は既定2、上限3。旧`maxRepairCycles`は互換入力であり、両方指定時は`maxReviewCycles`を優先する。上限到達時は`CHANGES_REQUIRED`で終了する。
+
+## 証跡と安全性
+
+`artifacts/<repository>/<run-id>/`へ依頼、承認済み計画、各attemptのreport、terminal記録、baseline／stage別status・diff、`run.json`を保存する。開始時のdirty treeはbaselineとして残すが、変更の帰属は完全には判定できない。
+
+起動、process-info、timeout、中断、欠落・不正reportはfail closedで扱う。中断時は`ctrl+c`と`escape`で停止を試み、証跡とペインを残す。Reviewerのコマンドはread-only sandbox内だけで実行する。
+
+## cleanup
+
+成功時だけ`cleanupMode`を適用する。
+
+- `ask`（既定）: UI確認後に閉じる
+- `on-success`: 成功時に閉じる
+- `never`: 残す
+
+失敗、中断、`NEEDS_PLANNER`、`CHANGES_REQUIRED`では自動cleanupしない。後から`development_pipeline_cleanup`を使える。新構成はReviewer→Worker、旧構成はReview→Verify→Implementの順で処理し、親、非idle、別runのペインを保護する。
+
+## 人間レビュー
+
+希望時は開始前に親セッションからPlannotatorで計画を承認する。最終差分をdiffaiで確認する場合は`cleanupMode: never`で実行し、Reviewer対応後にdiffaiをforegroundで起動する。人間が承認してからcleanup、commit、pushする。Plannotator／diffaiの自動起動は現行toolへ接続されていない。

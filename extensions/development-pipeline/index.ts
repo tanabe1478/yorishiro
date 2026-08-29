@@ -9,31 +9,31 @@ import { preflightVerifierSandbox } from "./sandbox.ts";
 import { finalizeStage, flowAfterReview, flowAfterVerification } from "./pipeline-flow.ts";
 import { cleanupRun, markRunAborted, registerCleanupTool, recordCleanupFailure } from "./cleanup.ts";
 import { shouldCleanup } from "./cleanup-policy.ts";
+import { validateReviewerReport, validateWorkerReport, workerHandoffFromReviewer } from "./role-contracts.ts";
+import { transitionAfterReview } from "./three-role-flow.ts";
 import { monitorPane, routeMonitorFailure } from "./pane-monitor.ts";
 export { routeMonitorFailure } from "./pane-monitor.ts";
 export function abortBeforePaneStart() { return { status: "aborted" as const, evidence: "pipeline aborted before pane startup; no child was started; pane preserved" }; }
 export function shouldSplitForAttempt(paneId: string) { return paneId.length === 0; }
 
-const MODELS = { plan: "openai-codex/gpt-5.6-sol", implement: "openai-codex/gpt-5.6-luna", verify: "openai-codex/gpt-5.6-terra", review: "openai-codex/gpt-5.6-sol" } as const;
-type Stage = "plan" | "implement" | "verify" | "review";
+const MODELS = { implement: "openai-codex/gpt-5.6-luna", review: "openai-codex/gpt-5.6-sol" } as const;
+type Stage = "implement" | "review";
 type StageStatus = "pending" | "running" | "passed" | "failed" | "blocked" | "aborted";
-type Input = { task: string; approvedPlan: string; cwd?: string; maxRepairCycles?: number; cleanupMode?: "ask" | "on-success" | "never" };
+type Input = { task: string; approvedPlan: string; cwd?: string; maxRepairCycles?: number; maxReviewCycles?: number; cleanupMode?: "ask" | "on-success" | "never" };
 type CommandResult = { code: number; stdout: string; stderr: string };
 type Attempt = { attempt: number; status: StageStatus; startedAt: string; finishedAt?: string; reportFile: string; paneId: string; verdict?: string; error?: string };
 type Pane = { paneId: string; name: string; model: string; attempts: Attempt[] };
 type LayoutCommand = (program: string, args: string[]) => Promise<CommandResult>;
-const ROLE_LABELS = ["Implement · Luna", "Verify · Terra", "Review · Sol"] as const;
+const ROLE_LABELS = ["Worker · Luna", "Reviewer · Sol"] as const;
 function shellQuote(value: string) { return "'" + value.replaceAll("'", "'\\''") + "'"; }
 
 const STAGE_TIMEOUT_MS = Number(process.env.YORISHIRO_STAGE_TIMEOUT_MS ?? 30 * 60 * 1000);
 const STARTUP_GRACE_MS = Number(process.env.YORISHIRO_STARTUP_GRACE_MS ?? 15 * 1000);
 const INFO: Record<Stage, { label: string; tools: string }> = {
-  plan: { label: "Plan · Sol", tools: "read,grep,find,ls,submit_stage_report" },
-  implement: { label: "Implement · Luna", tools: "read,grep,find,ls,bash,edit,write,submit_stage_report" },
-  verify: { label: "Verify · Terra", tools: "read,grep,find,ls,run_verification_command,submit_stage_report" },
-  review: { label: "Review · Sol", tools: "read,grep,find,ls,submit_stage_report" },
+  implement: { label: "Worker · Luna", tools: "read,grep,find,ls,bash,edit,write,submit_stage_report" },
+  review: { label: "Reviewer · Sol", tools: "read,grep,find,ls,run_verification_command,submit_stage_report" },
 };
-const stages: Stage[] = ["plan", "implement", "verify", "review"];
+const stages: Stage[] = ["implement", "review"];
 function rootDir() { return process.env.YORISHIRO_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.."); }
 function now() { return new Date().toISOString(); }
 function json(value: unknown) { return JSON.stringify(value, null, 2); }
@@ -96,8 +96,10 @@ async function writeLauncher(dir: string, stage: Stage, name: string, prompt: st
   await fs.writeFile(promptFile, prompt, { encoding: "utf8", mode: 0o700 });
   const reporter = path.join(rootDir(), "extensions", "development-pipeline", "stage-reporter.ts");
   const verifier = path.join(rootDir(), "extensions", "development-pipeline", "verifier-tools.ts");
-  const target = stage === "verify" ? `export YORISHIRO_TARGET_CWD=${shellQuote(cwd)}\n` : "";
-  const script = `#!/bin/sh\nset -eu\nexport YORISHIRO_REPORT_PATH=${shellQuote(reportPath)}\nexport YORISHIRO_REPORT_STAGE=${shellQuote(stage)}\n${target}prompt=$(cat -- ${shellQuote(promptFile)})\nexec pi --name ${shellQuote(name)} --model ${shellQuote(MODELS[stage])} --tools ${shellQuote(INFO[stage].tools)} --no-extensions --no-skills -e ${shellQuote(reporter)}${stage === "verify" ? ` -e ${shellQuote(verifier)}` : ""} "$prompt"\n`;
+  const role = stage === "implement" ? "Worker · Luna" : "Reviewer · Sol";
+  const schema = stage === "implement" ? "worker" : "reviewer";
+  const target = `export YORISHIRO_REPORT_SCHEMA=${shellQuote(schema)}\nexport YORISHIRO_REPORT_STAGE=${shellQuote(stage)}\nexport YORISHIRO_ROLE=${shellQuote(role)}\nexport YORISHIRO_REPORT_PATH=${shellQuote(reportPath)}\nexport YORISHIRO_PROMPT_PATH=${shellQuote(promptFile)}\n${stage === "review" ? `export YORISHIRO_TARGET_CWD=${shellQuote(cwd)}\n` : ""}`;
+  const script = `#!/bin/sh\nset -eu\n${target}prompt=$(cat -- ${shellQuote(promptFile)})\nexec pi --name ${shellQuote(name)} --model ${shellQuote(MODELS[stage])} --tools ${shellQuote(INFO[stage].tools)} --no-extensions --no-skills -e ${shellQuote(reporter)}${stage === "review" ? ` -e ${shellQuote(verifier)}` : ""} "$prompt"\n`;
   await fs.writeFile(launcher, script, { encoding: "utf8", mode: 0o700 });
   return { promptFile, launcher };
 }
@@ -106,17 +108,17 @@ async function startPane(stage: Stage, name: string, cwd: string, parent: string
   const layoutIndex = workers.length;
   const target = layoutIndex === 0 ? parent : workers.at(-1)!;
   const direction = layoutIndex === 0 ? "right" as const : "down" as const;
-  const ratio = layoutIndex === 0 ? "0.55" : layoutIndex === 1 ? "0.3333333333" : "0.5";
+  const ratio = layoutIndex === 0 ? "0.55" : "0.5";
   const files = await writeLauncher(artifactDir, stage, name, prompt, cwd, reportPath);
   const split = await splitPane(target, direction, ratio, cwd);
   await onPaneCreated(split.paneId, files);
   const launched = await command("herdr", ["pane", "run", split.paneId, shellQuote(files.launcher)]);
   if (launched.code) throw new Error(`Herdr pane run ${split.paneId} failed: ${launched.stderr || launched.stdout || `exit ${launched.code}`}`);
   const layout = await inspectLayout(parent);
-  validateGeometry(layout, parent, [...workers, split.paneId], ["right", ...(layoutIndex > 0 ? ["down"] : []), ...(layoutIndex > 1 ? ["down"] : [])], [0.55, ...(layoutIndex > 0 ? [0.3333333333] : []), ...(layoutIndex > 1 ? [0.5] : [])]);
+  validateGeometry(layout, parent, [...workers, split.paneId], ["right", ...(layoutIndex > 0 ? ["down"] : [])], [0.55, ...(layoutIndex > 0 ? [0.5] : [])]);
   return { paneId: split.paneId, layout, files };
 }
-async function sendPrompt(id: string, prompt: string) { const sent = await command("herdr", ["pane", "send-text", id, prompt]); if (sent.code) throw new Error(`Could not send prompt: ${sent.stderr || sent.stdout}`); const enter = await command("herdr", ["pane", "send-keys", id, "enter"]); if (enter.code) throw new Error(`Could not submit prompt: ${enter.stderr || enter.stdout}`); }
+async function sendPrompt(id: string, prompt: string) { const sent = await command("herdr", ["pane", "send-text", id, prompt]); if (sent.code) throw new Error(`Could not send prompt: ${sent.stderr || sent.stdout || `exit ${sent.code}`}`); const enter = await command("herdr", ["pane", "send-keys", id, "enter"]); if (enter.code) throw new Error(`Could not submit prompt: ${enter.stderr || enter.stdout}`); }
 async function captureTranscript(id: string, file: string) { const result = await command("herdr", ["agent", "read", id, "--source", "recent-unwrapped", "--lines", "200", "--format", "text"]); if (result.code) throw new Error(`Herdr transcript capture failed: ${result.stderr || result.stdout}`); await atomicWrite(file, result.stdout); }
 async function waitPane(id: string, report: string, signal: AbortSignal | undefined, update: (s: string) => void) {
   return monitorPane({
@@ -135,19 +137,17 @@ async function waitPane(id: string, report: string, signal: AbortSignal | undefi
     },
   });
 }
-function promptFor(stage: Stage, task: string, dir: string, plan: string, verification: string, review: string, attempt: number) {
-  const label = INFO[stage].label, report = path.join(dir, `${stage}-${attempt}.md`);
-  const common = `You are ${label} in a visible sequential pipeline. Work in the current repository. Task:\n${task}\n\nArtifacts: ${dir}. This is attempt ${attempt}.`;
-  const reportInstruction = `Your final action must be calling submit_stage_report; the orchestrator selected a private pending target and will materialize it as ${report} for attempt ${attempt}. Do not claim completion without using that tool.`;
-  if (stage === "plan") return `${common}\nInspect only; do not modify source. Produce requirements, acceptance criteria, risks, and ordered tasks. Submit verdict READY or BLOCKED. ${reportInstruction}`;
-  if (stage === "implement") return `${common}\nApproved plan:\n${plan}\n${verification || review ? `\nReported issues to repair specifically (do not broaden scope):\n${verification ? `Verifier report:\n${verification}\n` : ""}${review ? `Reviewer report:\n${review}\n` : ""}` : ""}Implement only the approved plan. You may edit source, but do not run or claim final verification. Submit verdict COMPLETED or BLOCKED and describe changed files and checks not performed. ${reportInstruction}`;
-  if (stage === "verify") return `${common}\nApproved plan:\n${plan}\nRead the implementation handoff(s) in the artifact directory. Inspect the live tree and run relevant checks through run_verification_command, which is the only command facility and is kernel-sandboxed read-only. Do not use shell escapes or attempt to write source or reports. Only submit_stage_report may write the report artifact. Submit PASS or FAIL with evidence. ${reportInstruction}`;
-  return `${common}\nApproved plan:\n${plan}\nVerifier report:\n${verification}\n${review ? `Prior review report:\n${review}\n` : ""}Review the live tree, current diff, task, plan, implementation handoff, and verifier report. Also inspect baseline artifacts ${path.join(dir, "diffs/baseline-status.txt")} and ${path.join(dir, "diffs/baseline-diff.patch")} to distinguish pre-existing dirty changes where possible, and state limitations. Never edit source. Submit APPROVED or CHANGES_REQUESTED with prioritized findings. ${reportInstruction}`;
+function promptFor(stage: Stage, task: string, dir: string, plan: string, review: string, attempt: number, workerReportPath = "", workerReportContent = "") {
+  const label = INFO[stage].label, report = path.join(dir, `${stage}-${attempt}.json`);
+  const common = `あなたは${label}です。可視化された逐次pipelineの一員として、現在のrepositoryで作業してください。\n作業内容：\n${task}\n\nartifact保存先：${dir}。今回のattempt：${attempt}。`;
+  const reportInstruction = `最後に必ずsubmit_stage_reportを呼び出し、structured JSON契約で報告してください。orchestratorが指定したpending先は${report}（attempt ${attempt}）です。`;
+  if (stage === "implement") return `${common}\n承認済み計画：\n${plan}\n${review ? `\nReviewerからの修正依頼（このstructured finding dataだけを使用）：\n${review}\n` : ""}承認済み計画の範囲だけを実装してください。sourceを変更し、実装・test・動作確認を行った結果を、COMPLETEDまたはBLOCKEDと日本語のsummary、changedScope、evidenceで報告してください。${reportInstruction}`;
+  return `${common}\n承認済み計画：\n${plan}\n現在のWorker report path：${workerReportPath}\nvalidator済みWorker report JSON本文：\n${workerReportContent}\n今回のattemptのsnapshot：${path.join(dir, `diffs/implement-${attempt}-status.txt`)} / ${path.join(dir, `diffs/implement-${attempt}-diff.patch`)}\nbaseline：${path.join(dir, "diffs/baseline-status.txt")} / ${path.join(dir, "diffs/baseline-diff.patch")}\nread-onlyの確認手段だけを使い、sourceを変更しないでください。独立した確認として、APPROVED、APPROVED_WITH_NOTES、CHANGES_REQUESTED、NEEDS_PLANNERとstructuredな日本語fieldを報告してください。${reportInstruction}`;
 }
 
 export default function (pi: ExtensionAPI) {
   registerCleanupTool(pi, rootDir());
-  pi.registerTool({ name: "development_pipeline", label: "Development Pipeline", description: "Run an auditable development pipeline in visible Herdr panes.", parameters: Type.Object({ task: Type.String({ description: "User-approved development task" }), approvedPlan: Type.String({ description: "Plan approved in the parent Sol conversation" }), cwd: Type.Optional(Type.String()), maxRepairCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 1, default: 1 })), cleanupMode: Type.Optional(Type.String({ description: "ask, on-success, or never; defaults to ask" })) }), async execute(_id, input: Input, signal, onUpdate, ctx) {
+  pi.registerTool({ name: "development_pipeline", label: "Development Pipeline", description: "可視のHerdrペインで監査可能な開発パイプラインを実行します。", parameters: Type.Object({ task: Type.String({ description: "User-approved development task" }), approvedPlan: Type.String({ description: "Plan approved in the parent Sol conversation" }), cwd: Type.Optional(Type.String()), maxReviewCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), maxRepairCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), cleanupMode: Type.Optional(Type.String({ description: "ask, on-success, or never; defaults to ask" })) }), async execute(_id, input: Input, signal, onUpdate, ctx) {
     const task = input.task?.trim(), approvedPlan = input.approvedPlan?.trim(), cwd = path.resolve(input.cwd?.trim() || ctx.cwd);
     if (!task) throw new Error("task must not be empty");
     if (!approvedPlan) throw new Error("approvedPlan must not be empty; planning is expected in the parent Sol conversation");
@@ -158,14 +158,14 @@ export default function (pi: ExtensionAPI) {
     try { if (!(await fs.stat(cwd)).isDirectory()) throw new Error(); } catch { throw new Error(`cwd does not exist: ${cwd}`); }
     await preflightVerifierSandbox(cwd);
     const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`, artifactDir = path.join(rootDir(), "artifacts", path.basename(cwd) || "repository", id), diffs = path.join(artifactDir, "diffs"); await fs.mkdir(diffs, { recursive: true });
-    await atomicWrite(path.join(artifactDir, "request.md"), `# Request\n\n${task}\n\nTarget: ${cwd}\n`); await atomicWrite(path.join(artifactDir, "approved-plan.md"), `# Approved plan\n\n${approvedPlan}\n`); await snapshot(cwd, diffs, "baseline");
-    const metadata: any = { targetRepository: path.basename(cwd), targetPath: cwd, startedAt: now(), parentPaneId: process.env.HERDR_PANE_ID, tabId: process.env.HERDR_TAB_ID, workspaceId: process.env.HERDR_WORKSPACE_ID, limitation: "Baseline captures pre-existing dirty changes; attribution is not perfect.", planning: { status: "passed", source: "parent Sol conversation", artifact: "approved-plan.md" }, stages: Object.fromEntries(stages.filter(s => s !== "plan").map(s => [s, { status: "pending", attempts: [] }])), panes: [], repairCycles: 0 };
+    await atomicWrite(path.join(artifactDir, "request.md"), `# 依頼\n\n${task}\n\n対象: ${cwd}\n`); await atomicWrite(path.join(artifactDir, "approved-plan.md"), `# 承認済み計画\n\n${approvedPlan}\n`); await snapshot(cwd, diffs, "baseline");
+    const metadata: any = { targetRepository: path.basename(cwd), targetPath: cwd, startedAt: now(), parentPaneId: process.env.HERDR_PANE_ID, tabId: process.env.HERDR_TAB_ID, workspaceId: process.env.HERDR_WORKSPACE_ID, limitation: "baselineは既存のdirty変更を含むため、変更の帰属を完全には判定できません。", planning: { status: "passed", source: "親Plannerセッション", artifact: "approved-plan.md" }, stages: Object.fromEntries(stages.filter(s => s !== "plan").map(s => [s, { status: "pending", attempts: [] }])), panes: [], repairCycles: 0 };
     await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
     const parentPaneId = metadata.parentPaneId as string;
     const emit = (stage: string, text: string) => onUpdate?.({ content: [{ type: "text", text: `${stage}: ${text}` }], details: { stage, artifactDir, panes: metadata.panes } });
     let activePane: string | undefined, abortWork: Promise<boolean> | undefined, plan = approvedPlan, verification = "", review = "";
     const runStage = async (stage: Stage, text: string, attempt: number): Promise<{ valid: boolean; positive: boolean; verdict?: string; text: string }> => {
-      const reportFile = path.join(artifactDir, `${stage}-${attempt}.md`), pendingReport = path.join(artifactDir, `${stage}-pending.md`), terminalFile = path.join(artifactDir, `${stage}-${attempt}.terminal.txt`), record: Attempt = { attempt, status: "running", startedAt: now(), reportFile: path.basename(reportFile), paneId: "" }; let terminalCaptured = false, snapshotSucceeded = true; let stageResult: { valid: boolean; positive: boolean; verdict?: string; text: string } = { valid: false, positive: false, text: "" };
+      const reportFile = path.join(artifactDir, `${stage}-${attempt}.json`), pendingReport = path.join(artifactDir, `${stage}-pending.json`), terminalFile = path.join(artifactDir, `${stage}-${attempt}.terminal.txt`), record: Attempt = { attempt, status: "running", startedAt: now(), reportFile: path.basename(reportFile), paneId: "" }; let terminalCaptured = false, snapshotSucceeded = true; let stageResult: { valid: boolean; positive: boolean; verdict?: string; text: string } = { valid: false, positive: false, text: "" };
       const stageData = metadata.stages[stage]; stageData.status = "running"; stageData.attempts.push(record); let pane = metadata.panes.find((p: Pane) => p.name === INFO[stage].label) as Pane | undefined;
       if (!pane) { pane = { paneId: "", name: INFO[stage].label, model: MODELS[stage], attempts: [] }; metadata.panes.push(pane); }
       pane.attempts.push(record); await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
@@ -191,43 +191,59 @@ export default function (pi: ExtensionAPI) {
           await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
         } else { record.paneId = pane.paneId; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); await sendPrompt(pane.paneId, text); }
         if (signal?.aborted) { const result = await routeMonitorFailure("aborted", abortWork ? () => abortWork! : () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
-        activePane = pane.paneId; emit(stage, `${pane.paneId} (${pane.name}), attempt ${attempt}`);
+        activePane = pane.paneId; emit(stage, `${pane.paneId}（${pane.name}）、試行 ${attempt}`);
         const state = await waitPane(pane.paneId, pendingReport, signal, m => emit(stage, m)); if (state === "aborted" || signal?.aborted) { const result = await routeMonitorFailure("aborted", abortWork ? () => abortWork! : () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
         if (state === "startup-timeout" || state === "timeout" || state === "process-info-failure") { const result = await routeMonitorFailure(state, () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
         if (state !== "settled") { record.status = "failed"; stageData.status = "failed"; record.error = `pane ${state}; pane preserved`; return { valid: false, positive: false, text: "" }; }
         await renameDetectedPane(pane.paneId, pane.name);
         await captureTranscript(pane.paneId, terminalFile); terminalCaptured = true;
-        const submitted = await fs.readFile(pendingReport, "utf8"); await atomicWrite(reportFile, `# ${stage} report (attempt ${attempt})\n\n${submitted.replace(/^# .*?\n\n/, "")}`); await fs.rm(pendingReport, { force: true });
+        const submitted = await fs.readFile(pendingReport, "utf8"); await atomicWrite(reportFile, submitted); await fs.rm(pendingReport, { force: true });
         let report = ""; try { report = await fs.readFile(reportFile, "utf8"); } catch { record.error = "missing durable report"; }
-        const choices = stage === "plan" ? ["READY", "BLOCKED"] : stage === "implement" ? ["COMPLETED", "BLOCKED"] : stage === "verify" ? ["PASS", "FAIL"] : ["APPROVED", "CHANGES_REQUESTED"]; const v = exactVerdict(report, choices), valid = !!v, positive = stage === "plan" ? v === "VERDICT: READY" : stage === "implement" ? v === "VERDICT: COMPLETED" : stage === "verify" ? v === "VERDICT: PASS" : v === "VERDICT: APPROVED"; record.verdict = v;
-        record.status = valid ? (positive ? "passed" : stage === "plan" && v === "VERDICT: BLOCKED" ? "blocked" : "failed") : "failed"; stageData.status = record.status; if (!valid) record.error = record.error || "missing or malformed final verdict"; stageResult.valid = valid; stageResult.positive = positive; stageResult.verdict = v; stageResult.text = report; return stageResult;
+        let parsed: any; try { parsed = JSON.parse(report); } catch { parsed = undefined; }
+        const checked = stage === "implement" ? (parsed ? validateWorkerReport(parsed) : { valid: false as const, error: "missing or malformed worker report" }) : (parsed ? validateReviewerReport(parsed) : { valid: false as const, error: "missing or malformed reviewer report" });
+        const v = parsed?.verdict ? `VERDICT: ${parsed.verdict}` : undefined, valid = checked.valid, positive = valid && (stage === "implement" ? parsed.verdict === "COMPLETED" : parsed.verdict === "APPROVED" || parsed.verdict === "APPROVED_WITH_NOTES"); record.verdict = v;
+        record.status = valid ? (positive ? "passed" : "failed") : "failed"; stageData.status = record.status; if (!valid) record.error = record.error || (checked as any).error; stageResult.valid = valid; stageResult.positive = positive; stageResult.verdict = v; stageResult.text = report; return stageResult;
       } catch (e) { record.status = signal?.aborted ? "aborted" : "failed"; stageData.status = record.status; record.error = e instanceof Error ? e.message : String(e); return { valid: false, positive: false, text: "" }; }
       finally { if (pane?.paneId && !terminalCaptured) { try { await captureTranscript(pane.paneId, terminalFile); } catch (e) { record.error = record.error || `terminal capture failed: ${e instanceof Error ? e.message : String(e)}`; } } record.finishedAt = now(); stageData.finishedAt = record.finishedAt; try { await snapshot(cwd, diffs, `${stage}-${attempt}`); } catch (e) { if (record.status !== "aborted") { record.status = "failed"; stageData.status = "failed"; snapshotSucceeded = false; record.error = `stage snapshot failed: ${e instanceof Error ? e.message : String(e)}`; stageResult.valid = false; stageResult.positive = false; stageResult.text = ""; } } if (signal?.aborted && pane?.paneId) { abortWork ??= interrupt(pane.paneId); const stopped = await abortWork; if (!stopped) record.error = record.error || "abort could not be confirmed"; } const finalized = finalizeStage(stageResult, snapshotSucceeded); stageResult.valid = finalized.valid; stageResult.positive = finalized.positive; stageResult.text = finalized.text; signal?.removeEventListener("abort", abortHandler); await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); }
     };
-    const finish = async (outcome: string) => { if (signal?.aborted) { if (activePane) { const stopped = abortWork ? await abortWork : await interrupt(activePane); if (!stopped) metadata.abortError = "Herdr could not confirm the active pane became idle"; } outcome = "ABORTED"; } metadata.finishedAt = now(); metadata.outcome = outcome; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); return { content: [{ type: "text", text: `${outcome}\nArtifacts: ${artifactDir}\n${outcome === "SUCCESS" ? "Cleanup decision pending." : "Worker panes remain open."}` }], details: { outcome, artifactDir, panes: metadata.panes } }; };
-    const implemented = await runStage("implement", promptFor("implement", task, artifactDir, plan, "", "", 1), 1); if (!implemented.positive) return finish(signal?.aborted ? "ABORTED" : "IMPLEMENTATION_FAILED");
+    const finish = async (outcome: string) => { if (signal?.aborted) { if (activePane) { const stopped = abortWork ? await abortWork : await interrupt(activePane); if (!stopped) metadata.abortError = "Herdr could not confirm the active pane became idle"; } outcome = "ABORTED"; } metadata.finishedAt = now(); metadata.outcome = outcome; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); return { content: [{ type: "text", text: `${outcome}\n成果物: ${artifactDir}\n${outcome === "SUCCESS" ? "cleanupの判断待ちです。" : "子ペインを保持しました。"}` }], details: { outcome, artifactDir, panes: metadata.panes } }; };
     let cycle = 0;
-    let verified = await runStage("verify", promptFor("verify", task, artifactDir, plan, "", "", 1), 1); verification = verified.text;
-    if (!verified.valid) return finish(signal?.aborted ? "ABORTED" : "VERIFICATION_FAILED");
-    if (!verified.positive) { if (flowAfterVerification(verified, cycle, input.maxRepairCycles ?? 1)[0] !== "implement") return finish(verified.valid ? "CHANGES_REQUIRED" : "VERIFICATION_FAILED"); cycle = 1; metadata.repairCycles = cycle; const repair = await runStage("implement", promptFor("implement", task, artifactDir, plan, verification, "", 2), 2); if (!repair.positive) return finish(signal?.aborted ? "ABORTED" : "REPAIR_FAILED"); verified = await runStage("verify", promptFor("verify", task, artifactDir, plan, "", "", 2), 2); verification = verified.text; if (!verified.positive) return finish(signal?.aborted ? "ABORTED" : verified.valid ? "CHANGES_REQUIRED" : "VERIFICATION_FAILED"); }
-    let reviewed = await runStage("review", promptFor("review", task, artifactDir, plan, verification, "", 1), 1); review = reviewed.text; if (!reviewed.valid) return finish(signal?.aborted ? "ABORTED" : "REVIEW_FAILED");
-    if (!reviewed.positive) { if (flowAfterReview(reviewed, cycle, input.maxRepairCycles ?? 1)[0] !== "implement") return finish(reviewed.valid ? "CHANGES_REQUIRED" : "REVIEW_FAILED"); cycle = 1; metadata.repairCycles = cycle; const repair = await runStage("implement", promptFor("implement", task, artifactDir, plan, verification, review, 3), 3); if (!repair.positive) return finish(signal?.aborted ? "ABORTED" : "REPAIR_FAILED"); verified = await runStage("verify", promptFor("verify", task, artifactDir, plan, "", "", 3), 3); verification = verified.text; if (!verified.positive) return finish(signal?.aborted ? "ABORTED" : verified.valid ? "CHANGES_REQUIRED" : "VERIFICATION_FAILED"); reviewed = await runStage("review", promptFor("review", task, artifactDir, plan, verification, review, 2), 2); review = reviewed.text; if (!reviewed.positive) return finish(signal?.aborted ? "ABORTED" : reviewed.valid ? "CHANGES_REQUIRED" : "REVIEW_FAILED"); }
+    let implemented = await runStage("implement", promptFor("implement", task, artifactDir, plan, "", 1), 1);
+    if (!implemented.positive) return finish(signal?.aborted ? "ABORTED" : implemented.valid ? "IMPLEMENTATION_BLOCKED" : "IMPLEMENTATION_FAILED");
+    let reviewed = await runStage("review", promptFor("review", task, artifactDir, plan, "", 1, path.join(artifactDir, "implement-1.json"), implemented.text), 1); review = reviewed.text;
+    if (!reviewed.valid) return finish(signal?.aborted ? "ABORTED" : "REVIEW_FAILED");
+    while (!reviewed.positive) {
+      const reviewData = (() => { try { return JSON.parse(reviewed.text); } catch { return undefined; } })();
+      if (!reviewData) return finish("REVIEW_FAILED");
+      const transition = transitionAfterReview(reviewData, metadata.reviewIds ?? [], cycle, { maxReviewCycles: input.maxReviewCycles, maxRepairCycles: input.maxRepairCycles });
+      metadata.reviewIds = transition.reviewIds; metadata.reviewBudget = transition.budget; metadata.repeatedIds = transition.repeatedIds; if (transition.plannerReason) metadata.plannerReason = transition.plannerReason;
+      if (transition.outcome === "NEEDS_PLANNER") return finish("NEEDS_PLANNER");
+      if (transition.outcome === "CHANGES_REQUIRED") return finish("CHANGES_REQUIRED");
+      cycle++; metadata.repairCycles = cycle;
+      const handoff = JSON.stringify(workerHandoffFromReviewer(reviewData));
+      implemented = await runStage("implement", promptFor("implement", task, artifactDir, plan, handoff, cycle + 1), cycle + 1);
+      if (!implemented.positive) return finish(signal?.aborted ? "ABORTED" : "IMPLEMENTATION_BLOCKED");
+      reviewed = await runStage("review", promptFor("review", task, artifactDir, plan, handoff, cycle + 1, path.join(artifactDir, `implement-${cycle + 1}.json`), implemented.text), cycle + 1); review = reviewed.text;
+      if (!reviewed.valid) return finish(signal?.aborted ? "ABORTED" : "REVIEW_FAILED");
+    }
+    const finalReview = JSON.parse(reviewed.text); const finalTransition = transitionAfterReview(finalReview, metadata.reviewIds ?? [], cycle, { maxReviewCycles: input.maxReviewCycles, maxRepairCycles: input.maxRepairCycles });
+    metadata.reviewIds = finalTransition.reviewIds; metadata.reviewBudget = finalTransition.budget; metadata.repeatedIds = finalTransition.repeatedIds;
     if (signal?.aborted) return finish("ABORTED");
-    const finalResult: any = await finish("SUCCESS"); let cleanupMessage = cleanupMode === "never" ? "Cleanup disabled; all worker panes remain open." : "Cleanup declined; all worker panes remain open.";
+    const finalResult: any = await finish("SUCCESS"); let cleanupMessage = cleanupMode === "never" ? "cleanupは無効です。子ペインを保持しました。" : "cleanupは実行されませんでした。子ペインを保持しました。";
     let confirmed = false;
     try {
-      if (signal?.aborted) { await markRunAborted(artifactDir, path.join(rootDir(), "artifacts")); cleanupMessage = "Cleanup cancelled; all worker panes remain open."; }
-      else confirmed = cleanupMode === "ask" && ctx.hasUI ? await ctx.ui.confirm("Close pipeline panes?", "Close only this run's idle worker panes?") : false;
-      if (signal?.aborted) { await markRunAborted(artifactDir, path.join(rootDir(), "artifacts")); cleanupMessage = "Cleanup cancelled; all worker panes remain open."; }
+      if (signal?.aborted) { await markRunAborted(artifactDir, path.join(rootDir(), "artifacts")); cleanupMessage = "cleanupを中断しました。子ペインを保持しました。"; }
+      else confirmed = cleanupMode === "ask" && ctx.hasUI ? await ctx.ui.confirm("パイプラインのペインを閉じますか？", "このrunに属するidle状態の子ペインだけを閉じます。") : false;
+      if (signal?.aborted) { await markRunAborted(artifactDir, path.join(rootDir(), "artifacts")); cleanupMessage = "cleanupを中断しました。子ペインを保持しました。"; }
       else if (shouldCleanup("SUCCESS", cleanupMode, ctx.hasUI, confirmed)) {
-        try { const cleanup = await cleanupRun(artifactDir, path.join(rootDir(), "artifacts"), parentPaneId, signal); const allClosed = cleanup.results.length > 0 && cleanup.results.every((r: any) => r.status === "closed"); cleanupMessage = allClosed ? "Cleanup complete; all worker panes were closed." : `Cleanup partial; worker panes remain where not closed. ${cleanup.summary}`; finalResult.details.cleanup = cleanup; if (allClosed) { const audited = await clearLaunchersAfterCleanup(artifactDir); metadata.cleanup = audited.cleanup; metadata.launchers = []; } }
-        catch (error) { const message = error instanceof Error ? error.message : String(error); await recordCleanupFailure(artifactDir, path.join(rootDir(), "artifacts"), message); cleanupMessage = `Cleanup failed; all worker panes remain open where not already closed. ${message}`; finalResult.details.cleanupError = message; }
-      } else if (cleanupMode === "ask" && !ctx.hasUI) cleanupMessage = "Cleanup unavailable without a usable UI; all worker panes remain open. Use development_pipeline_cleanup later.";
-    } catch (error) { const message = error instanceof Error ? error.message : String(error); await recordCleanupFailure(artifactDir, path.join(rootDir(), "artifacts"), message); cleanupMessage = `Cleanup confirmation failed; all worker panes remain open. ${message}`; finalResult.details.cleanupError = message; }
+        try { const cleanup = await cleanupRun(artifactDir, path.join(rootDir(), "artifacts"), parentPaneId, signal); const allClosed = cleanup.results.length > 0 && cleanup.results.every((r: any) => r.status === "closed"); cleanupMessage = allClosed ? "cleanupが完了し、子ペインを閉じました。" : `cleanupは一部だけ完了しました。閉じられなかった子ペインを保持しています。${cleanup.summary}`; finalResult.details.cleanup = cleanup; if (allClosed) { const audited = await clearLaunchersAfterCleanup(artifactDir); metadata.cleanup = audited.cleanup; metadata.launchers = []; } }
+        catch (error) { const message = error instanceof Error ? error.message : String(error); await recordCleanupFailure(artifactDir, path.join(rootDir(), "artifacts"), message); cleanupMessage = `cleanupに失敗しました。閉じられていない子ペインを保持しています。${message}`; finalResult.details.cleanupError = message; }
+      } else if (cleanupMode === "ask" && !ctx.hasUI) cleanupMessage = "利用可能なUIがないためcleanupを確認できません。子ペインを保持しました。後からdevelopment_pipeline_cleanupを使用してください。";
+    } catch (error) { const message = error instanceof Error ? error.message : String(error); await recordCleanupFailure(artifactDir, path.join(rootDir(), "artifacts"), message); cleanupMessage = `cleanup確認に失敗しました。子ペインを保持しています。${message}`; finalResult.details.cleanupError = message; }
     if (signal?.aborted) { try { await markRunAborted(artifactDir, path.join(rootDir(), "artifacts")); } catch (error) { finalResult.details.cleanupError = error instanceof Error ? error.message : String(error); } }
     const durable = JSON.parse(await fs.readFile(path.join(artifactDir, "run.json"), "utf8"));
     finalResult.details.outcome = durable.outcome;
-    finalResult.content[0].text = finalResult.content[0].text.replace("SUCCESS", durable.outcome).replace("Cleanup decision pending.", durable.outcome === "ABORTED" ? "Cleanup cancelled; all worker panes remain open." : cleanupMessage); return finalResult;
+    finalResult.content[0].text = finalResult.content[0].text.replace("SUCCESS", durable.outcome).replace("cleanupの判断待ちです。", durable.outcome === "ABORTED" ? "cleanupを中断しました。子ペインを保持しました。" : cleanupMessage); return finalResult;
     }
   });
 }

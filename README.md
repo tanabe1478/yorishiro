@@ -38,22 +38,33 @@ cd work/example
 
 ## 開発パイプライン
 
-要件と実装計画が親Sol会話で承認済みの作業は `development_pipeline` ツールへ委譲できます。親エージェントが実装を重複して行わず、承認済みのタスクと計画を渡してください。計画用の子ペインは作りません。
+親Piで要件と実装計画を合意した作業は、`development_pipeline`へ委譲できます。Plannerは親セッション自身であり、子Plannerは起動しません。
 
-| 役割 | 固定モデル | 権限 |
+| 役割 | 固定モデル | 担当 |
 |---|---|---|
-| 計画・調査・要件（親Sol会話） | `openai-codex/gpt-5.6-sol` | 親会話で実施 |
-| 実装 | `openai-codex/gpt-5.6-luna` | coding tools |
-| 検証 | `openai-codex/gpt-5.6-terra` | read, grep, find, ls, sandboxed verification command |
-| レビュー | `openai-codex/gpt-5.6-sol` | read-only |
+| Planner（親） | 親セッションのモデル | 要件、計画、Reviewer指摘の採否 |
+| Worker · Luna | `openai-codex/gpt-5.6-luna` | 実装、テスト、ビルド、動作確認、修正 |
+| Reviewer · Sol | `openai-codex/gpt-5.6-sol` | read-onlyレビュー、sandbox内の独立検証 |
 
-パイプラインは **Herdr 上で起動した Pi からのみ**実行できます。計画は親Sol会話で承認済みである必要があり、実行時に `approvedPlan` として保存します。`HERDR_PANE_ID`、`HERDR_TAB_ID`、`HERDR_WORKSPACE_ID`、`HERDR_SOCKET_PATH` を検証し、現在のタブを右分割して各ステージの通常のインタラクティブ Pi TUI を表示します。親ペインは残り、自動フォーカス・ズーム・ペイン削除は行いません。各ペインのプロンプト、ツール呼び出し、編集、差分、テスト出力を直接確認できます。
+パイプラインはHerdr内で起動したPiからのみ実行できます。現在のタブを、親55%、右45%のWorker／Reviewer上下2段へ分割します。子は通常のPi TUIとして表示され、修正と再レビューでは同じペインを再利用します。子からパイプラインを再帰起動することはできません。
 
-子ステージのペイン名は `Implement · Luna`、`Verify · Terra`、`Review · Sol` です。検証にはmacOSの`/usr/bin/sandbox-exec`、またはLinuxの`/usr/bin/bwrap`と利用可能なuser namespaceが必要です。その他のOS、sandbox未導入環境、`/tmp`配下の対象リポジトリは実装開始前に明確に拒否します。修復・再検証・再レビューは同じペインとPiセッションへ追加入力し、ペイン名を変えません。完了・失敗・中断後もペインは保持されるため、不要になったペインは Herdr で手動削除してください。Pi の公式 Herdr integration は現在未導入です。この実装は Herdr CLI 0.7.3 の画面・ペイン検出を使い、グローバル設定は変更しません。
+WorkerとReviewerは中央validatorが検証する構造化JSONで報告します。Reviewerの判定は`APPROVED`、`APPROVED_WITH_NOTES`、`CHANGES_REQUESTED`、`NEEDS_PLANNER`です。Workerへ戻す情報はblocking findingだけに制限し、Reviewerの生出力やtranscriptは渡しません。同じ指摘IDの再発や、修正後に理由なく追加されたblockingは`NEEDS_PLANNER`で止まります。
 
-各ペインはまず `startup` 状態で最大15秒、`argv0` が厳密に `pi` のプロセス情報を待ちます。Piを観測するまでは欠落情報を終了とは扱いません。観測後に有効なプロセス情報からPiが消えた場合だけ `exited`、起動猶予または通常の30分制限を超えた場合は別の失敗として記録します。プロセス情報のコマンド失敗・JSON解析失敗も終了とはみなさず、再試行後に専用エラーにします。タイムアウト・中断時は `ctrl+c`、`escape`、idle確認で子作業を停止しますが、ペインと証跡は保持します。
+修正回数は`maxReviewCycles`で指定でき、既定2、上限3です。旧`maxRepairCycles`も互換入力として受理し、両方指定時は`maxReviewCycles`を優先します。欠落・不正レポート、プロセス失敗、timeout、中断は安全側で停止します。失敗・中断・Planner判断待ちでは子ペインを残します。
 
-成功時のworkerペイン整理は `cleanupMode`（`ask` / `on-success` / `never`、既定値`ask`）で制御します。失敗・中断・CHANGES_REQUIREDでは自動削除せず、拒否時もペインを残します。後から `development_pipeline_cleanup` に成果物runディレクトリを渡して整理できます（実パスをcanonicalizeし、`SUCCESS` runだけを受け付けます）。親ペインは常に保護されます。各ステージは、明示的にロードした `submit_stage_report` 拡張ツール（オーケストレータが選んだ pending パスだけへ原子的に書ける狭い報告機構）で、厳密な verdict を含む成果物を保存します。Verifyのコマンドはカーネル強制のread-only sandbox内で実行され、プロセスグループ単位でキャンセルされます。各結果にはモデル可視のexit status（通常終了・TIMEOUT・CANCELLED）が含まれ、出力はUTF-8バイト単位でstatus/通知を含めて64 KiBに制限されます。ソースや報告を変更できません。Planは親Sol会話から供給し、子ペインを作りません。実行記録は `artifacts/<repository>/<run-id>/`（Git管理外）の `request.md`、レポート、`diffs/`、`run.json` にあり、ペイン ID と状態（pending/running/passed/failed/blocked/aborted）も記録されます。有効な検証 FAIL またはレビュー CHANGES_REQUESTED は最大1回だけ修復できます。欠落・不正レポート、プロセス失敗、タイムアウト、中断は終端失敗です。修復・再検証・再レビューは既存セッションで続行します。開始時の dirty tree は baseline として保存しますが、既存変更との帰属は完全には判定できません。
+Reviewerの検証コマンドはmacOSの`sandbox-exec`またはLinuxのbubblewrap/user namespaceによるread-only sandboxで実行します。未対応環境、sandbox未導入環境、`/tmp`配下の対象は作業開始前に拒否します。
+
+成果物は`artifacts/<repository>/<run-id>/`に保存されます。主な内容は依頼、承認済み計画、各attemptの構造化report、baselineと各stageのstatus/diff、`run.json`です。既存のdirty変更はbaselineとして保持しますが、変更の帰属を完全には判定できません。
+
+成功時の整理は`cleanupMode`で制御します。
+
+- `ask`（既定）: UIで確認する
+- `on-success`: 成功時だけ整理する
+- `never`: ペインを残す
+
+後から`development_pipeline_cleanup`へrunディレクトリを渡して整理できます。新構成はReviewer→Worker、旧構成はReview→Verify→Implementの順に閉じます。親ペイン、非idleペイン、別runのペインは保護されます。
+
+計画を画面で確認したい場合は、パイプライン開始前にPlannotatorを親セッションから利用します。最終差分を確認したい場合は`cleanupMode: never`で成功させ、Reviewer対応後にdiffaiをforegroundで実行し、承認後にcleanup・commit・pushします。これらの自動起動は現在の`development_pipeline`には接続していません。
 
 ## 育て方
 
