@@ -9,7 +9,7 @@ function fakeHerdr(observations, report = false) {
     now: () => clock,
     sleep: async ms => { clock += ms; },
     poll: async () => { const observation = observations[Math.min(index++, observations.length - 1)]; return { ...observation, processInfoValid: observation.processInfoValid ?? true }; },
-    reportExists: () => report,
+    reportExists: () => typeof report === "function" ? report(clock, index) : report,
   };
 }
 
@@ -49,6 +49,54 @@ fake = fakeHerdr([
 assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 2_000, onUpdate() {} }), "startup-timeout");
 
 fake = fakeHerdr([
+  { status: "running", processInfo: { argv0: "pi" } },
+  { status: "idle", processInfo: { argv0: "pi" } },
+], false);
+assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 2_000, reportMissingGraceMs: 2, pollIntervalMs: 1, onUpdate() {} }), "report-missing", "activeからidleへ遷移してreportがない場合は有限猶予でfail closedする");
+
+const continuityUpdates = [];
+fake = fakeHerdr([
+  { status: "running", processInfo: { argv0: "pi" } },
+  { status: "idle", processInfo: { argv0: "pi" } },
+  { status: "future-status", processInfo: { argv0: "pi" } },
+  { status: "idle", processInfo: { argv0: "pi" } },
+], false);
+assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 2_000, reportMissingGraceMs: 2, pollIntervalMs: 1, onUpdate: message => continuityUpdates.push(message) }), "report-missing", "unknown status後のidleは新しいquiescent区間として計測する");
+assert.equal(continuityUpdates.filter(message => message.includes("report-missing猶予を開始")).length, 2, "unknown status must reset the missing-report timer");
+
+const undefinedContinuityUpdates = [];
+fake = fakeHerdr([
+  { status: "running", processInfo: { argv0: "pi" } },
+  { status: "idle", processInfo: { argv0: "pi" } },
+  { processInfo: { argv0: "pi" } },
+  { status: "idle", processInfo: { argv0: "pi" } },
+], false);
+assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 2_000, reportMissingGraceMs: 2, pollIntervalMs: 1, onUpdate: message => undefinedContinuityUpdates.push(message) }), "report-missing", "undefined status後のidleは新しいquiescent区間として計測する");
+assert.equal(undefinedContinuityUpdates.filter(message => message.includes("report-missing猶予を開始")).length, 2, "undefined status must reset the missing-report timer");
+
+fake = fakeHerdr([{ status: "idle", processInfo: { argv0: "pi" } }], false);
+assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 2, reportMissingGraceMs: 2, pollIntervalMs: 1, onUpdate() {} }), "report-missing", "起動直後からidleでもstartup grace後に有限猶予でfail closedする");
+
+fake = fakeHerdr([
+  { status: "running", processInfo: { argv0: "pi" } },
+  { status: "idle", processInfo: { argv0: "pi" } },
+], (clock) => clock >= 2);
+assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 2_000, reportMissingGraceMs: 10, reportSettlementGraceMs: 10, pollIntervalMs: 1, onUpdate() {} }), "settled", "missing report猶予内にreportが現れれば通常settleする");
+
+fake = fakeHerdr([
+  { status: "running", processInfo: { argv0: "pi" } },
+  { status: "idle", processInfo: { argv0: "pi" } },
+  { status: "running", processInfo: { argv0: "pi" } },
+  { status: "idle", processInfo: { argv0: "pi" } },
+], false);
+assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 2_000, reportMissingGraceMs: 2, pollIntervalMs: 1, onUpdate() {} }), "report-missing", "active復帰時は欠落timerを解除し、次のidleから再計測する");
+
+fake = fakeHerdr([{ status: "future-status", processInfo: { argv0: "pi" } }], false);
+assert.equal(await monitorPane({ ...fake, timeoutMs: 4, startupGraceMs: 1, reportMissingGraceMs: 1, pollIntervalMs: 1, onUpdate() {} }), "timeout", "unknown statusだけではreport欠落と断定しない");
+fake = fakeHerdr([{ processInfo: { argv0: "pi" } }], false);
+assert.equal(await monitorPane({ ...fake, timeoutMs: 4, startupGraceMs: 1, reportMissingGraceMs: 1, pollIntervalMs: 1, onUpdate() {} }), "timeout", "undefined statusだけではreport欠落と断定しない");
+
+fake = fakeHerdr([
   { status: "running", processInfo: {}, processInfoValid: false },
   { status: "running", processInfo: { argv0: "pi" } },
   { status: "idle", processInfo: {}, processInfoValid: true },
@@ -61,6 +109,12 @@ fake = fakeHerdr([
   { status: "running", processInfo: {}, processInfoValid: false },
 ]);
 assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 2_000, onUpdate() {} }), "process-info-failure");
+
+let reportMissingStops = 0;
+const reportMissing = await routeMonitorFailure("report-missing", async () => { reportMissingStops++; return true; });
+assert.equal(reportMissing.status, "failed");
+assert.equal(reportMissingStops, 0, "report-missing must preserve the quiescent pane without interrupting it");
+assert.match(reportMissing.evidence, /durable report missing/);
 
 for (const state of ["startup-timeout", "timeout", "process-info-failure", "aborted"]) {
   let stops = 0;

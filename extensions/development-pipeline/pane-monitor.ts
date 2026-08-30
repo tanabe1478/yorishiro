@@ -1,4 +1,4 @@
-export type PaneMonitorState = "settled" | "exited" | "startup-timeout" | "timeout" | "process-info-failure" | "aborted";
+export type PaneMonitorState = "settled" | "exited" | "report-missing" | "startup-timeout" | "timeout" | "process-info-failure" | "aborted";
 export type PanePoll = { status?: string; processInfo: unknown; processInfoValid: boolean };
 export type MonitorStopResult = { stopped: boolean; evidence: string };
 
@@ -10,6 +10,7 @@ export async function stopAfterMonitorFailure(state: PaneMonitorState, stop: () 
 }
 
 export async function routeMonitorFailure(state: PaneMonitorState, stop: () => Promise<boolean>): Promise<{ status: "failed" | "aborted"; evidence: string } | undefined> {
+  if (state === "report-missing") return { status: "failed", evidence: "durable report missing after finite quiescent grace; pane preserved" };
   const result = await stopAfterMonitorFailure(state, stop);
   return result ? { status: state === "aborted" ? "aborted" : "failed", evidence: result.evidence } : undefined;
 }
@@ -22,8 +23,16 @@ export function hasExactPiIdentity(value: unknown): boolean {
   return Object.values(record).some(hasExactPiIdentity);
 }
 
+const QUIESCENT_STATUSES = new Set(["idle", "done", "completed"]);
+const ACTIVE_STATUSES = new Set(["active", "starting", "running", "working", "busy", "thinking", "tool_call", "tool-call", "streaming", "executing", "waiting"]);
+
 export function isQuiescentAgentStatus(status?: string): boolean {
-  return status === undefined || ["idle", "done", "completed", "unknown"].includes(status.toLowerCase());
+  return typeof status === "string" && QUIESCENT_STATUSES.has(status.toLowerCase());
+}
+
+/** Unknown or future Herdr statuses are deliberately not treated as active. */
+export function isActiveAgentStatus(status?: string): boolean {
+  return typeof status === "string" && ACTIVE_STATUSES.has(status.toLowerCase());
 }
 
 export async function monitorPane(options: {
@@ -37,6 +46,7 @@ export async function monitorPane(options: {
   startupGraceMs: number;
   pollIntervalMs?: number;
   reportSettlementGraceMs?: number;
+  reportMissingGraceMs?: number;
 }): Promise<PaneMonitorState> {
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? ((milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds)));
@@ -44,9 +54,12 @@ export async function monitorPane(options: {
   const startupDeadline = now() + options.startupGraceMs;
   const pollIntervalMs = options.pollIntervalMs ?? 1000;
   const reportSettlementGraceMs = options.reportSettlementGraceMs ?? 5000;
+  const reportMissingGraceMs = options.reportMissingGraceMs ?? reportSettlementGraceMs;
   let state: "startup" | "monitoring" = "startup";
   let invalidProcessInfoPolls = 0;
   let reportObservedAt: number | undefined;
+  let activeObserved = false;
+  let reportMissingSince: number | undefined;
   while (now() < deadline) {
     if (options.signal?.aborted) return "aborted";
     const observation = await options.poll();
@@ -63,12 +76,28 @@ export async function monitorPane(options: {
     if (state === "monitoring") {
       if (!hasPi) return "exited";
       const hasReport = options.reportExists();
+      const quiescent = isQuiescentAgentStatus(observation.status);
       if (hasReport && reportObservedAt === undefined) {
         reportObservedAt = now();
         await options.onUpdate("durable reportを検出し、Piの完了状態を確認しています");
       }
-      if (hasReport && (isQuiescentAgentStatus(observation.status) || now() - reportObservedAt! >= reportSettlementGraceMs)) return "settled";
-      await options.onUpdate(`pane is ${observation.status ?? "running"}`);
+      if (hasReport && (quiescent || now() - reportObservedAt! >= reportSettlementGraceMs)) return "settled";
+      if (!hasReport) {
+        if (isActiveAgentStatus(observation.status)) {
+          activeObserved = true;
+          reportMissingSince = undefined;
+        } else if (quiescent && (activeObserved || now() >= startupDeadline)) {
+          if (reportMissingSince === undefined) {
+            reportMissingSince = now();
+            await options.onUpdate("durable reportがなく、quiescent状態のreport-missing猶予を開始しました");
+          }
+          if (now() - reportMissingSince >= reportMissingGraceMs) return "report-missing";
+        } else {
+          // An unknown status is not evidence of quiescence. Start a new grace interval when idle returns.
+          reportMissingSince = undefined;
+        }
+      }
+      await options.onUpdate(`pane is ${observation.status ?? "unknown"}`);
     } else if (now() >= startupDeadline) {
       return "startup-timeout";
     } else {

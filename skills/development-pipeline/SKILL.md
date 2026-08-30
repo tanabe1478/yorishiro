@@ -44,7 +44,7 @@ Workerへはsanitized findingだけを渡し、Reviewerのsummary、note、生�
 
 `artifacts/<repository>/<run-id>/`へ依頼、承認済み計画、quality contract、各attemptのreport、quality gate、terminal記録、baseline／stage別status・diff・fingerprint、`run.json`を保存する。baseline fingerprintとの差分で既存dirty pathの内容変更、untracked・deleted・renameも検出する。
 
-起動、process-info、timeout、中断、欠落・不正reportはfail closedで扱う。監視はHerdrの特定status名だけに依存しない。exact Pi identityとdurable reportを必須とし、既知のquiescent statusは即時settle、未知またはactive statusもreport検出後5秒の有限猶予でsettleする。待機理由と時刻を`run.json` heartbeatへ継続記録する。中断時は`ctrl+c`と`escape`で停止を試み、証跡とペインを残す。Reviewerのコマンドも使い捨ての書き込み可能snapshot内だけで実行し、元checkoutへの書き込みはkernel sandboxで拒否する。
+起動、process-info、timeout、中断、欠落・不正reportはfail closedで扱う。監視はHerdrの特定status名だけに依存しない。exact Pi identityとdurable reportを必須とし、reportがないまま既知のquiescent status（`idle`／`done`／`completed`）になった場合は、active観測済みなら直ちに、起動直後からquiescentならstartup grace後に有限のreport-missing猶予を計測して失敗します。猶予中のreportは通常settle、active復帰はtimer解除とし、未知・undefined statusだけでは欠落と断定しません。report-missing時はterminal transcript、heartbeat、`run.json`へ診断を残してペインを保持します。待機理由と時刻を`run.json` heartbeatへ継続記録する。中断時は`ctrl+c`と`escape`で停止を試み、証跡とペインを残す。Reviewerのコマンドも使い捨ての書き込み可能snapshot内だけで実行し、元checkoutへの書き込みはkernel sandboxで拒否する。
 
 ## cleanup
 

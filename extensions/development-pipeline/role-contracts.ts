@@ -19,13 +19,29 @@ export function isCanonicalFindingId(value: unknown): value is string { return t
 function fail(error: string): Validation { return { valid: false, error }; }
 function plain(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
 function exact(value: Record<string, unknown>, keys: readonly string[]) { const actual=Reflect.ownKeys(value); return actual.length === keys.length && keys.every(key=>Object.prototype.hasOwnProperty.call(value,key)) && actual.every(key=>typeof key === "string" && keys.includes(key)); }
+function exactFieldDiagnostic(value: unknown, keys: readonly string[], label: string): string {
+  const actual = value && typeof value === "object" && !Array.isArray(value) ? Reflect.ownKeys(value as object).map(String) : [];
+  const missing = keys.filter(key => !actual.includes(key));
+  const unexpected = actual.filter(key => !keys.includes(key));
+  return `${label} has exact fields; expected=[${keys.join(", ")}]; missing=[${missing.join(", ")}]; unexpected=[${unexpected.join(", ")}]`;
+}
+function exactFailure(value: unknown, keys: readonly string[], label: string): string | undefined {
+  if (!plain(value)) return exactFieldDiagnostic(value, keys, label);
+  return exact(value, keys) ? undefined : exactFieldDiagnostic(value, keys, label);
+}
 
 export function validateWorkerReport(value: unknown, contract?: QualityContract): Validation {
-  if (!plain(value) || !exact(value,["verdict","summary","changedScope","evidence","completedPlanItems","changedPaths"])) return fail("worker report must be a plain object with exact fields");
+  const fields=["verdict","summary","changedScope","evidence","completedPlanItems","changedPaths"] as const;
+  const fieldError=exactFailure(value,fields,"worker report"); if (fieldError) return fail(fieldError);
   const r=value as Record<string, unknown>, items=r.completedPlanItems, paths=r.changedPaths;
   if (r.verdict !== "COMPLETED" && r.verdict !== "BLOCKED") return fail("worker verdict is invalid");
   if (!japanese(r.summary) || !japanese(r.changedScope) || !japanese(r.evidence)) return fail("worker summary, changedScope, and evidence must be Japanese and nonempty");
-  if (!Array.isArray(items) || !items.every(item => plain(item) && exact(item,["id","evidence"]) && text(item.id) && japanese(item.evidence))) return fail("completedPlanItems must contain exact canonical IDs and Japanese evidence");
+  if (!Array.isArray(items)) return fail("completedPlanItems must be an array");
+  for (const item of items) {
+    const itemFieldError=exactFailure(item,["id","evidence"],"completedPlanItems item");
+    if (itemFieldError) return fail(itemFieldError);
+    if (!text((item as Record<string,unknown>).id) || !japanese((item as Record<string,unknown>).evidence)) return fail("completedPlanItems must contain exact canonical IDs and Japanese evidence");
+  }
   const planIds=(items as Record<string,unknown>[]).map(item=>item.id as string);
   if (new Set(planIds).size !== planIds.length) return fail("completedPlanItems IDs must be unique");
   if (!Array.isArray(paths) || !paths.every(isRepositoryRelativePath) || new Set(paths).size !== paths.length) return fail("changedPaths must be unique repository-relative paths");
@@ -38,10 +54,10 @@ export function validateWorkerReport(value: unknown, contract?: QualityContract)
 }
 
 function validateBlocking(item: unknown, ids: Set<string>): Validation {
-  if (!plain(item)) return fail("blocking finding must be a plain object");
-  const f=item as Record<string, unknown>, discovery=f.discovery;
+  const discovery=plain(item) ? (item as Record<string,unknown>).discovery : undefined;
   const keys=discovery === "previously_missed" ? ["id","severity","target","reproduction","userImpact","expectedOutcome","route","discovery","missedReason"] : ["id","severity","target","reproduction","userImpact","expectedOutcome","route","discovery"];
-  if (!exact(f,keys)) return fail("blocking finding has exact fields");
+  const fieldError=exactFailure(item,keys,"blocking finding"); if (fieldError) return fail(fieldError);
+  const f=item as Record<string, unknown>;
   if (!isCanonicalFindingId(f.id) || ids.has(f.id)) return fail("finding IDs must be canonical, unique, and nonempty");
   if (f.severity !== "critical" && f.severity !== "high") return fail("blocking severity is invalid");
   if (!text(f.target)) return fail("blocking target is required");
@@ -53,7 +69,8 @@ function validateBlocking(item: unknown, ids: Set<string>): Validation {
   return {valid:true};
 }
 function validateNote(item: unknown, ids: Set<string>): Validation {
-  if (!plain(item) || !exact(item,["id","severity","target","note"])) return fail("non-blocking note has exact fields");
+  const keys=["id","severity","target","note"] as const;
+  const fieldError=exactFailure(item,keys,"non-blocking note"); if (fieldError) return fail(fieldError);
   const n=item as Record<string, unknown>;
   if (!isCanonicalFindingId(n.id) || ids.has(n.id)) return fail("note IDs must be canonical, unique, and nonempty");
   if (n.severity !== "medium" && n.severity !== "low") return fail("note severity is invalid");
@@ -63,7 +80,8 @@ function validateNote(item: unknown, ids: Set<string>): Validation {
   return {valid:true};
 }
 export function validateReviewerReport(value: unknown): Validation {
-  if (!plain(value) || !exact(value,["verdict","summary","blockingFindings","nonBlockingNotes","plannerQuestions"])) return fail("reviewer report must have exact fields");
+  const fields=["verdict","summary","blockingFindings","nonBlockingNotes","plannerQuestions"] as const;
+  const fieldError=exactFailure(value,fields,"reviewer report"); if (fieldError) return fail(fieldError);
   const r=value as Record<string, unknown>, blocking=r.blockingFindings, notes=r.nonBlockingNotes, questions=r.plannerQuestions;
   if (!["APPROVED","APPROVED_WITH_NOTES","CHANGES_REQUESTED","NEEDS_PLANNER"].includes(String(r.verdict))) return fail("reviewer verdict is invalid");
   if (!japanese(r.summary) || !Array.isArray(blocking) || !Array.isArray(notes) || !Array.isArray(questions) || !questions.every(japanese)) return fail("reviewer human fields are required in Japanese");

@@ -195,7 +195,7 @@ async function waitPane(id: string, report: string, signal: AbortSignal | undefi
 function promptFor(stage: Stage, task: string, dir: string, plan: string, review: string, attempt: number, workerReportPath = "", workerReportContent = "", contractJson = "", qualityGatePath = "", qualityGateContent = "", workerSnapshotAttempt = attempt) {
   const label = INFO[stage].label, report = path.join(dir, `${stage}-${attempt}.json`);
   const common = `あなたは${label}です。可視化された逐次pipelineの一員として、現在のrepositoryで作業してください。\n作業内容：\n${task}\n\nartifact保存先：${dir}。今回のattempt：${attempt}。`;
-  const reportInstruction = `最後に必ずsubmit_stage_reportを呼び出し、structured JSON契約で報告してください。orchestratorが指定したpending先は${report}（attempt ${attempt}）です。`;
+  const reportInstruction = `最後に必ずsubmit_stage_reportを呼び出し、structured JSON契約で報告してください。orchestratorが指定したpending先は${report}（attempt ${attempt}）です。ツールの成功応答（Submitted ... report）で書き込み成功を確認してください。validation errorが返った場合はexpected/missing/unexpected fieldsを確認してpayloadを修正し、同じpending先へ成功するまで再提出してください。成功確認前に終了・idleにならないでください。`;
   if (stage === "implement") return `${common}\n承認済み計画：\n${plan}\nquality contract（このJSONを厳守）：\n${contractJson}\n${review ? `\norchestratorからのsanitized修正finding（このstructured dataだけを使用）：\n${review}\n` : ""}承認済み計画の範囲だけを実装してください。sourceを変更し、実装・test・動作確認を行った結果を、COMPLETEDまたはBLOCKEDと日本語のsummary、changedScope、evidenceで報告してください。COMPLETEDのcompletedPlanItemsは契約の全planItemsをidごとに一度ずつ、BLOCKEDは実際に完了したcontract IDのsubsetだけを含め、日本語のevidenceを付けてください。どちらもchangedPathsにはbaseline以後のgit実diffを正確に列挙し、allowedPathPrefixesを守ってください。${reportInstruction}`;
   return `${common}\n承認済み計画：\n${plan}\nquality contract（validator済み）：\n${contractJson}\n現在のWorker report path：${workerReportPath}\nvalidator済みWorker report JSON本文：\n${workerReportContent}\ncurrent quality-gate artifact path：${qualityGatePath}\nvalidator済みquality-gate内容：\n${qualityGateContent}\n今回のWorker attemptのactual snapshot：${path.join(dir, `diffs/implement-${workerSnapshotAttempt}-status.txt`)} / ${path.join(dir, `diffs/implement-${workerSnapshotAttempt}-diff.patch`)} / ${path.join(dir, `diffs/implement-${workerSnapshotAttempt}-fingerprint.json`)}\nbaseline：${path.join(dir, "diffs/baseline-status.txt")} / ${path.join(dir, "diffs/baseline-diff.patch")} / ${path.join(dir, "diffs/baseline-fingerprint.json")}\nread-onlyの確認手段だけを使い、sourceを変更しないでください。Workerの自己申告ではなくactual changed pathsと独立check結果を確認し、APPROVED、APPROVED_WITH_NOTES、CHANGES_REQUESTED、NEEDS_PLANNERとstructuredな日本語fieldを報告してください。${reportInstruction}`;
 }
@@ -282,6 +282,14 @@ export default function (pi: ExtensionAPI) {
           } else emit(stage, message);
         }); if (state === "aborted" || signal?.aborted) { const result = await routeMonitorFailure("aborted", abortWork ? () => abortWork! : () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
         if (state === "startup-timeout" || state === "timeout" || state === "process-info-failure") { const result = await routeMonitorFailure(state, () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
+        if (state === "report-missing") {
+          const diagnostic = "REPORT_MISSING: durable reportが有限猶予内に現れないまま、子ペインがquiescentになりました。ペインは安全のため保持しています。";
+          record.status = "failed"; stageData.status = "failed"; record.error = diagnostic;
+          metadata.reportFailures = [...(metadata.reportFailures ?? []), { code: "REPORT_MISSING", stage, attempt, paneId: pane.paneId, diagnostic, recordedAt: now() }];
+          await heartbeat(stage, attempt, diagnostic);
+          try { await captureTranscript(pane.paneId, terminalFile); terminalCaptured = true; } catch (e) { record.error += ` terminal transcript capture failed: ${e instanceof Error ? e.message : String(e)}`; }
+          return { valid: false, positive: false, text: "" };
+        }
         if (state !== "settled") { record.status = "failed"; stageData.status = "failed"; record.error = `pane ${state}; pane preserved`; return { valid: false, positive: false, text: "" }; }
         await renameDetectedPane(pane.paneId, pane.name);
         await captureTranscript(pane.paneId, terminalFile); terminalCaptured = true;

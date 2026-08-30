@@ -54,6 +54,15 @@ expectInvalid({ ...report(), verdict: "CHANGES_REQUESTED", blockingFindings: [bl
 expectInvalid({ ...report(), verdict: "NEEDS_PLANNER", blockingFindings: [blocking()], plannerQuestions: [] }, "planner要素なしNEEDS_PLANNER");
 expectInvalid({ ...report(), extra: true }, "cross-role extra field");
 
+const workerExtra = validateWorkerReport({ ...worker, extra: true });
+assert.equal(workerExtra.valid, false);
+assert.match(workerExtra.error, /expected=.*missing=.*unexpected=/, "Worker exact-field error must explain expected/missing/unexpected fields");
+const workerMissing = { ...worker }; delete workerMissing.evidence;
+assert.match(validateWorkerReport(workerMissing).error, /expected=.*evidence.*missing=.*evidence.*unexpected=/, "Worker missing-field error must name the missing field");
+const reviewerExtra = validateReviewerReport({ ...report(), blockingFindings: [{ ...blocking(), extra: true }] });
+assert.equal(reviewerExtra.valid, false);
+assert.match(reviewerExtra.error, /expected=.*missing=.*unexpected=.*extra/, "Reviewer nested exact-field error must name the unexpected field");
+
 const handoffReport = report({ summary: "日本語の要約はhandoffに含めない。", blockingFindings: [blocking({ discovery: "previously_missed", missedReason: "前回のレビューで見逃した理由" })], nonBlockingNotes: [note()] });
 try {
   assert.deepEqual(workerHandoffFromReviewer(handoffReport), { findings: [{ id: "AUTH-1", severity: "high", target: "src/auth.ts", reproduction: "再現手順", userImpact: "認証情報が漏れる", expectedOutcome: "認証情報を漏らさない", route: "worker", discovery: "previously_missed", missedReason: "前回のレビューで見逃した理由" }] });
