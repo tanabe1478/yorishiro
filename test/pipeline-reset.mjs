@@ -31,7 +31,7 @@ const rejectsWithoutClose = async (name, overrides, current = context) => {
   assert.equal(await closeCount(), 0, `${name} must dispatch no close`);
 };
 try {
-  for (const outcome of ["IMPLEMENTATION_FAILED", "ABORTED", "REVIEW_FAILED", "NEEDS_PLANNER", "HUMAN_CHANGES_REQUESTED"]) {
+  for (const outcome of ["IMPLEMENTATION_FAILED", "WORKER_EVIDENCE_MISMATCH", "QUALITY_GATE_FAILED", "ABORTED", "REVIEW_FAILED", "NEEDS_PLANNER", "HUMAN_CHANGES_REQUESTED"]) {
     await writeFile(log, ""); const dir = await make(`valid-${outcome}`, { outcome });
     const result = await resetRun(dir, artifacts, context, true); assert.equal(result.results[0].status, "closed");
   }

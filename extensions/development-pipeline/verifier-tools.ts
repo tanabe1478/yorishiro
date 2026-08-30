@@ -1,4 +1,7 @@
 import { spawn } from "node:child_process";
+import { cp, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { preflightVerifierSandbox } from "./sandbox.ts";
@@ -17,9 +20,9 @@ export function trimUtf8(buffer: Buffer, max: number) {
   return buffer.subarray(0, end);
 }
 export function boundUtf8(text: string, max = MAX_OUTPUT) { return trimUtf8(Buffer.from(text, "utf8"), max).toString("utf8"); }
-export function run(program: string, args: string[], cwd: string, timeout: number, signal?: AbortSignal): Promise<{ code: number; stdout: string; stderr: string; truncated: boolean; cancelled: boolean; timedOut: boolean }> {
+export function run(program: string, args: string[], cwd: string, timeout: number, signal?: AbortSignal, env?: Record<string, string>): Promise<{ code: number; stdout: string; stderr: string; truncated: boolean; cancelled: boolean; timedOut: boolean }> {
   return new Promise((resolve) => {
-    const child = spawn(program, args, { cwd, shell: false, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(program, args, { cwd, shell: false, detached: true, env: env ? { ...process.env, ...env } : undefined, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = Buffer.alloc(0), stderr = Buffer.alloc(0), truncated = false, cancelled = false, timedOut = false, settled = false;
     const append = (current: Buffer, chunk: Buffer) => { const limit = MAX_OUTPUT + 4; if (current.length >= limit) { truncated = true; return current; } const combined = Buffer.concat([current, chunk]); if (combined.length > limit) truncated = true; return combined.subarray(0, limit); };
     const normalized = () => { const combined = Buffer.concat([stdout, stderr]); let decoded: string; try { decoded = new TextDecoder("utf-8", { fatal: true }).decode(combined); } catch { decoded = new TextDecoder("utf-8").decode(combined); truncated = true; } const visible = boundUtf8(decoded, MAX_OUTPUT); if (Buffer.byteLength(visible, "utf8") < Buffer.byteLength(decoded, "utf8")) truncated = true; return visible; };
@@ -33,15 +36,60 @@ export function run(program: string, args: string[], cwd: string, timeout: numbe
   });
 }
 
+function sandboxLiteral(value: string) { return JSON.stringify(value); }
 export function sandboxCommand(program: string, args: string[], cwd: string): string[] {
-  if (process.platform === "darwin") return ["/usr/bin/sandbox-exec", "-p", `(version 1) (deny default) (allow process*) (allow file-read*) (allow network*) (allow file-write* (subpath "/tmp"))`, "--", program, ...args];
-  if (process.platform === "linux") return ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--chdir", cwd, "--", program, ...args];
+  if (process.platform === "darwin") {
+    const profile = `(version 1) (allow default) (deny file-write*) (allow file-write* (subpath ${sandboxLiteral(cwd)})) (allow file-write* (literal "/dev/null"))`;
+    return ["/usr/bin/sandbox-exec", "-p", profile, "--", program, ...args];
+  }
+  if (process.platform === "linux") return ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--bind", cwd, cwd, "--dev", "/dev", "--proc", "/proc", "--chdir", cwd, "--", program, ...args];
   throw new Error(`Verifier sandbox is unsupported on ${process.platform}`);
+}
+
+type VerificationWorkspace = { root: string; cwd: string; temp: string; cache: string };
+async function createVerificationWorkspace(cwd: string, signal?: AbortSignal): Promise<VerificationWorkspace> {
+  const root = await mkdtemp(path.join(tmpdir(), "yorishiro-verification-"));
+  const workspace = path.join(root, "workspace");
+  try {
+    await mkdir(workspace);
+    const source = `${cwd}${path.sep}.`;
+    const copyArgs = process.platform === "darwin" ? ["-cR", source, workspace] : ["-a", "--reflink=auto", source, workspace];
+    const copied = await run("/bin/cp", copyArgs, cwd, 300_000, signal);
+    if (copied.code !== 0 || copied.cancelled || copied.timedOut) {
+      await rm(workspace, { recursive: true, force: true });
+      await mkdir(workspace);
+      if (signal?.aborted) throw new Error("Verifier snapshot copy was cancelled");
+      await cp(cwd, workspace, { recursive: true, force: true, errorOnExist: false });
+    }
+    const canonical = await realpath(workspace);
+    const temp = path.join(canonical, ".yorishiro-tmp"), cache = path.join(canonical, ".yorishiro-cache");
+    await Promise.all([mkdir(temp, { recursive: true }), mkdir(cache, { recursive: true })]);
+    return { root, cwd: canonical, temp, cache };
+  } catch (error) {
+    await rm(root, { recursive: true, force: true });
+    throw error;
+  }
 }
 export async function runSandboxedVerification(program: string, args: string[], cwd: string, timeoutMs: number, signal?: AbortSignal) {
   await preflightVerifierSandbox(cwd);
-  const command = sandboxCommand(program, args, cwd);
-  return run(command[0], command.slice(1), cwd, timeoutMs, signal);
+  let workspace: VerificationWorkspace;
+  try { workspace = await createVerificationWorkspace(await realpath(cwd), signal); }
+  catch (error) {
+    if (signal?.aborted) return { code: 1, stdout: "", stderr: "", truncated: false, cancelled: true, timedOut: false };
+    throw error;
+  }
+  try {
+    const command = sandboxCommand(program, args, workspace.cwd);
+    return await run(command[0], command.slice(1), workspace.cwd, timeoutMs, signal, {
+      TMPDIR: workspace.temp,
+      TMP: workspace.temp,
+      TEMP: workspace.temp,
+      npm_config_cache: path.join(workspace.cache, "npm"),
+      XDG_CACHE_HOME: path.join(workspace.cache, "xdg"),
+    });
+  } finally {
+    await rm(workspace.root, { recursive: true, force: true });
+  }
 }
 
 export default function (pi: ExtensionAPI) {

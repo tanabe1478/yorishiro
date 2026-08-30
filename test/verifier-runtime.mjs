@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import path from "node:path";
 import process from "node:process";
-const { run, MAX_OUTPUT } = await import("../extensions/development-pipeline/verifier-tools.ts");
+const { run, runSandboxedVerification, MAX_OUTPUT } = await import("../extensions/development-pipeline/verifier-tools.ts");
 const noisy = await run(process.execPath, ["-e", `process.stdout.write("a".repeat(65535) + "🙂")`], process.cwd(), 5000);
 assert.equal(noisy.truncated, true);
 assert.ok(Buffer.byteLength(noisy.stdout, "utf8") + Buffer.byteLength(noisy.stderr, "utf8") <= MAX_OUTPUT);
@@ -21,4 +24,16 @@ const timed = await run(process.execPath, ["-e", "setTimeout(() => {}, 30000)"],
 assert.equal(timed.timedOut, true);
 assert.equal(timed.cancelled, false);
 assert.ok(Date.now() - started < 3000, "cancellation must finish promptly");
-console.log("verifier output/cancellation test passed");
+
+const sourceMarker = path.join(process.cwd(), ".yorishiro-verifier-source-write.tmp");
+await rm(sourceMarker, { force: true });
+const writableSnapshot = await runSandboxedVerification(process.execPath, ["-e", "require('node:fs').writeFileSync('snapshot-write.tmp', 'ok'); console.log(process.cwd())"], process.cwd(), 10_000);
+assert.equal(writableSnapshot.code, 0, writableSnapshot.stdout + writableSnapshot.stderr);
+assert.doesNotMatch(writableSnapshot.stdout, new RegExp(`^${process.cwd().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m"), "verification must run in a disposable snapshot");
+assert.equal(existsSync(path.join(process.cwd(), "snapshot-write.tmp")), false, "snapshot writes must not reach the source checkout");
+const blockedSourceWrite = await runSandboxedVerification(process.execPath, ["-e", `require('node:fs').writeFileSync(${JSON.stringify(sourceMarker)}, 'forbidden')`], process.cwd(), 10_000);
+assert.notEqual(blockedSourceWrite.code, 0, "sandbox must block writes to the source checkout");
+assert.equal(existsSync(sourceMarker), false);
+const npmStartup = await runSandboxedVerification("npm", ["--version"], process.cwd(), 10_000);
+assert.equal(npmStartup.code, 0, npmStartup.stdout + npmStartup.stderr);
+console.log("verifier output/cancellation/snapshot test passed");

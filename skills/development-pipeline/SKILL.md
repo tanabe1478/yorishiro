@@ -27,7 +27,7 @@ WorkerとReviewerは`submit_stage_report`で構造化JSONを提出する。中�
 
 Quality evidence不一致の初回だけ、違反種別とcontract item/check IDから作るstable signatureおよびpath本文を含まないsanitized findingを、同じWorkerペインへ送りquality repairを1回許可する。この時点ではReviewerを起動しない。同じsignatureが再発したらLunaからSol Workerへ切り替えるPlanner理由をartifactに記録して`NEEDS_PLANNER`、異なる違反が2回目に出たら`WORKER_EVIDENCE_MISMATCH`で終端する。追加fallbackや無限loopは禁止する。
 
-COMPLETEDのWorker終了後、Reviewer開始前にrequiredChecksをshellなしのread-only sandboxで順次実行します。結果（argv、exit、timeout/cancel、出力SHA-256、要約）は`quality-gate-N.json`へ保存し、1件でも失敗すれば`QUALITY_GATE_FAILED`です。修正attemptごとに再実行します。validator通過したCOMPLETED event、当該attemptのquality gate eventとartifactが揃わない限り`SUCCESS`にしてはならない。
+COMPLETEDのWorker終了後、Reviewer開始前にrequiredChecksをshellなしで順次実行します。対象checkoutは使い捨てsnapshotへ複製し、そのsnapshotだけを書き込み可能にしたkernel sandboxを使うため、ビルドやfixture生成を許しつつ元checkoutはread-onlyです。結果（argv、exit、timeout/cancel、出力SHA-256、最大4KiBの診断抜粋、要約）は`quality-gate-N.json`へ保存し、1件でも失敗すれば`QUALITY_GATE_FAILED`です。修正attemptごとに再実行します。validator通過したCOMPLETED event、当該attemptのquality gate eventとartifactが揃わない限り`SUCCESS`にしてはならない。
 
 Reviewer判定:
 
@@ -44,7 +44,7 @@ Workerへはsanitized findingだけを渡し、Reviewerのsummary、note、生�
 
 `artifacts/<repository>/<run-id>/`へ依頼、承認済み計画、quality contract、各attemptのreport、quality gate、terminal記録、baseline／stage別status・diff・fingerprint、`run.json`を保存する。baseline fingerprintとの差分で既存dirty pathの内容変更、untracked・deleted・renameも検出する。
 
-起動、process-info、timeout、中断、欠落・不正reportはfail closedで扱う。監視はHerdrの特定status名だけに依存しない。exact Pi identityとdurable reportを必須とし、既知のquiescent statusは即時settle、未知またはactive statusもreport検出後5秒の有限猶予でsettleする。待機理由と時刻を`run.json` heartbeatへ継続記録する。中断時は`ctrl+c`と`escape`で停止を試み、証跡とペインを残す。Reviewerのコマンドはread-only sandbox内だけで実行する。
+起動、process-info、timeout、中断、欠落・不正reportはfail closedで扱う。監視はHerdrの特定status名だけに依存しない。exact Pi identityとdurable reportを必須とし、既知のquiescent statusは即時settle、未知またはactive statusもreport検出後5秒の有限猶予でsettleする。待機理由と時刻を`run.json` heartbeatへ継続記録する。中断時は`ctrl+c`と`escape`で停止を試み、証跡とペインを残す。Reviewerのコマンドも使い捨ての書き込み可能snapshot内だけで実行し、元checkoutへの書き込みはkernel sandboxで拒否する。
 
 ## cleanup
 

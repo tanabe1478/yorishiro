@@ -14,7 +14,7 @@ import { transitionAfterReview } from "./three-role-flow.ts";
 import { monitorPane, routeMonitorFailure } from "./pane-monitor.ts";
 import { reviewPlan, reviewDiff, resolveReviewMode, executeDiffProcess, type PlanGateResult, type DiffGateResult } from "./human-review-gates.ts";
 import { assertSuccessQualityState, captureFingerprintMap, changedPathsBetween, compareWorkerEvidence, hashQualityContract, validateQualityContract, qualityContractArtifact, type QualityContract, type FingerprintMap } from "./quality-contract.ts";
-import { runSandboxedVerification } from "./verifier-tools.ts";
+import { boundUtf8, runSandboxedVerification } from "./verifier-tools.ts";
 import { createHash } from "node:crypto";
 export { routeMonitorFailure } from "./pane-monitor.ts";
 export function abortBeforePaneStart() { return { status: "aborted" as const, evidence: "pipeline aborted before pane startup; no child was started; pane preserved" }; }
@@ -44,7 +44,7 @@ type Stage = "implement" | "review";
 type StageStatus = "pending" | "running" | "passed" | "failed" | "blocked" | "aborted";
 type Input = { task: string; approvedPlan: string; qualityContract: QualityContract; cwd?: string; maxRepairCycles?: number; maxReviewCycles?: number; cleanupMode?: "ask" | "on-success" | "never"; planReviewMode?: "ask" | "required" | "skip"; diffReviewMode?: "ask" | "required" | "skip" };
 type CommandResult = { code: number; stdout: string; stderr: string };
-type QualityGateResult = { gate: number; status: "passed" | "failed" | "cancelled"; checks: Array<{ id: string; argv: string[]; exit: number; exitCode: number; timeout: boolean; timedOut: boolean; cancelled: boolean; outputHash: string; summary: string }> };
+type QualityGateResult = { gate: number; status: "passed" | "failed" | "cancelled"; checks: Array<{ id: string; argv: string[]; exit: number; exitCode: number; timeout: boolean; timedOut: boolean; cancelled: boolean; outputHash: string; outputExcerpt: string; outputTruncated: boolean; summary: string }> };
 type QualityMismatch = { signature: string; errors: string[]; actualPaths: string[]; reportedPaths: string[]; violations: Array<{ type: string; contractId: string }> };
 type Attempt = { attempt: number; status: StageStatus; startedAt: string; finishedAt?: string; reportFile: string; paneId: string; verdict?: string; error?: string };
 type Pane = { paneId: string; name: string; model: string; attempts: Attempt[] };
@@ -98,8 +98,11 @@ async function runQualityGate(contract: QualityContract, cwd: string, gate: numb
     try { result = await runSandboxedVerification(check.program, check.args, cwd, timeoutMs, signal); }
     catch (error) { result = { code: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error), truncated: false, cancelled: !!signal?.aborted, timedOut: false }; }
     const output = `${result.stdout}${result.stderr}`;
+    const outputExcerpt = boundUtf8(output, 4096);
+    const outputTruncated = result.truncated || Buffer.byteLength(outputExcerpt, "utf8") < Buffer.byteLength(output, "utf8");
+    const diagnostic = outputExcerpt.trim().split(/\r?\n/).find(Boolean);
     const status = result.timedOut ? "タイムアウトしました" : result.cancelled ? "キャンセルされました" : `終了コード${result.code}`;
-    checks.push({ id: check.id, argv: [check.program, ...check.args], exit: result.code, exitCode: result.code, timeout: result.timedOut, timedOut: result.timedOut, cancelled: result.cancelled, outputHash: hashOutput(output), summary: `独立check「${check.id}」は${status}。出力はSHA-256で記録しました。` });
+    checks.push({ id: check.id, argv: [check.program, ...check.args], exit: result.code, exitCode: result.code, timeout: result.timedOut, timedOut: result.timedOut, cancelled: result.cancelled, outputHash: hashOutput(output), outputExcerpt, outputTruncated, summary: `独立check「${check.id}」は${status}。出力はSHA-256と最大4KiBの診断抜粋で記録しました。${diagnostic ? ` 主な出力: ${diagnostic}` : ""}` });
   }
   return { gate, status: checks.every(check => check.exitCode === 0 && !check.timeout && !check.cancelled) ? "passed" : signal?.aborted ? "cancelled" : "failed", checks };
 }
@@ -340,7 +343,7 @@ export default function (pi: ExtensionAPI) {
       if (!repaired.qualityMismatch) return { worker: repaired };
       return { worker: repaired, outcome: await qualityAfterWorker(repaired, implementAttempt) };
     };
-    const finish = async (outcome: string) => { if (signal?.aborted) { if (activePane) { const stopped = abortWork ? await abortWork : await interrupt(activePane); if (!stopped) metadata.abortError = "Herdr could not confirm the active pane became idle"; } outcome = "ABORTED"; } if (outcome === "ABORTED" && !metadata.cleanup) metadata.cleanup = { status: "aborted", results: (metadata.panes ?? []).map((pane: Pane) => ({ paneId: pane.paneId, name: pane.name, status: "skipped", reason: "cleanupは中断されました" })) }; metadata.finishedAt = now(); metadata.outcome = outcome; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); return { content: [{ type: "text", text: `${outcome}\n成果物: ${artifactDir}\n${outcome === "SUCCESS" ? "cleanupの判断待ちです。" : "子ペインを保持しました。"}` }], details: { outcome, cleanupDecision: cleanupMode, artifactDir, panes: metadata.panes } }; };
+    const finish = async (outcome: string) => { if (signal?.aborted) { if (activePane) { const stopped = abortWork ? await abortWork : await interrupt(activePane); if (!stopped) metadata.abortError = "Herdr could not confirm the active pane became idle"; } outcome = "ABORTED"; } if (outcome === "ABORTED" && !metadata.cleanup) metadata.cleanup = { status: "aborted", results: (metadata.panes ?? []).map((pane: Pane) => ({ paneId: pane.paneId, name: pane.name, status: "skipped", reason: "cleanupは中断されました" })) }; metadata.finishedAt = now(); metadata.outcome = outcome; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); const qualityDetail = outcome === "QUALITY_GATE_FAILED" ? (metadata.qualityGates?.at(-1)?.checks ?? []).filter((check: any) => check.exitCode !== 0 || check.timeout || check.cancelled).map((check: any) => check.summary).join("\n") : ""; return { content: [{ type: "text", text: `${outcome}\n成果物: ${artifactDir}${qualityDetail ? `\n${qualityDetail}` : ""}\n${outcome === "SUCCESS" ? "cleanupの判断待ちです。" : "子ペインを保持しました。"}` }], details: { outcome, cleanupDecision: cleanupMode, artifactDir, panes: metadata.panes } }; };
     let cycle = 0;
     const hasReviewEventBus = !!(pi as any).events;
     const reviewEventBus = (pi as any).events ?? { emit: async () => { throw new Error("review event bus is unavailable"); } };
