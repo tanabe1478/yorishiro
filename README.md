@@ -68,6 +68,108 @@ Reviewerとquality gateの検証コマンドは、対象checkoutをcopy-on-write
 
 人間レビューは`planReviewMode`と`diffReviewMode`で制御します（`ask`既定、`required`、`skip`）。計画レビューは子ペイン起動前、差分レビューはReviewer完了後かつcleanup前に実行し、結果と計画SHA-256をrun artifactへ保存します。変更要求や必須レビューの失敗では安全側で停止し、commit・pushは行いません。
 
+## セッション観測（observer）
+
+`bin/yorishiro-observe` は、動いている pi または Claude Code のセッションログ（JSONL）を読み取り専用で追いかけ、人間向けに状態を要約します。エージェントには介入せず、あなたが「いま見る価値があるか」を判断する材料だけを出します。
+
+```bash
+# カレントディレクトリの最新セッション（pi / Claude Code の新しい方）を追いかける
+./bin/yorishiro-observe
+
+# Herdr のペインに紐づくセッションを追う / 形式を固定 / 1回だけ評価 / macOS 通知
+./bin/yorishiro-observe --pane w5:p8S
+./bin/yorishiro-observe --claude --once
+./bin/yorishiro-observe --pi --notify
+./bin/yorishiro-observe path/to/session.jsonl --json
+
+# Herdr の現在ペインを下に分割し、そこで自分のセッションを追う observer を起動する
+./bin/yorishiro-observe --open-pane --notify
+```
+
+表示は緑（放置してよい）、黄（そろそろ確認）、赤（介入を検討）の3段階で、根拠と「エージェントに何を伝えるか」の文案を添えます。
+
+### Web ダッシュボード
+
+Herdr を使わない場合や複数セッションをまとめて見たい場合は、ローカルの Web サーバーとして起動します。
+
+```bash
+./bin/yorishiro-observe serve --open            # http://127.0.0.1:4877/ をブラウザで開く
+./bin/yorishiro-observe serve --notify --hours 6  # 6時間以内に動いたセッションだけ追い、黄・赤で macOS 通知
+```
+
+`~/.pi/agent/sessions/` と `~/.claude/projects/` を走査して動いているセッションを自動検出し、1枚ずつカードで表示します。カードには判定と根拠、エージェントへ送る文案（コピーボタン付き）、コスト判定と運転の変え方、コンテキスト・検証・差分・トークン内訳が載ります。Herdr が動いていればペイン ID も付きます。/clear（Claude Code）や新規セッション開始（pi、同じプロジェクトで直前まで動いていたセッションがある場合）を検出し、置き換えられた旧セッションは「終了 → 新セッション … に置換」として畳み、新セッションは「最初の指示待ち」と表示します。更新は Server-Sent Events で即時反映、外部依存はありません。bind 先は `127.0.0.1` 固定が既定で、`--host` で変えられます。API は `/api/sessions`（JSON）と `/api/events`（SSE）です。`?all=1` でフィルタを外した状態、`?nosse=1` で SSE を使わないポーリング表示（ヘッドレスブラウザでの撮影用）になります。
+
+### 決定論的な判定
+
+| 判定 | 内容 |
+|---|---|
+| 同一反復 | 直近20回のツール呼び出しで同じコマンド実行や同じファイルの読み直しが3回以上 |
+| エラー反復 | 同じエラー文字列（先頭2行、数字を無視）が3回以上 |
+| 検証失敗の連続 | 検証コマンド（test / lint / typecheck / build 系）が2回以上連続で失敗 |
+| 未検証編集 | コードの編集後12回（黄）/ 25回（赤）のツール呼び出しで検証コマンドがない、または検証せずにターンを終えた。Markdown などの文書編集は対象外 |
+| フェーズ逸脱 | 編集後、検証に進まず5回連続で読み取り・検索に戻った |
+| 終了時監査 | ターン終了時に、編集以降 test / lint / typecheck / build のどれが成功したかを表示。プロジェクトに lint・型チェックの手段（package.json の scripts、Makefile、pyproject）があるのに走っていなければ参考情報として出す |
+| スコープ拡大 | 現在のターンで変更ファイルが8件（黄）/ 15件（赤）以上 |
+| 差分の増大 | 作業ツリーの `git diff` が300行（黄）/ 1000行（赤）以上。未追跡ファイル数も表示 |
+| TODO 混入 | 差分の追加行に TODO / FIXME / XXX / HACK がある |
+| コンテキスト使用率 | モデルの上限に対して75%（黄）/ 90%（赤）以上。上限はモデル名から推定し `--context-limit` で上書き可能 |
+| 停滞 | 作業中のはずなのに10分以上ログに動きがない |
+| サブエージェント | 起動が3回以上 |
+| キャッシュミス | pi 本体（`core/cache-stats`）と同じ式。前回リクエストのプロンプト量と今回の cache read の差を再課金量とみなし、1,024 トークン以下は無視、compaction で基準をリセット、モデル切替は数える。原因を「モデル切替 / 中断 / 不明」で分け、pi のログでは料金内訳から追加コストも出す。前回プロンプトの 10% 未満の小さな再作成（Claude Code の毎呼び出しで起きる）は「部分再書込」として別集計。キャッシュ寿命は Claude Code の usage（ephemeral_1h / 5m）から読み、pi は 5 分を既定にする |
+| ターンの浪費 | 1ターンでモデル呼び出しが25回（黄）/ 50回（赤）以上 |
+| 出力・thinking 過多 | 料金比重（出力 100 : cache read 1）で見て出力と thinking が全体の50%以上。pi の thinking level も表示 |
+
+Bash 経由の書き込み（heredoc、`tee`、`sed -i`）も編集として数えます。heredoc の本文はコマンドとして解釈しません。検証コマンドの判定は `--verify REGEX` で上書きできます。Claude Code のサブエージェント（sidechain）の動きは本体の判定から除外し、スラッシュコマンド（/clear、/model など）は会話ターンとして数えません。まだ 1 ターンも進んでいないセッションには判定を出しません。
+
+### 分類器（安いモデル）
+
+黄・赤に変わったとき、またはターンが終わったときだけ、構造化サマリ（目的、フェーズ、直近の行動、変更ファイル、テスト回数、決定論的判定）を安いモデルに渡し、5分類で返させます。全文の会話は渡しません。30秒に1回までです。
+
+| 分類 | 意味 |
+|---|---|
+| CONTINUE | 任せてよい |
+| VERIFY | 検証させる |
+| REPLAN | 同じ失敗の繰り返しや迷走。仮説を見直させる |
+| COMPACT | コンテキストが主なリスク |
+| ASK_USER | 人間の判断や確認が必要 |
+
+あわせて進捗率の推定、要件がカバーされているか、エージェントの報告と実際の行動が一致しているか（テストを走らせずに「通った」と言っていないか）を返します。
+
+コスト面は、記事「What a task costs on Opus 5.5」の原則（cost/task で見る、不要なターンが最も高い、キャッシュ書き直し1回 ≒ 読み25回、出力1トークン ≒ cache read 100トークン、effort は medium 起点で検証ループを先に整える、lookup は安いモデルへ、サブエージェントはコンテキストを複製する、/compact は10ターン以上残るときだけ）を評価基準として分類器に渡し、ターンごとのトークン内訳（新規入力・cache read・cache write・出力・thinking・中断時間）から次の判定を返させます。
+
+| costVerdict | 意味 |
+|---|---|
+| FINE | 問題なし |
+| WASTED_TURNS | 本体の不要なリトライや遠回り |
+| CACHE_MISSES | キャッシュの書き直しが繰り返されている |
+| OUTPUT_HEAVY | thinking や長文出力が支配的 |
+| EFFORT_TOO_HIGH / EFFORT_TOO_LOW | 機械的な作業に高 thinking、または検証ループなしで低 effort のまま詰まっている |
+| DELEGATE_LOOKUPS | 強いモデルが検索・ログ読みにターンを使っている |
+| SUBAGENTS_EXPENSIVE | サブエージェントのコストが見合っていない |
+| COMPACT_NOW / CLEAR_NOW | /compact または /clear の頃合い |
+
+`costSuggestion` は「エージェントに言うこと」ではなく「あなたが運転を変えること」（effort、モデル、/compact か /clear、委譲、次の指示の出し方）です。
+
+分類器が有効なときは、ルールが黄・赤になっても即座には通知せず、分類器の判定を待ちます。CONTINUE なら通知せず、見出しに「分類器は継続でよいと判断」と添えて赤は黄に和らげます。CONTINUE 以外ならルールの根拠と分類器の理由を合わせて通知します。分類器を切っている（`--advisor none`）ときはルールだけで通知します。起動直後に古いセッションへ一斉に問い合わせないよう、直近 1 時間に動いたセッションだけを分類器に回します。
+
+呼び出し先は `--advisor pi|claude|none`（既定 `pi`、モデルは `google-vertex/gemini-3.8-flash`。別のモデルは `--advisor-model` で指定）。環境変数 `YORISHIRO_OBSERVER_ADVISOR` と `YORISHIRO_OBSERVER_ADVISOR_MODEL` でも指定できます。`claude -p` は haiku でも1回あたりのコストが pi 経由より2桁高いので、必要なときだけ使ってください。
+
+### Claude Code hook 連携
+
+```bash
+./bin/yorishiro-observe install-hooks
+```
+
+`~/.claude/settings.json` にバックアップを作ってから SessionStart / Stop / Notification の hook を追加します（登録済みなら何もしません）。
+
+- SessionStart: セッション ID、transcript のパス、Herdr のペイン ID を `~/.local/state/yorishiro/observer/sessions/` に記録
+- Stop: transcript を読んで終了時監査（未検証編集、TODO 混入、差分の増大、エラー反復など）を `audits/` に保存し、黄・赤なら macOS 通知
+- Notification: Claude Code の通知（権限待ちなど）を macOS 通知へ転送し `notifications/` に記録
+
+hook は常に exit 0 で、エージェントの動作を止めません。pi には外部 hook がないため、pi の終了時監査は追従モードの observer が担います。
+
+セッションログの場所は pi が `~/.pi/agent/sessions/`、Claude Code が `~/.claude/projects/` で、作業ディレクトリのパスか Herdr が持つセッション ID から導出します。エージェントの内部推論は記録されないため、観測できるのは会話、ツール呼び出し、その結果だけです。
+
 ## 育て方
 
 1. まず `AGENTS.md` と設定だけで使う

@@ -21,9 +21,10 @@
     "test:pipeline-v3-integration": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/pipeline-v3-integration.mjs",
     "test:pipeline-v3-mutation": "node ./test/pipeline-v3-mutation.mjs",
     "test:pipeline-reset": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/pipeline-reset.mjs",
+    "test:observer": "node --experimental-strip-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON ./test/observer.mjs",
     "test:sandbox-preflight": "node --experimental-strip-types ./test/sandbox-preflight.mjs",
     "test:cleanup-policy": "node --experimental-strip-types --experimental-loader ./test/typebox-loader.mjs ./test/cleanup-policy.mjs",
-    "test": "npm run test:pi-extension-load && npm run test:reporter && npm run test:role-contracts && npm run test:quality-contract && npm run test:three-role-flow && npm run test:pipeline-control && npm run test:pipeline-layout && npm run test:pipeline-flow && npm run test:verifier-boundary && npm run test:verifier-runtime && npm run test:sandbox-preflight && npm run test:cleanup-policy && npm run test:pane-monitor && npm run test:pipeline-routing-extension && npm run test:pipeline-cleanup-cancellation-extension && npm run test:cleanup-compatibility-production && npm run test:human-review-gates && npm run test:pipeline-v3-integration && npm run test:pipeline-v3-mutation && npm run test:pipeline-reset"
+    "test": "npm run test:pi-extension-load && npm run test:reporter && npm run test:role-contracts && npm run test:quality-contract && npm run test:three-role-flow && npm run test:pipeline-control && npm run test:pipeline-layout && npm run test:pipeline-flow && npm run test:verifier-boundary && npm run test:verifier-runtime && npm run test:sandbox-preflight && npm run test:cleanup-policy && npm run test:pane-monitor && npm run test:pipeline-routing-extension && npm run test:pipeline-cleanup-cancellation-extension && npm run test:cleanup-compatibility-production && npm run test:human-review-gates && npm run test:pipeline-v3-integration && npm run test:pipeline-v3-mutation && npm run test:pipeline-reset && npm run test:observer"
   },
   "description": "A personal harness layered on top of pi",
   "keywords": ["pi-package"],
