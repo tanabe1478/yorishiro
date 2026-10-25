@@ -43,20 +43,28 @@ cd work/example
 | 役割 | 固定モデル | 担当 |
 |---|---|---|
 | Planner（親） | 親セッションのモデル | 要件、計画、Reviewer指摘の採否 |
-| Worker · Luna | `openai-codex/gpt-5.6-luna`（既定thinking: `high`） | 実装、テスト、ビルド、動作確認、修正 |
-| Reviewer · Sol | `openai-codex/gpt-5.6-sol`（既定thinking: `medium`） | read-onlyレビュー、sandbox内の独立検証 |
+| Worker · DeepSeek | `opencode-go/deepseek-v4.1-flash`（既定thinking: `high`） | 実装、テスト、ビルド、動作確認、修正 |
+| Reviewer · Sol | `openai/gpt-5.6-sol`（既定thinking: `medium`） | read-onlyレビュー、sandbox内の独立検証 |
+
+旧`openai-codex/gpt-5.6-luna`と`openai-codex/gpt-5.6-sol`はこのPi環境のcatalogに存在しません。Reviewerは同じSol modelを提供するcanonical provider `openai`へ移行しました。親のモデルは変更しません。
 
 パイプラインはHerdr内で起動したPiからのみ実行できます。通常実行では別タブを作らず、呼出元の現在タブを、親55%、右45%のWorker／Reviewer上下2段へ分割します。子は通常のPi TUIとして表示され、修正と再レビューでは同じペインを再利用します。子からパイプラインを再帰起動することはできません。修正版Extensionを新規ロードする使い捨てE2Eだけは隔離タブを使用し、確認後にタブ全体を削除します。
 
+`development_pipeline`の`workflow`には`feature`（既定）、`bug-fix`、`refactoring`を指定します。親は`skills/development-workflow/SKILL.md`と対応playbookに沿って計画し、子にはartifact内のstage別`workflow-brief-<stage>.md`、workflow Skill、playbook、対象checkoutの`.pi/skills/verify-*/`（feature mapを含む）を明示`--skill`で渡します。子は`--no-skills`でもこれらのpathを直接読むため、親だけがworkflowを知る状態にはなりません。verify Skillが無いcheckoutでは、実ユーザー面の既存harnessを優先します。
+
+固定modelは起動前に`pi auth check --model ... --json --no-refresh`と`pi --offline --list-models`でcatalog存在とprovider readinessを確認します（credentialは保存・表示しません）。子launcherは`--model`で固定し、`model-guard.ts`が`tool_call`境界でactive modelの不一致・不明を拒否します。偶発的なmodel選択・cycle・restoreによるedit/bash/reportを止めるためのguardであり、敵対的Workerやnested shellに対するsecurity sandboxではありません。
+
 WorkerとReviewerは中央validatorが検証する構造化JSONで報告します。`development_pipeline`には必須の`qualityContract`（承認項目、独立check、任意の変更path prefix）を渡します。契約はSHA-256とともに`quality-contract.json`／`run.json`へ保存されます。`COMPLETED`は`completedPlanItems`のcontract ID exact一致、`changedPaths`の実diff exact一致、prefix遵守、独立checks成功が必須です。`BLOCKED`は完了済みcontract IDのsubset（unknown／duplicate不可）とactual `changedPaths` exact一致、prefix遵守を必須とし、独立checksとReviewerを起動せず`IMPLEMENTATION_BLOCKED`で終わります。BLOCKEDでも虚偽ID／path／prefix違反は許しません。
 
-Quality evidence不一致の初回だけ、Reviewerを起動せず同じWorkerペインへpath本文を除いたsanitized findingを送り、quality repairを1回行います。signatureは違反種別とcontract item/check IDで安定化します。同じsignatureの再発はSol Workerへの切替理由をartifactへ残して`NEEDS_PLANNER`、異なる2回目の違反は`WORKER_EVIDENCE_MISMATCH`で停止し、loopしません。COMPLETEDのReviewer開始前にはrequiredChecksを対象checkoutの使い捨てsnapshot上で順次実行し、失敗・timeout・cancelは`QUALITY_GATE_FAILED`として停止します。各checkは出力SHA-256に加えて最大4KiBの診断抜粋をartifactと失敗結果へ残します。Reviewerの判定は`APPROVED`、`APPROVED_WITH_NOTES`、`CHANGES_REQUESTED`、`NEEDS_PLANNER`です。Workerへ戻す情報はsanitized blocking findingだけに制限し、Reviewerの生出力やtranscriptを渡しません。同じ指摘IDの再発や、修正後に理由なく追加されたblockingは`NEEDS_PLANNER`で止まります。
+Quality evidence不一致の初回だけ、Reviewerを起動せず同じWorkerペインへpath本文を除いたsanitized findingを送り、quality repairを1回行います。signatureは違反種別とcontract item/check IDで安定化します。同じsignatureが再発した場合は、同一Workerの有限repairを使い切ったものとして`NEEDS_PLANNER`で停止し、モデル切替・fallbackは行わず、停止理由を`quality-planner-stop.json`と`run.json`へ残します。異なる2回目の違反は`WORKER_EVIDENCE_MISMATCH`で停止し、loopしません。COMPLETEDのReviewer開始前にはrequiredChecksを対象checkoutの使い捨てsnapshot上で順次実行し、失敗・timeout・cancelは`QUALITY_GATE_FAILED`として停止します。各checkは出力SHA-256に加えて最大4KiBの診断抜粋をartifactと失敗結果へ残します。Reviewerの判定は`APPROVED`、`APPROVED_WITH_NOTES`、`CHANGES_REQUESTED`、`NEEDS_PLANNER`です。Workerへ戻す情報はsanitized blocking findingだけに制限し、Reviewerの生出力やtranscriptを渡しません。同じ指摘IDの再発や、修正後に理由なく追加されたblockingは`NEEDS_PLANNER`で止まります。
 
-修正回数は`maxReviewCycles`で指定でき、既定2、上限3です。旧`maxRepairCycles`も互換入力として受理し、両方指定時は`maxReviewCycles`を優先します。欠落・不正レポート、プロセス失敗、timeout、中断は安全側で停止します。失敗・中断・Planner判断待ちでは子ペインを残します。監視はHerdrの特定status名だけに依存せず、exact Pi identityとdurable reportを完了根拠にします。durable reportがないままexact Piが`idle`／`done`／`completed`になった場合は、activeを観測済みなら直ちに、起動直後からquiescentならstartup grace後に有限のreport-missing猶予を開始し、期限でfail closedします。猶予中にreportが現れれば通常settleし、activeへ戻ればtimerを解除します。未知・undefined statusだけでは欠落と断定しません。report-missing時はterminal transcript、heartbeat、`run.json`へ診断を残し、ペインを保持します。監視中のheartbeatは`run.json`へ継続記録します。
+修正回数は`maxReviewCycles`で指定でき、既定2、上限3です。旧`maxRepairCycles`も互換入力として受理し、両方指定時は`maxReviewCycles`を優先します。欠落・不正レポート、プロセス失敗、timeout、中断は安全側で停止します。失敗・中断・Planner判断待ちでは子ペインを残します。監視はHerdrの特定status名だけに依存せず、exact Pi identityとdurable reportを完了根拠にします。exact Pi identityは`argv0 === "pi"`と、Herdr 0.9の`foreground_processes[].argv[0] === "pi"`を受理し、pathや引数、`cmdline`/`name`だけの一致は拒否します。durable reportがないままexact Piが`idle`／`done`／`completed`になった場合は、activeを観測済みなら直ちに、起動直後からquiescentならstartup grace後に有限のreport-missing猶予を開始し、期限でfail closedします。猶予中にreportが現れれば通常settleし、activeへ戻ればtimerを解除します。未知・undefined statusだけでは欠落と断定しません。report-missing時はterminal transcript、heartbeat、`run.json`へ診断を残し、ペインを保持します。terminal transcriptはagent readが終了済みagentで失敗した場合に`pane read --raw`へfallbackし、ペインが残っている限り診断を保存します。監視中のheartbeatは`run.json`へ継続記録します。
 
 Reviewerとquality gateの検証コマンドは、対象checkoutをcopy-on-write優先で使い捨てsnapshotへ複製し、そのsnapshotだけを書き込み可能にしたmacOSの`sandbox-exec`またはLinuxのbubblewrap/user namespace内で実行します。ビルド成果物やテストfixtureはsnapshotへ書けますが、元checkoutへの書き込みはkernelで拒否されます。未対応環境、sandbox未導入環境、`/tmp`配下の対象は作業開始前に拒否します。
 
-成果物は`artifacts/<repository>/<run-id>/`に保存されます。主な内容は依頼、承認済み計画、`quality-contract.json`、`plan-review.json`、`diff-review.json`、各attemptの構造化report、quality gate結果、baselineと各Worker stageのstatus/diff/fingerprint、`run.json`です。baseline fingerprintとの差分で既存dirty pathの内容変更、untracked・deleted・renameも検出します。
+検証の証跡を残す場合は、コマンドがsnapshot内の`$YORISHIRO_EVIDENCE_DIR`へfileを書きます。orchestratorはteardown前に、通常fileだけを上限付き（file数100、1file 1MiB、合計8MiB、深さ4、visited entry数1000）でrun artifactの`evidence/`へ回収します。snapshotに元からある`.yorishiro-evidence`は毎回削除して空から開始します。evidence rootや子のsymlink、special file、destination外へ出るpath、上限超過は拒否・skipし、`skippedCount`と`truncated`で可視化します。Reviewerの`run_verification_command`も同じ仕組みを使い、modelが任意のwrite先を指定することはできません。
+
+成果物は`artifacts/<repository>/<run-id>/`に保存されます。主な内容は依頼、承認済み計画、stage別workflow brief、`quality-contract.json`、`plan-review.json`、`diff-review.json`、各attemptの構造化report、quality gate結果と`evidence/`、baselineと各Worker stageのstatus/diff/fingerprint、`model-guard.log`、`run.json`です。baseline fingerprintとの差分で既存dirty pathの内容変更、untracked・deleted・renameも検出します。
 
 成功時の整理は`cleanupMode`で制御します。
 
@@ -64,7 +72,7 @@ Reviewerとquality gateの検証コマンドは、対象checkoutをcopy-on-write
 - `on-success`: 成功時だけ整理する
 - `never`: ペインを残す
 
-後から`development_pipeline_cleanup`へrunディレクトリを渡して整理できます。失敗・中断runは成功用cleanupと分離された`development_pipeline_reset`で、canonical runDirと現在のworkspace/tab、明示confirm、記録済みpane identity、idle状態を検証してから安全にresetします。新構成はReviewer→Worker、旧構成はReview→Verify→Implementの順に閉じます。親ペイン、非idleペイン、別runのペインは保護されます。開始時に現在タブへ親以外のペインがある場合は`LAYOUT_OCCUPIED`として停止し、他人のペインを自動削除しません。
+後から`development_pipeline_cleanup`へrunディレクトリを渡して整理できます。失敗・中断runは成功用cleanupと分離された`development_pipeline_reset`で、canonical runDirと現在のworkspace/tab、明示confirm、記録済みpane identity、idle状態を検証してから安全にresetします。現行構成は`Reviewer · Sol`→`Worker · DeepSeek`、旧2役構成は`Reviewer · Sol`→`Worker · Luna`、旧3役構成は`Review · Sol`→`Verify · Terra`→`Implement · Luna`として認識します。複数世代のroleが混在するrunはmode ambiguityとして閉じません。親ペイン、非idleペイン、別runのペインは保護されます。開始時に現在タブへ親以外のペインがある場合は`LAYOUT_OCCUPIED`として停止し、他人のペインを自動削除しません。
 
 人間レビューは`planReviewMode`と`diffReviewMode`で制御します（`ask`既定、`required`、`skip`）。計画レビューは子ペイン起動前、差分レビューはReviewer完了後かつcleanup前に実行し、結果と計画SHA-256をrun artifactへ保存します。変更要求や必須レビューの失敗では安全側で停止し、commit・pushは行いません。
 
@@ -169,6 +177,16 @@ Bash 経由の書き込み（heredoc、`tee`、`sed -i`）も編集として数�
 hook は常に exit 0 で、エージェントの動作を止めません。pi には外部 hook がないため、pi の終了時監査は追従モードの observer が担います。
 
 セッションログの場所は pi が `~/.pi/agent/sessions/`、Claude Code が `~/.claude/projects/` で、作業ディレクトリのパスか Herdr が持つセッション ID から導出します。エージェントの内部推論は記録されないため、観測できるのは会話、ツール呼び出し、その結果だけです。
+
+## 検証Skill
+
+project-localの検証手順は`.pi/skills/verify-<project>/`に置けます。`skills/create-verification-skill/SKILL.md`は、repositoryをinterviewし、Launch／Doctor／Drive／Evidence／Cleanup／Helpersと4-H2のfeature mapを生成する手順を定義します。生成物は一度、実ユーザー面で1つ以上のfeatureを実行し、cleanup後も証跡が残ることを確認するまでdeliverableと呼びません。`skills/maintain-verification-skill/SKILL.md`はsourceとliveの両方で全featureを監査し、doc drift、harness gap、product regressionを区別します。どちらもfile編集は固定DeepSeek Workerへ委譲し、親modelやread-only Reviewerは書きません。
+
+Yorishiro自身のdogfood用Skillは`.pi/skills/verify-yorishiro/`にあります。実`bin/yorishiro`のRPC起動、Pi/Jiti extension load、明示`--skill` discovery、observer helpを実行し、証跡を`artifacts/verify-yorishiro/`へ残します。このSkillはrepository-localで、packageのgeneric `skills/` manifestからは配布しません。
+
+## pstackの採用範囲
+
+pstackのworkflow、verification Skill生成・保守、feature/bug fix/refactoringのplaybookだけをYorishiro向けに適応しました。formal verification、statechart、Cursor専用のBugbot/automation、PR shipping/autonomy、swarm/arena/multi-model fallbackなどは取り込んでいません。上流のrevision、適応内容、未採用項目の全リストは[`docs/pstack-adoption.md`](./docs/pstack-adoption.md)にあります（MIT attributionは[`docs/licenses/pstack-MIT.txt`](./docs/licenses/pstack-MIT.txt)）。pstackとの完全互換を主張しません。
 
 ## 育て方
 

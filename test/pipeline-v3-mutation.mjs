@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { assertScenario, collectObservedEvents, removeOneObservation } from "./support/pipeline-v3-harness.mjs";
 import { assertSuccessQualityState } from "../extensions/development-pipeline/quality-contract.ts";
 
-const prompt = "あなたはWorker · Lunaです。今回のattempt：2。";
+const prompt = "あなたはWorker · DeepSeekです。今回のattempt：2。";
 const fixture = {
   commandLog: [
     ["pane", "split", "parent"],

@@ -55,6 +55,13 @@ async function runCase(name, panes, expectedClose, expectedResults, expectedStat
   } finally { await rm(run, { recursive: true, force: true }); }
 }
 
+await runCase("current", [
+  { paneId: "fake:reviewer-c", name: "Reviewer · Sol" },
+  { paneId: "fake:worker-c", name: "Worker · DeepSeek" },
+], ["fake:reviewer-c", "fake:worker-c"], [
+  { paneId: "fake:reviewer-c", name: "Reviewer · Sol", status: "closed" },
+  { paneId: "fake:worker-c", name: "Worker · DeepSeek", status: "closed" },
+], "completed");
 await runCase("new", [
   { paneId: "fake:reviewer", name: "Reviewer · Sol" },
   { paneId: "fake:worker", name: "Worker · Luna" },
@@ -97,6 +104,15 @@ await runCase("mixed-modes-fail-safe", [
   { paneId: "fake:reviewer-both", name: "Reviewer · Sol", status: "skipped", reason: "mode ambiguity" },
   { paneId: "fake:review-both", name: "Review · Sol", status: "skipped", reason: "mode ambiguity" },
   { paneId: "fake:unknown-both", name: "Unknown · X", status: "skipped", reason: "unknown role" },
+], "partial");
+await runCase("mixed-worker-generations", [
+  { paneId: "fake:worker-new", name: "Worker · DeepSeek" },
+  { paneId: "fake:worker-old", name: "Worker · Luna" },
+  { paneId: "fake:reviewer-new", name: "Reviewer · Sol" },
+], [], [
+  { paneId: "fake:worker-new", name: "Worker · DeepSeek", status: "skipped", reason: "mode ambiguity" },
+  { paneId: "fake:worker-old", name: "Worker · Luna", status: "skipped", reason: "mode ambiguity" },
+  { paneId: "fake:reviewer-new", name: "Reviewer · Sol", status: "skipped", reason: "mode ambiguity" },
 ], "partial");
 await runCase("unknown", [{ paneId: "fake:unknown", name: "Unknown · X" }], [], [{ paneId: "fake:unknown", name: "Unknown · X", status: "skipped", reason: "unknown role" }], "partial");
 await runCase("parent", [{ paneId: "parent", name: "Reviewer · Sol" }], [], [{ paneId: "parent", name: "Reviewer · Sol", status: "skipped", reason: "parent/current pane protected" }], "partial");

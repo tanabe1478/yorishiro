@@ -5,8 +5,33 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 type Result = { paneId: string; name: string; status: string; reason?: string };
+/** Historical three-role layout. Keep this order for old runs. */
 export const CLEANUP_ORDER = ["Review · Sol", "Verify · Terra", "Implement · Luna"] as const;
-const MODERN_CLEANUP_ORDER = ["Reviewer · Sol", "Worker · Luna"] as const;
+/** Historical two-role layout used before the fixed Worker model migration. */
+export const LEGACY_MODERN_CLEANUP_ORDER = ["Reviewer · Sol", "Worker · Luna"] as const;
+/** Current two-role layout. */
+export const CURRENT_CLEANUP_ORDER = ["Reviewer · Sol", "Worker · DeepSeek"] as const;
+const ALL_ROLES = new Set<string>([...CLEANUP_ORDER, ...LEGACY_MODERN_CLEANUP_ORDER, ...CURRENT_CLEANUP_ORDER]);
+export type CleanupMode = "current" | "legacy-modern" | "legacy";
+export type CleanupResolution = { status: "ok"; mode: CleanupMode; order: readonly string[] } | { status: "ambiguous"; recognized: string[] };
+
+/**
+ * Decide which recorded pane layout a run uses. Mixed layouts are ambiguous and
+ * must not be closed automatically. Historical role names are preserved only as
+ * compatibility input; they are never used for new runs.
+ */
+export function resolveCleanupMode(panes: Array<{ name?: string }>): CleanupResolution {
+  const names = new Set(panes.map(pane => pane.name).filter((name): name is string => typeof name === "string" && name.length > 0));
+  const current = names.has("Worker · DeepSeek");
+  const legacyModern = names.has("Worker · Luna");
+  const legacy = CLEANUP_ORDER.some(name => names.has(name));
+  const modernReviewer = names.has("Reviewer · Sol");
+  if ([current, legacyModern, legacy].filter(Boolean).length > 1 || (modernReviewer && legacy)) return { status: "ambiguous", recognized: [...names].filter(name => ALL_ROLES.has(name)) };
+  if (current) return { status: "ok", mode: "current", order: CURRENT_CLEANUP_ORDER.filter(name => names.has(name)) };
+  if (legacyModern) return { status: "ok", mode: "legacy-modern", order: LEGACY_MODERN_CLEANUP_ORDER.filter(name => names.has(name)) };
+  if (legacy) return { status: "ok", mode: "legacy", order: CLEANUP_ORDER };
+  return { status: "ok", mode: "current", order: CURRENT_CLEANUP_ORDER.filter(name => names.has(name)) };
+}
 type CommandResult = { code: number; stdout: string; stderr: string; cancelled: boolean };
 function command(args: string[], signal?: AbortSignal): Promise<CommandResult> { return new Promise(resolve => { const p = spawn("herdr", args, { shell: false, stdio: ["ignore", "pipe", "pipe"] }); let stdout="", stderr="", cancelled=false; const abort=()=>{ cancelled=true; try { p.kill("SIGTERM"); } catch {} }; if (signal) { if (signal.aborted) abort(); else signal.addEventListener("abort", abort, { once:true }); } p.stdout.on("data", d => stdout += d); p.stderr.on("data", d => stderr += d); p.on("error", e => resolve({code:1,stdout,stderr:stderr+e.message,cancelled})); p.on("close", code => { if (signal) signal.removeEventListener("abort", abort); resolve({code:code ?? 1,stdout,stderr,cancelled}); }); }); }
 function parse(s: string): any { try { return JSON.parse(s); } catch { return undefined; } }
@@ -19,7 +44,10 @@ function cancelledResult(pane: { paneId?: string; name?: string }, name: string)
 export async function markRunAborted(runDir: string, root: string) {
   const canonical=await canonicalRun(runDir,root), file=path.join(canonical,"run.json"), metadata=JSON.parse(await fs.readFile(file,"utf8"));
   metadata.outcome="ABORTED";
-  metadata.cleanup={...(metadata.cleanup ?? {}), finishedAt:new Date().toISOString(), status:"aborted", results:metadata.cleanup?.results ?? (CLEANUP_ORDER.map(name => cancelledResult((metadata.panes ?? []).find((p: any) => p.name===name) ?? {}, name)))};
+  const panes = (metadata.panes ?? []) as Array<{ paneId?: string; name?: string }>;
+  const resolution = resolveCleanupMode(panes);
+  const names = resolution.status === "ok" ? resolution.order : [...new Set(panes.map(pane => pane.name).filter((name): name is string => typeof name === "string" && name.length > 0))];
+  metadata.cleanup={...(metadata.cleanup ?? {}), finishedAt:new Date().toISOString(), status:"aborted", results:metadata.cleanup?.results ?? names.map(name => cancelledResult(panes.find(p => p.name===name) ?? {}, name))};
   await atomic(file,metadata);
   return metadata;
 }
@@ -29,19 +57,18 @@ export async function cleanupRun(runDir: string, root: string, currentPane?: str
   if (!currentPane) throw new Error("current pane identity is required for cleanup");
   if (![metadata.parentPaneId,metadata.workspaceId,metadata.tabId].every(v=>typeof v === "string" && v.length>0)) throw new Error("cleanup run identity is incomplete");
   const panes=(metadata.panes ?? []) as Array<{paneId?:string;name?:string}>;
-  const modern = MODERN_CLEANUP_ORDER.some(name => panes.some(p => p.name === name));
-  const legacy = CLEANUP_ORDER.some(name => panes.some(p => p.name === name));
-  const modeAmbiguous = modern && legacy;
-  const order = modeAmbiguous ? [] : modern ? MODERN_CLEANUP_ORDER.filter(name => panes.some(p => p.name === name)) : legacy ? CLEANUP_ORDER : [];
+  const resolution = resolveCleanupMode(panes);
+  const modeAmbiguous = resolution.status === "ambiguous";
+  const order = resolution.status === "ambiguous" ? [] : resolution.mode === "legacy" ? resolution.order : resolution.order.filter(name => panes.some(p => p.name === name));
   const ambiguous = new Set<string>();
   for (const name of order) { if (new Set(panes.filter(p => p.name === name).map(p => p.paneId).filter(Boolean)).size > 1) ambiguous.add(name); }
-  const unknown = panes.filter(p => !CLEANUP_ORDER.includes(p.name as any) && !MODERN_CLEANUP_ORDER.includes(p.name as any));
+  const unknown = panes.filter(p => !p.name || !ALL_ROLES.has(p.name));
   const abortAll = () => { for (const name of order) results.push(cancelledResult(panes.find(p=>p.name===name) ?? {}, name)); };
   metadata.cleanup={ requestedAt:new Date().toISOString(), status:"running", results:[] }; await atomic(runFile,metadata);
   if (signal?.aborted) { abortAll(); metadata.outcome="ABORTED"; metadata.cleanup={...metadata.cleanup,finishedAt:new Date().toISOString(),status:"aborted",results}; await atomic(runFile,metadata); return {results,summary:results.map(r=>`${r.name}: ${r.status} (${r.reason})`).join("; ")}; }
   if (modeAmbiguous) {
     for (const pane of panes) {
-      const recognized = CLEANUP_ORDER.includes(pane.name as any) || MODERN_CLEANUP_ORDER.includes(pane.name as any);
+      const recognized = typeof pane.name === "string" && ALL_ROLES.has(pane.name);
       results.push({paneId:pane.paneId ?? "",name:pane.name ?? "",status:"skipped",reason:recognized ? "mode ambiguity" : "unknown role"});
     }
     metadata.cleanup={requestedAt:metadata.cleanup.requestedAt,finishedAt:new Date().toISOString(),status:"partial",results}; await atomic(runFile,metadata);
@@ -84,9 +111,8 @@ export async function resetRun(runDir: string, root: string, context: { paneId?:
   if (![...runIdentity, ...currentIdentity].every(value => typeof value === "string" && value.length > 0)) throw new Error("run/current identityが不完全です");
   if (context.paneId !== metadata.parentPaneId || context.workspaceId !== metadata.workspaceId || context.tabId !== metadata.tabId) throw new Error("現在のpane/workspace/tab identityがrun親と一致しません");
   const panes = (metadata.panes ?? []) as Array<{ paneId?: string; name?: string }>;
-  const modern = MODERN_CLEANUP_ORDER.some(name => panes.some(pane => pane.name === name));
-  const legacy = CLEANUP_ORDER.some(name => panes.some(pane => pane.name === name));
-  const allowed = new Set<string>(modern && !legacy ? MODERN_CLEANUP_ORDER : !modern && legacy ? CLEANUP_ORDER : []);
+  const resolution = resolveCleanupMode(panes);
+  const allowed = resolution.status === "ok" ? new Set<string>(resolution.order) : new Set<string>();
   const paneIds = panes.map(pane => pane.paneId).filter((paneId): paneId is string => typeof paneId === "string" && paneId.length > 0);
   const duplicatePaneId = new Set(paneIds).size !== paneIds.length;
   if (panes.length > 0 && (!allowed.size || panes.some(pane => !allowed.has(pane.name ?? "") || !pane.paneId) || [...allowed].some(name => panes.filter(pane => pane.name === name).length > 1) || duplicatePaneId)) throw new Error("reset対象のrole/pane identityが混在・不明・重複しています。close前に安全停止しました");

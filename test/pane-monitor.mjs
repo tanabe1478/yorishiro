@@ -1,6 +1,18 @@
 import assert from "node:assert/strict";
-const { monitorPane } = await import("../extensions/development-pipeline/pane-monitor.ts");
-const { interrupt, routeMonitorFailure, abortBeforePaneStart } = await import("../extensions/development-pipeline/index.ts");
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+const { monitorPane, hasExactPiIdentity } = await import("../extensions/development-pipeline/pane-monitor.ts");
+const { interrupt, routeMonitorFailure, abortBeforePaneStart, captureTranscript } = await import("../extensions/development-pipeline/index.ts");
+
+assert.equal(hasExactPiIdentity({ argv0: "pi" }), true);
+assert.equal(hasExactPiIdentity({ foreground_processes: [{ argv: ["pi"], cmdline: "pi", name: "pi", pid: 123 }] }), true, "Herdr 0.9 foreground_processes argv[0] is authoritative");
+assert.equal(hasExactPiIdentity({ foreground_processes: [{ argv: ["pi", "--model", "x"], cmdline: "pi --model x" }] }), true);
+assert.equal(hasExactPiIdentity({ foreground_processes: [{ argv: ["/usr/bin/pi"], name: "pi" }] }), false, "a path is not the exact pi argv[0]");
+assert.equal(hasExactPiIdentity({ foreground_processes: [{ argv: ["sudo", "pi"], name: "pi" }] }), false, "an argument named pi is not the executable");
+assert.equal(hasExactPiIdentity({ cmdline: "pi", name: "pi" }), false, "display fields alone are not identity");
+assert.equal(hasExactPiIdentity({ argv0: "/usr/bin/pi" }), false);
+assert.equal(hasExactPiIdentity({ argv0: "pi-wrapper" }), false);
 
 function fakeHerdr(observations, report = false) {
   let clock = 0;
@@ -140,6 +152,30 @@ assert.equal(ok, true);
 assert.deepEqual(calls.slice(0, 3), [
   ["herdr", ["pane", "send-keys", "pane", "ctrl+c"]],
   ["herdr", ["pane", "send-keys", "pane", "escape"]],
-  ["herdr", ["agent", "wait", "pane", "--status", "idle", "--timeout", "2000"]],
+  ["herdr", ["agent", "wait", "pane", "--until", "idle", "--timeout", "2000"]],
 ]);
+
+const transcriptDir = await mkdtemp(path.join(os.tmpdir(), "yorishiro-transcript-"));
+try {
+  const transcriptFile = path.join(transcriptDir, "terminal.txt");
+  const primaryCalls = [];
+  const primary = await captureTranscript("pane", transcriptFile, async (program, args) => { primaryCalls.push([program, args]); return { code: 0, stdout: "PRIMARY", stderr: "" }; });
+  assert.deepEqual(primary, { source: "agent", bytes: 7 });
+  assert.equal(await readFile(transcriptFile, "utf8"), "PRIMARY");
+  assert.equal(primaryCalls.length, 1);
+
+  const fallbackCalls = [];
+  const fallback = await captureTranscript("pane", transcriptFile, async (program, args) => {
+    fallbackCalls.push([program, args]);
+    if (args[0] === "agent") return { code: 1, stdout: "", stderr: "agent target vanished" };
+    return { code: 0, stdout: "RAW-PANE", stderr: "" };
+  });
+  assert.deepEqual(fallback, { source: "pane", bytes: 8 });
+  assert.equal(await readFile(transcriptFile, "utf8"), "RAW-PANE");
+  assert.deepEqual(fallbackCalls[1], ["herdr", ["pane", "read", "pane", "--source", "recent-unwrapped", "--lines", "200", "--format", "text", "--raw"]]);
+
+  await assert.rejects(() => captureTranscript("pane", path.join(transcriptDir, "missing.txt"), async (_program, args) => args[0] === "agent" ? { code: 1, stdout: "", stderr: "agent gone" } : { code: 1, stdout: "", stderr: "pane gone" }), /agent: agent gone; pane: pane gone/);
+} finally {
+  await rm(transcriptDir, { recursive: true, force: true });
+}
 console.log("deterministic pane startup/exit and interrupt tests passed");

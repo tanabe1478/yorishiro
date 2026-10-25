@@ -11,7 +11,7 @@ const herdr = path.join(bin, "herdr");
 await writeFile(herdr, `#!/bin/sh
 printf '%s\\n' "$*" >> "$RESET_HERDR_LOG"
 if [ "$1" = pane ] && [ "$2" = get ]; then
-  case "$3" in worker) name='Worker · Luna';; reviewer) name='Reviewer · Sol';; *) name="$3";; esac
+  case "$3" in worker) name='Worker · Luna';; deepseek) name='Worker · DeepSeek';; reviewer) name='Reviewer · Sol';; *) name="$3";; esac
   printf '{"workspace_id":"ws","tab_id":"tab","name":"%s","agent_status":"idle"}\\n' "$name"
 fi
 `);
@@ -35,6 +35,10 @@ try {
     await writeFile(log, ""); const dir = await make(`valid-${outcome}`, { outcome });
     const result = await resetRun(dir, artifacts, context, true); assert.equal(result.results[0].status, "closed");
   }
+  await writeFile(log, ""); const current = await make("valid-current", { panes: [{ paneId: "deepseek", name: "Worker · DeepSeek" }, { paneId: "reviewer", name: "Reviewer · Sol" }] });
+  const currentResult = await resetRun(current, artifacts, context, true);
+  assert.deepEqual(currentResult.results.map(result => result.status), ["closed", "closed"]);
+  assert.deepEqual((await readFile(log, "utf8")).trim().split("\n").filter(line => line.startsWith("pane close ")), ["pane close reviewer", "pane close deepseek"]);
   await rejectsWithoutClose("success", { outcome: "SUCCESS" });
   await rejectsWithoutClose("noncanonical", { outcome: "TOTALLY_FAILED" });
   await rejectsWithoutClose("unfinished", { finishedAt: undefined });

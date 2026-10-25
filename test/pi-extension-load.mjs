@@ -21,6 +21,10 @@ const current = run(path.join(root, "extensions", "development-pipeline", "index
 assert.equal(current.status, 0, `Pi/Jiti failed to initialize the current extension:\n${current.stderr}`);
 assert.match(current.stdout, /"command":"get_state"/);
 
+const guard = run(path.join(root, "extensions", "development-pipeline", "model-guard.ts"));
+assert.equal(guard.status, 0, `Pi/Jiti failed to initialize the model guard:\n${guard.stderr}`);
+assert.match(guard.stdout, /"command":"get_state"/);
+
 const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "yorishiro-jiti-broken-"));
 try {
   const fixture = path.join(fixtureRoot, "development-pipeline");

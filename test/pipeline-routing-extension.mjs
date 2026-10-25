@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { installFakePi } from "./support/fake-pi.mjs";
 
 const root = path.resolve(new URL("..", import.meta.url).pathname);
 const herdrDir = await mkdtemp(path.join(os.tmpdir(), "yorishiro-fake-herdr-"));
@@ -35,6 +36,7 @@ else if (a[0] === "pane" && a[1] === "process-info") {
 }
 `);
 await chmod(herdr, 0o755);
+await installFakePi(herdrDir);
 process.env.PATH = `${herdrDir}:${process.env.PATH}`;
 process.env.FAKE_HERDR_LOG = log;
 const stopFile = path.join(herdrDir, "stopped");
@@ -89,6 +91,10 @@ for (const [scenario, expectedError] of [["startup", /startup deadline expired/]
   const interrupts = calls.filter(a => a[0] === "pane" && a[1] === "send-keys").map(a => a.slice(2));
   assert.deepEqual(interrupts, scenario === "layout-failure" ? [] : [["fake:split1", "ctrl+c"], ["fake:split1", "escape"]]);
   assert.equal(calls.filter(a => a[0] === "pane" && a[1] === "close").length, scenario === "layout-failure" ? 1 : 0);
+  const waits = calls.filter(a => a[0] === "agent" && a[1] === "wait");
+  assert.equal(waits.some(a => a.includes("--status")), false, "installed Herdr uses --until, not --status");
+  assert.ok(waits.every(a => a.includes("--until")), "monitor must use --until");
+  if (scenario !== "layout-failure") assert.ok(waits.length > 0, "monitor must poll agent wait");
 }
 
 const occupied = await executeScenario("layout-occupied");
@@ -116,6 +122,24 @@ assert.match(before.metadata.stages.implement.attempts[0].error, /no child was s
 assert.equal(before.calls.filter(a => a[0] === "agent" && a[1] === "start").length, 0);
 assert.equal(before.calls.filter(a => a[0] === "pane" && a[1] === "send-keys").length, 0);
 assert.equal(before.calls.filter(a => a[0] === "pane" && a[1] === "close").length, 0);
+
+const preflightContract = { planItems: [{ id: "PLAN-1", description: "実装する" }], requiredChecks: [{ id: "CHECK-1", program: "/usr/bin/true", args: [] }] };
+async function expectPreflightFailure(env, pattern) {
+  Object.assign(process.env, env);
+  await writeFile(log, "");
+  try {
+    await assert.rejects(() => pipeline.execute("preflight", { task: "preflight", approvedPlan: "approved", qualityContract: preflightContract, cwd: root, cleanupMode: "never" }, new AbortController().signal, () => {}, { cwd: root, hasUI: false }), pattern);
+    const calls = (await readFile(log, "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+    assert.equal(calls.filter(args => args[0] === "pane" && (args[1] === "split" || args[1] === "run")).length, 0, "preflight failure must not start a pane");
+  } finally {
+    delete process.env.FAKE_PI_AUTH_STATUS;
+    delete process.env.FAKE_PI_AUTH_EXIT;
+    delete process.env.FAKE_PI_PROVIDER;
+  }
+}
+await expectPreflightFailure({ FAKE_PI_AUTH_STATUS: "not_ready" }, /MODEL_PREFLIGHT_FAILED.*not ready/);
+await expectPreflightFailure({ FAKE_PI_AUTH_EXIT: "1" }, /MODEL_PREFLIGHT_FAILED.*exited nonzero/);
+await expectPreflightFailure({ FAKE_PI_PROVIDER: "other" }, /MODEL_PREFLIGHT_FAILED.*resolved to provider other/);
 
 await rm(herdrDir, { recursive: true, force: true });
 console.log("registered production routing fake-Herdr test passed");

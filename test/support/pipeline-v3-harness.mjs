@@ -23,7 +23,7 @@ export function collectObservedEvents({ commandLog, state, productionReturn, pro
   }
   for (const line of String(promptRaw ?? "").trim().split("\n").filter(Boolean)) {
     const [paneId, encoded] = line.split("\t"), prompt = Buffer.from(encoded ?? "", "base64").toString("utf8");
-    const stage = prompt.includes("Worker · Luna") ? "implement" : prompt.includes("Reviewer · Sol") ? "review" : undefined;
+    const stage = prompt.includes("Worker · DeepSeek") ? "implement" : prompt.includes("Reviewer · Sol") ? "review" : undefined;
     const attemptText = prompt.match(/今回のattempt：(\d+)/)?.[1];
     if (!paneId || !stage || !attemptText) throw new Error("prompt raw observation lacks pane/stage/attempt");
     events.push({ kind: "dispatch", source: "prompt-raw", paneId, stage, attempt: Number(attemptText), prompt });

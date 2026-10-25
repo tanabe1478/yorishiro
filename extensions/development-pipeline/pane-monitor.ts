@@ -20,6 +20,9 @@ export function hasExactPiIdentity(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
   if (record.argv0 === "pi") return true;
+  // Newer Herdr returns foreground_processes:[{ argv: ["pi", ...], ... }]
+  // with no argv0. Only argv[0] is authoritative; cmdline/name are display data.
+  if (Array.isArray(record.argv) && record.argv[0] === "pi") return true;
   return Object.values(record).some(hasExactPiIdentity);
 }
 

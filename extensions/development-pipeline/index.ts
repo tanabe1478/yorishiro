@@ -16,6 +16,9 @@ import { reviewPlan, reviewDiff, resolveReviewMode, executeDiffProcess, type Pla
 import { assertSuccessQualityState, captureFingerprintMap, changedPathsBetween, compareWorkerEvidence, hashQualityContract, validateQualityContract, qualityContractArtifact, type QualityContract, type FingerprintMap } from "./quality-contract.ts";
 import { boundUtf8, runSandboxedVerification } from "./verifier-tools.ts";
 import { createHash } from "node:crypto";
+import { INFO, MODELS, ROLE_LABELS, STAGES, roleMetadata, roleModels, type Stage } from "./models.ts";
+import { discoverVerifySkills, isWorkflowName, shellQuote, writeLauncher, writeWorkflowBrief, type WorkflowName } from "./launcher.ts";
+import { preflightFixedModels } from "./model-preflight.ts";
 export { routeMonitorFailure } from "./pane-monitor.ts";
 export function abortBeforePaneStart() { return { status: "aborted" as const, evidence: "pipeline aborted before pane startup; no child was started; pane preserved" }; }
 export function shouldSplitForAttempt(paneId: string) { return paneId.length === 0; }
@@ -39,27 +42,20 @@ export async function rollbackPane(paneId: string, run: LayoutCommand = (program
   if (result.code) throw new Error(`Herdr pane rollback ${paneId} failed: ${result.stderr || result.stdout || `exit ${result.code}`}`);
 }
 
-const MODELS = { implement: "openai-codex/gpt-5.6-luna", review: "openai-codex/gpt-5.6-sol" } as const;
-type Stage = "implement" | "review";
 type StageStatus = "pending" | "running" | "passed" | "failed" | "blocked" | "aborted";
-type Input = { task: string; approvedPlan: string; qualityContract: QualityContract; cwd?: string; maxRepairCycles?: number; maxReviewCycles?: number; cleanupMode?: "ask" | "on-success" | "never"; planReviewMode?: "ask" | "required" | "skip"; diffReviewMode?: "ask" | "required" | "skip" };
+type Input = { task: string; approvedPlan: string; qualityContract: QualityContract; workflow?: string; cwd?: string; maxRepairCycles?: number; maxReviewCycles?: number; cleanupMode?: "ask" | "on-success" | "never"; planReviewMode?: "ask" | "required" | "skip"; diffReviewMode?: "ask" | "required" | "skip" };
 type CommandResult = { code: number; stdout: string; stderr: string };
-type QualityGateResult = { gate: number; status: "passed" | "failed" | "cancelled"; checks: Array<{ id: string; argv: string[]; exit: number; exitCode: number; timeout: boolean; timedOut: boolean; cancelled: boolean; outputHash: string; outputExcerpt: string; outputTruncated: boolean; summary: string }> };
+type CheckEvidence = { status: string; dir: string; files: number; bytes: number; skipped: number; skippedCount: number; visited: number; truncated: boolean };
+type QualityGateResult = { gate: number; status: "passed" | "failed" | "cancelled"; checks: Array<{ id: string; argv: string[]; exit: number; exitCode: number; timeout: boolean; timedOut: boolean; cancelled: boolean; outputHash: string; outputExcerpt: string; outputTruncated: boolean; summary: string; evidence?: CheckEvidence; evidenceError?: string }> };
 type QualityMismatch = { signature: string; errors: string[]; actualPaths: string[]; reportedPaths: string[]; violations: Array<{ type: string; contractId: string }> };
 type Attempt = { attempt: number; status: StageStatus; startedAt: string; finishedAt?: string; reportFile: string; paneId: string; verdict?: string; error?: string };
 type Pane = { paneId: string; name: string; model: string; attempts: Attempt[] };
 type LayoutCommand = (program: string, args: string[]) => Promise<CommandResult>;
-const ROLE_LABELS = ["Worker · Luna", "Reviewer · Sol"] as const;
-function shellQuote(value: string) { return "'" + value.replaceAll("'", "'\\''") + "'"; }
 
 const STAGE_TIMEOUT_MS = Number(process.env.YORISHIRO_STAGE_TIMEOUT_MS ?? 30 * 60 * 1000);
 const STARTUP_GRACE_MS = Number(process.env.YORISHIRO_STARTUP_GRACE_MS ?? 15 * 1000);
 const REPORT_SETTLEMENT_GRACE_MS = Number(process.env.YORISHIRO_REPORT_SETTLEMENT_GRACE_MS ?? 5 * 1000);
-const INFO: Record<Stage, { label: string; tools: string; thinking: "high" | "medium" }> = {
-  implement: { label: "Worker · Luna", tools: "read,grep,find,ls,bash,edit,write,submit_stage_report", thinking: "high" },
-  review: { label: "Reviewer · Sol", tools: "read,grep,find,ls,run_verification_command,submit_stage_report", thinking: "medium" },
-};
-const stages: Stage[] = ["implement", "review"];
+const stages: Stage[] = [...STAGES];
 function rootDir() { return process.env.YORISHIRO_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.."); }
 function now() { return new Date().toISOString(); }
 function json(value: unknown) { return JSON.stringify(value, null, 2); }
@@ -90,19 +86,29 @@ function exactVerdict(text: string, choices: string[]): string | undefined { con
 async function snapshot(cwd: string, dir: string, name: string) { const s = await command("git", ["status", "--short"], cwd), u = await command("git", ["diff", "--no-ext-diff"], cwd), st = await command("git", ["diff", "--cached", "--no-ext-diff"], cwd); if (s.code || u.code || st.code) throw new Error(`git snapshot failed: ${s.stderr || u.stderr || st.stderr}`); await atomicWrite(path.join(dir, `${name}-status.txt`), s.stdout); await atomicWrite(path.join(dir, `${name}-diff.patch`), `${u.stdout}\n\n# --- staged diff ---\n${st.stdout}`); }
 async function fingerprintSnapshot(cwd: string, dir: string, name: string): Promise<FingerprintMap> { const map = await captureFingerprintMap(cwd); await atomicWrite(path.join(dir, `${name}-fingerprint.json`), json(map)); return map; }
 function hashOutput(text: string) { return createHash("sha256").update(text, "utf8").digest("hex"); }
-async function runQualityGate(contract: QualityContract, cwd: string, gate: number, signal?: AbortSignal): Promise<QualityGateResult> {
+/** Stable, collision-resistant per-check evidence directory name. */
+export function evidenceSegment(id: string, index: number) {
+  const cleaned = id.replace(/[^A-Za-z0-9._-]/g, "_");
+  const slug = cleaned === "" || cleaned === "." || cleaned === ".." ? "check" : cleaned.slice(0, 48);
+  const digest = createHash("sha256").update(id, "utf8").digest("hex").slice(0, 8);
+  return `${index + 1}-${slug}-${digest}`;
+}
+async function runQualityGate(contract: QualityContract, cwd: string, gate: number, artifactDir: string, signal?: AbortSignal): Promise<QualityGateResult> {
   const checks: QualityGateResult["checks"] = [];
-  for (const check of contract.requiredChecks) {
+  for (const [index, check] of contract.requiredChecks.entries()) {
     const timeoutMs = check.timeoutMs ?? 120000;
-    let result: { code: number; stdout: string; stderr: string; truncated: boolean; cancelled: boolean; timedOut: boolean };
-    try { result = await runSandboxedVerification(check.program, check.args, cwd, timeoutMs, signal); }
+    const evidenceDir = path.join(artifactDir, "evidence", `quality-gate-${gate}`, evidenceSegment(check.id, index));
+    let result: { code: number; stdout: string; stderr: string; truncated: boolean; cancelled: boolean; timedOut: boolean; evidence?: any; evidenceError?: string };
+    try { result = await runSandboxedVerification(check.program, check.args, cwd, timeoutMs, signal, { evidenceDir }); }
     catch (error) { result = { code: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error), truncated: false, cancelled: !!signal?.aborted, timedOut: false }; }
     const output = `${result.stdout}${result.stderr}`;
     const outputExcerpt = boundUtf8(output, 4096);
     const outputTruncated = result.truncated || Buffer.byteLength(outputExcerpt, "utf8") < Buffer.byteLength(output, "utf8");
     const diagnostic = outputExcerpt.trim().split(/\r?\n/).find(Boolean);
     const status = result.timedOut ? "タイムアウトしました" : result.cancelled ? "キャンセルされました" : `終了コード${result.code}`;
-    checks.push({ id: check.id, argv: [check.program, ...check.args], exit: result.code, exitCode: result.code, timeout: result.timedOut, timedOut: result.timedOut, cancelled: result.cancelled, outputHash: hashOutput(output), outputExcerpt, outputTruncated, summary: `独立check「${check.id}」は${status}。出力はSHA-256と最大4KiBの診断抜粋で記録しました。${diagnostic ? ` 主な出力: ${diagnostic}` : ""}` });
+    const evidence = result.evidence ? { status: result.evidence.status, dir: path.relative(artifactDir, evidenceDir), files: result.evidence.files.length, bytes: result.evidence.bytes, skipped: result.evidence.skipped.length, skippedCount: result.evidence.skippedCount, visited: result.evidence.visited, truncated: result.evidence.truncated } : undefined;
+    const evidenceDetail = result.evidenceError ? ` 証跡回収に失敗しました: ${boundUtf8(result.evidenceError, 300)}` : result.evidence ? result.evidence.files.length ? ` 証跡${result.evidence.files.length}件を${evidence!.dir}へ保存しました。${result.evidence.truncated || result.evidence.skippedCount > 0 ? ` 証跡は不完全です（skip=${result.evidence.skippedCount}, truncated=${result.evidence.truncated}）。` : ""}` : ` 証跡は空です。${result.evidence.truncated || result.evidence.skippedCount > 0 ? ` 証跡は不完全です（skip=${result.evidence.skippedCount}, truncated=${result.evidence.truncated}）。` : ""}` : "";
+    checks.push({ id: check.id, argv: [check.program, ...check.args], exit: result.code, exitCode: result.code, timeout: result.timedOut, timedOut: result.timedOut, cancelled: result.cancelled, outputHash: hashOutput(output), outputExcerpt, outputTruncated, summary: `独立check「${check.id}」は${status}。出力はSHA-256と最大4KiBの診断抜粋で記録しました。${diagnostic ? ` 主な出力: ${diagnostic}` : ""}${evidenceDetail}`, ...(evidence ? { evidence } : {}), ...(result.evidenceError ? { evidenceError: result.evidenceError } : {}) });
   }
   return { gate, status: checks.every(check => check.exitCode === 0 && !check.timeout && !check.cancelled) ? "passed" : signal?.aborted ? "cancelled" : "failed", checks };
 }
@@ -139,41 +145,62 @@ export async function renameDetectedPane(id: string, label: string, run: LayoutC
   if (!((responseType === "ok" || responseType === "pane_info") && returnedId === id)) throw new Error(`Herdr pane rename ${id} was not confirmed with matching pane ID`);
   return payload;
 }
-async function writeLauncher(dir: string, stage: Stage, name: string, prompt: string, cwd: string, reportPath: string) {
-  const promptFile = path.join(dir, `${stage}-prompt.md`), launcher = path.join(dir, `${stage}-launcher.sh`);
-  await fs.writeFile(promptFile, prompt, { encoding: "utf8", mode: 0o700 });
-  const reporter = path.join(rootDir(), "extensions", "development-pipeline", "stage-reporter.ts");
-  const verifier = path.join(rootDir(), "extensions", "development-pipeline", "verifier-tools.ts");
-  const role = stage === "implement" ? "Worker · Luna" : "Reviewer · Sol";
-  const schema = stage === "implement" ? "worker" : "reviewer";
-  const target = `export YORISHIRO_REPORT_SCHEMA=${shellQuote(schema)}\nexport YORISHIRO_REPORT_STAGE=${shellQuote(stage)}\nexport YORISHIRO_ROLE=${shellQuote(role)}\nexport YORISHIRO_REPORT_PATH=${shellQuote(reportPath)}\nexport YORISHIRO_PROMPT_PATH=${shellQuote(promptFile)}\n${stage === "review" ? `export YORISHIRO_TARGET_CWD=${shellQuote(cwd)}\n` : ""}`;
-  const script = `#!/bin/sh\nset -eu\n${target}prompt=$(cat -- ${shellQuote(promptFile)})\nexec pi --name ${shellQuote(name)} --model ${shellQuote(MODELS[stage])} --thinking ${shellQuote(INFO[stage].thinking)} --tools ${shellQuote(INFO[stage].tools)} --no-extensions --no-skills -e ${shellQuote(reporter)}${stage === "review" ? ` -e ${shellQuote(verifier)}` : ""} "$prompt"\n`;
-  await fs.writeFile(launcher, script, { encoding: "utf8", mode: 0o700 });
-  return { promptFile, launcher };
-}
-export async function interrupt(id: string, run: (program: string, args: string[]) => Promise<CommandResult> = (program, args) => command(program, args), getPane: (paneId: string) => Promise<unknown> = paneGet): Promise<boolean> { for (let attempt = 0; attempt < 2; attempt++) { const ctrl = await run("herdr", ["pane", "send-keys", id, "ctrl+c"]); const esc = await run("herdr", ["pane", "send-keys", id, "escape"]); const waited = await run("herdr", ["agent", "wait", id, "--status", "idle", "--timeout", "2000"]); const pane = await getPane(id); const status = field(pane, "agent_status"); if (!ctrl.code && !esc.code && !waited.code && (status === "idle" || status === "unknown")) return true; await new Promise(r => setTimeout(r, 250)); } return false; }
-async function startPane(stage: Stage, name: string, cwd: string, parent: string, tab: string, prompt: string, reportPath: string, workers: string[], artifactDir: string, onPaneCreated: (paneId: string, files: { promptFile: string; launcher: string }) => Promise<void>) {
+type LaunchContext = {
+  cwd: string;
+  artifactDir: string;
+  root: string;
+  parentPane: string;
+  workflow: WorkflowName;
+  workflowSkillDir: string;
+  workflowPlaybook: string;
+  verifySkills: string[];
+};
+export async function interrupt(id: string, run: (program: string, args: string[]) => Promise<CommandResult> = (program, args) => command(program, args), getPane: (paneId: string) => Promise<unknown> = paneGet): Promise<boolean> { for (let attempt = 0; attempt < 2; attempt++) { const ctrl = await run("herdr", ["pane", "send-keys", id, "ctrl+c"]); const esc = await run("herdr", ["pane", "send-keys", id, "escape"]); const waited = await run("herdr", ["agent", "wait", id, "--until", "idle", "--timeout", "2000"]); const pane = await getPane(id); const status = field(pane, "agent_status"); if (!ctrl.code && !esc.code && !waited.code && (status === "idle" || status === "unknown")) return true; await new Promise(r => setTimeout(r, 250)); } return false; }
+async function startPane(stage: Stage, name: string, prompt: string, reportPath: string, workers: string[], context: LaunchContext, onPaneCreated: (paneId: string, files: { promptFile: string; launcher: string }) => Promise<void>) {
   const layoutIndex = workers.length;
-  const target = layoutIndex === 0 ? parent : workers.at(-1)!;
+  const target = layoutIndex === 0 ? context.parentPane : workers.at(-1)!;
   const direction = layoutIndex === 0 ? "right" as const : "down" as const;
   const ratio = layoutIndex === 0 ? "0.55" : "0.5";
-  const split = await splitPane(target, direction, ratio, cwd);
+  const split = await splitPane(target, direction, ratio, context.cwd);
   let layout: any;
   try {
-    layout = await inspectLayout(parent);
-    validateGeometry(layout, parent, [...workers, split.paneId], ["right", ...(layoutIndex > 0 ? ["down"] : [])], [0.55, ...(layoutIndex > 0 ? [0.5] : [])]);
+    layout = await inspectLayout(context.parentPane);
+    validateGeometry(layout, context.parentPane, [...workers, split.paneId], ["right", ...(layoutIndex > 0 ? ["down"] : [])], [0.55, ...(layoutIndex > 0 ? [0.5] : [])]);
   } catch (error) {
     try { await rollbackPane(split.paneId); } catch (rollbackError) { throw new Error(`${error instanceof Error ? error.message : String(error)}; rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`); }
     throw error;
   }
-  const files = await writeLauncher(artifactDir, stage, name, prompt, cwd, reportPath);
+  const files = await writeLauncher({
+    stage,
+    name,
+    promptFile: path.join(context.artifactDir, `${stage}-prompt.md`),
+    promptFileContent: prompt,
+    cwd: context.cwd,
+    reportPath,
+    artifactDir: context.artifactDir,
+    root: context.root,
+    workflowSkillDir: context.workflowSkillDir,
+    workflowPlaybook: context.workflowPlaybook,
+    workflowBrief: path.join(context.artifactDir, `workflow-brief-${stage}.md`),
+    workflow: context.workflow,
+    verifySkills: context.verifySkills,
+  });
   await onPaneCreated(split.paneId, files);
   const launched = await command("herdr", ["pane", "run", split.paneId, shellQuote(files.launcher)]);
   if (launched.code) throw new Error(`Herdr pane run ${split.paneId} failed: ${launched.stderr || launched.stdout || `exit ${launched.code}`}`);
   return { paneId: split.paneId, layout, files };
 }
 async function sendPrompt(id: string, prompt: string) { const sent = await command("herdr", ["pane", "send-text", id, prompt]); if (sent.code) throw new Error(`Could not send prompt: ${sent.stderr || sent.stdout || `exit ${sent.code}`}`); const enter = await command("herdr", ["pane", "send-keys", id, "enter"]); if (enter.code) throw new Error(`Could not submit prompt: ${enter.stderr || enter.stdout}`); }
-async function captureTranscript(id: string, file: string) { const result = await command("herdr", ["agent", "read", id, "--source", "recent-unwrapped", "--lines", "200", "--format", "text"]); if (result.code) throw new Error(`Herdr transcript capture failed: ${result.stderr || result.stdout}`); await atomicWrite(file, result.stdout); }
+export async function captureTranscript(id: string, file: string, run: (program: string, args: string[]) => Promise<CommandResult> = (program, args) => command(program, args)) {
+  const primary = await run("herdr", ["agent", "read", id, "--source", "recent-unwrapped", "--lines", "200", "--format", "text"]);
+  if (!primary.code) { await atomicWrite(file, primary.stdout); return { source: "agent" as const, bytes: Buffer.byteLength(primary.stdout, "utf8") }; }
+  // Herdr can no longer resolve an exited agent target. The pane still exists
+  // (and is deliberately preserved), so read its raw terminal buffer instead.
+  const fallback = await run("herdr", ["pane", "read", id, "--source", "recent-unwrapped", "--lines", "200", "--format", "text", "--raw"]);
+  if (fallback.code) throw new Error(`Herdr transcript capture failed (agent: ${boundUtf8(primary.stderr || primary.stdout || `exit ${primary.code}`, 300)}; pane: ${boundUtf8(fallback.stderr || fallback.stdout || `exit ${fallback.code}`, 300)})`);
+  await atomicWrite(file, fallback.stdout);
+  return { source: "pane" as const, bytes: Buffer.byteLength(fallback.stdout, "utf8") };
+}
 async function waitPane(id: string, report: string, signal: AbortSignal | undefined, update: (s: string) => void | Promise<void>) {
   return monitorPane({
     reportExists: () => existsSync(report),
@@ -184,7 +211,7 @@ async function waitPane(id: string, report: string, signal: AbortSignal | undefi
     reportSettlementGraceMs: REPORT_SETTLEMENT_GRACE_MS,
     pollIntervalMs: Number(process.env.YORISHIRO_POLL_INTERVAL_MS ?? 1000),
     poll: async () => {
-      await command("herdr", ["agent", "wait", id, "--status", "idle", "--timeout", "1000"], undefined, signal);
+      await command("herdr", ["agent", "wait", id, "--until", "idle", "--timeout", "1000"], undefined, signal);
       const infoResult = await command("herdr", ["pane", "process-info", "--pane", id], undefined, signal);
       const pane = await paneGet(id);
       const processInfo = parse(infoResult);
@@ -194,7 +221,7 @@ async function waitPane(id: string, report: string, signal: AbortSignal | undefi
 }
 function promptFor(stage: Stage, task: string, dir: string, plan: string, review: string, attempt: number, workerReportPath = "", workerReportContent = "", contractJson = "", qualityGatePath = "", qualityGateContent = "", workerSnapshotAttempt = attempt) {
   const label = INFO[stage].label, report = path.join(dir, `${stage}-${attempt}.json`);
-  const common = `あなたは${label}です。可視化された逐次pipelineの一員として、現在のrepositoryで作業してください。\n作業内容：\n${task}\n\nartifact保存先：${dir}。今回のattempt：${attempt}。`;
+  const common = `あなたは${label}です。可視化された逐次pipelineの一員として、現在のrepositoryで作業してください。\n作業内容：\n${task}\n\nartifact保存先：${dir}。今回のattempt：${attempt}。\n最初に必ず ${path.join(dir, `workflow-brief-${stage}.md`)} を最後まで読み、そこに示されたworkflow Skill、playbook、対象checkoutのverification Skill / feature mapを実ファイルとして読んでから進めてください。skill自動探索は無効ですが、briefに書かれたpathを明示的に読む必要があります。compilationだけを成功証拠にせず、対象の実ユーザー面で確認してください。commit、push、PR作成、外部messageは行わないでください。`;
   const reportInstruction = `最後に必ずsubmit_stage_reportを呼び出し、structured JSON契約で報告してください。orchestratorが指定したpending先は${report}（attempt ${attempt}）です。ツールの成功応答（Submitted ... report）で書き込み成功を確認してください。validation errorが返った場合はexpected/missing/unexpected fieldsを確認してpayloadを修正し、同じpending先へ成功するまで再提出してください。成功確認前に終了・idleにならないでください。`;
   if (stage === "implement") return `${common}\n承認済み計画：\n${plan}\nquality contract（このJSONを厳守）：\n${contractJson}\n${review ? `\norchestratorからのsanitized修正finding（このstructured dataだけを使用）：\n${review}\n` : ""}承認済み計画の範囲だけを実装してください。sourceを変更し、実装・test・動作確認を行った結果を、COMPLETEDまたはBLOCKEDと日本語のsummary、changedScope、evidenceで報告してください。COMPLETEDのcompletedPlanItemsは契約の全planItemsをidごとに一度ずつ、BLOCKEDは実際に完了したcontract IDのsubsetだけを含め、日本語のevidenceを付けてください。どちらもchangedPathsにはbaseline以後のgit実diffを正確に列挙し、allowedPathPrefixesを守ってください。${reportInstruction}`;
   return `${common}\n承認済み計画：\n${plan}\nquality contract（validator済み）：\n${contractJson}\n現在のWorker report path：${workerReportPath}\nvalidator済みWorker report JSON本文：\n${workerReportContent}\ncurrent quality-gate artifact path：${qualityGatePath}\nvalidator済みquality-gate内容：\n${qualityGateContent}\n今回のWorker attemptのactual snapshot：${path.join(dir, `diffs/implement-${workerSnapshotAttempt}-status.txt`)} / ${path.join(dir, `diffs/implement-${workerSnapshotAttempt}-diff.patch`)} / ${path.join(dir, `diffs/implement-${workerSnapshotAttempt}-fingerprint.json`)}\nbaseline：${path.join(dir, "diffs/baseline-status.txt")} / ${path.join(dir, "diffs/baseline-diff.patch")} / ${path.join(dir, "diffs/baseline-fingerprint.json")}\nread-onlyの確認手段だけを使い、sourceを変更しないでください。Workerの自己申告ではなくactual changed pathsと独立check結果を確認し、APPROVED、APPROVED_WITH_NOTES、CHANGES_REQUESTED、NEEDS_PLANNERとstructuredな日本語fieldを報告してください。${reportInstruction}`;
@@ -203,13 +230,15 @@ function promptFor(stage: Stage, task: string, dir: string, plan: string, review
 export default function (pi: ExtensionAPI) {
   registerCleanupTool(pi, rootDir());
   registerResetTool(pi, rootDir());
-  pi.registerTool({ name: "development_pipeline", label: "Development Pipeline", description: "可視のHerdrペインで監査可能な開発パイプラインを実行します。", parameters: Type.Object({ task: Type.String({ description: "User-approved development task" }), approvedPlan: Type.String({ description: "Plan approved in the parent Sol conversation" }), qualityContract: Type.Object({ planItems: Type.Array(Type.Object({ id: Type.String(), description: Type.String() })), requiredChecks: Type.Array(Type.Object({ id: Type.String(), program: Type.String(), args: Type.Array(Type.String()), timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 300000 })) })), allowedPathPrefixes: Type.Optional(Type.Array(Type.String())) }), cwd: Type.Optional(Type.String()), maxReviewCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), maxRepairCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), cleanupMode: Type.Optional(Type.String({ description: "ask, on-success, or never; defaults to ask" })), planReviewMode: Type.Optional(Type.String({ description: "計画レビュー: ask, required, skip（既定 ask）" })), diffReviewMode: Type.Optional(Type.String({ description: "差分レビュー: ask, required, skip（既定 ask）" })) }), async execute(_id, input: Input, signal, onUpdate, ctx) {
+  pi.registerTool({ name: "development_pipeline", label: "Development Pipeline", description: "可視のHerdrペインで監査可能な開発パイプラインを実行します。workflowでfeature、bug-fix、refactoringのplaybookを選びます。", parameters: Type.Object({ task: Type.String({ description: "User-approved development task" }), approvedPlan: Type.String({ description: "Plan approved in the parent Planner conversation" }), qualityContract: Type.Object({ planItems: Type.Array(Type.Object({ id: Type.String(), description: Type.String() })), requiredChecks: Type.Array(Type.Object({ id: Type.String(), program: Type.String(), args: Type.Array(Type.String()), timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 300000 })) })), allowedPathPrefixes: Type.Optional(Type.Array(Type.String())) }), workflow: Type.Optional(Type.String({ description: "feature, bug-fix, or refactoring; defaults to feature" })), cwd: Type.Optional(Type.String()), maxReviewCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), maxRepairCycles: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, default: 2 })), cleanupMode: Type.Optional(Type.String({ description: "ask, on-success, or never; defaults to ask" })), planReviewMode: Type.Optional(Type.String({ description: "計画レビュー: ask, required, skip（既定 ask）" })), diffReviewMode: Type.Optional(Type.String({ description: "差分レビュー: ask, required, skip（既定 ask）" })) }), async execute(_id, input: Input, signal, onUpdate, ctx) {
     const contractCheck = validateQualityContract(input?.qualityContract);
     if (!contractCheck.valid) throw new Error(`Invalid qualityContract: ${contractCheck.error}`);
     const qualityContract = contractCheck.value;
     const task = input.task?.trim(), approvedPlan = input.approvedPlan?.trim(), cwd = path.resolve(input.cwd?.trim() || ctx.cwd);
     if (!task) throw new Error("task must not be empty");
-    if (!approvedPlan) throw new Error("approvedPlan must not be empty; planning is expected in the parent Sol conversation");
+    if (!approvedPlan) throw new Error("approvedPlan must not be empty; planning is expected in the parent Planner conversation");
+    const workflow = input.workflow ?? "feature";
+    if (!isWorkflowName(workflow)) throw new Error(`workflow must be one of ${["feature", "bug-fix", "refactoring"].join(", ")}`);
     const cleanupMode = input.cleanupMode ?? "ask"; if (!["ask", "on-success", "never"].includes(cleanupMode)) throw new Error("cleanupMode must be ask, on-success, or never");
     const planReviewMode = resolveReviewMode(input.planReviewMode), diffReviewMode = resolveReviewMode(input.diffReviewMode);
     for (const key of ["HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_SOCKET_PATH"]) if (!process.env[key]) throw new Error(`Herdr context is required (${key} is missing)`);
@@ -217,13 +246,20 @@ export default function (pi: ExtensionAPI) {
     const herdr = await command("herdr", ["status"]); if (herdr.code) throw new Error(`Herdr is unavailable: ${herdr.stderr || herdr.stdout}`);
     try { if (!(await fs.stat(cwd)).isDirectory()) throw new Error(); } catch { throw new Error(`cwd does not exist: ${cwd}`); }
     await preflightVerifierSandbox(cwd);
+    const modelPreflight = signal?.aborted ? { status: "skipped" as const, reason: "pipeline aborted before model preflight", checkedAt: now(), models: [] } : await preflightFixedModels([MODELS.implement, MODELS.review], { signal });
+    const workflowSkillDir = path.join(rootDir(), "skills", "development-workflow");
+    const workflowPlaybook = path.join(workflowSkillDir, "playbooks", `${workflow}.md`);
+    if (!existsSync(path.join(workflowSkillDir, "SKILL.md")) || !existsSync(workflowPlaybook)) throw new Error(`Workflow skill or playbook is unavailable: ${workflow}`);
+    const verifySkills = await discoverVerifySkills(cwd);
     const id = `${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`, artifactDir = path.join(rootDir(), "artifacts", path.basename(cwd) || "repository", id), diffs = path.join(artifactDir, "diffs"); await fs.mkdir(diffs, { recursive: true });
+    const workflowBriefs = { implement: await writeWorkflowBrief({ artifactDir, cwd, workflow, skillDir: workflowSkillDir, playbookPath: workflowPlaybook, verifySkills, stage: "implement" }), review: await writeWorkflowBrief({ artifactDir, cwd, workflow, skillDir: workflowSkillDir, playbookPath: workflowPlaybook, verifySkills, stage: "review" }) };
     await atomicWrite(path.join(artifactDir, "request.md"), `# 依頼\n\n${task}\n\n対象: ${cwd}\n`); await atomicWrite(path.join(artifactDir, "approved-plan.md"), `# 承認済み計画\n\n${approvedPlan}\n`); await atomicWrite(path.join(artifactDir, "quality-contract.json"), json(qualityContractArtifact(qualityContract))); await snapshot(cwd, diffs, "baseline");
     const baselineFingerprint = await fingerprintSnapshot(cwd, diffs, "baseline");
     const qualityContractHash = hashQualityContract(qualityContract);
-    const metadata: any = { targetRepository: path.basename(cwd), targetPath: cwd, startedAt: now(), qualityContractHash, qualityContract: { sha256: qualityContractHash, artifact: "quality-contract.json" }, baselineFingerprint: "diffs/baseline-fingerprint.json", parentPaneId: process.env.HERDR_PANE_ID, tabId: process.env.HERDR_TAB_ID, workspaceId: process.env.HERDR_WORKSPACE_ID, limitation: "baseline fingerprintとの差分で今回変化したpathを機械的に照合します。", planning: { status: "pending", mode: planReviewMode, source: "親Plannerセッション", artifact: "approved-plan.md" }, humanReview: { planMode: planReviewMode, diffMode: diffReviewMode }, stages: Object.fromEntries(stages.filter(s => s !== "plan").map(s => [s, { status: "pending", attempts: [] }])), panes: [], repairCycles: 0, qualityGates: [], qualityContractBaselineCount: Object.keys(baselineFingerprint).length };
+    const metadata: any = { targetRepository: path.basename(cwd), targetPath: cwd, startedAt: now(), qualityContractHash, qualityContract: { sha256: qualityContractHash, artifact: "quality-contract.json" }, baselineFingerprint: "diffs/baseline-fingerprint.json", parentPaneId: process.env.HERDR_PANE_ID, tabId: process.env.HERDR_TAB_ID, workspaceId: process.env.HERDR_WORKSPACE_ID, limitation: "baseline fingerprintとの差分で今回変化したpathを機械的に照合します。", models: roleModels(), roles: roleMetadata(), modelPreflight, modelGuard: { enabled: true, boundary: "pi tool_call", limitation: "意図的に敵対的なWorker、改変されたPi、任意のnested shellは防がない" }, workflow: { name: workflow, skill: path.relative(rootDir(), workflowSkillDir), playbook: path.relative(rootDir(), workflowPlaybook), briefs: { implement: path.basename(workflowBriefs.implement), review: path.basename(workflowBriefs.review) }, targetVerifySkills: verifySkills.map(dir => path.relative(cwd, dir)) }, evidenceRoot: "evidence", planning: { status: "pending", mode: planReviewMode, source: "親Plannerセッション", artifact: "approved-plan.md" }, humanReview: { planMode: planReviewMode, diffMode: diffReviewMode }, stages: Object.fromEntries(stages.filter(s => s !== "plan").map(s => [s, { status: "pending", attempts: [] }])), panes: [], repairCycles: 0, qualityGates: [], qualityContractBaselineCount: Object.keys(baselineFingerprint).length };
     await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
     const parentPaneId = metadata.parentPaneId as string;
+    const launchContext: LaunchContext = { cwd, artifactDir, root: rootDir(), parentPane: parentPaneId, workflow, workflowSkillDir, workflowPlaybook, verifySkills };
     const emit = (stage: string, text: string) => onUpdate?.({ content: [{ type: "text", text: `${stage}: ${text}` }], details: { stage, artifactDir, panes: metadata.panes } });
     const heartbeat = async (stage: string, attempt: number, reason: string) => {
       metadata.heartbeat = { stage, attempt, updatedAt: now(), waitingReason: reason };
@@ -258,7 +294,7 @@ export default function (pi: ExtensionAPI) {
           }
           const workerIds = metadata.panes.filter((p: Pane) => p.paneId).map((p: Pane) => p.paneId);
           try {
-            const started = await startPane(stage, pane.name, cwd, parentPaneId, process.env.HERDR_TAB_ID!, text, pendingReport, workerIds, artifactDir, async (paneId, files) => {
+            const started = await startPane(stage, pane.name, text, pendingReport, workerIds, launchContext, async (paneId, files) => {
               pane.paneId = paneId;
               record.paneId = paneId;
               metadata.launchers = [...(metadata.launchers ?? []), ...[files.launcher, files.promptFile].map(file => path.basename(file))];
@@ -320,18 +356,18 @@ export default function (pi: ExtensionAPI) {
         const sanitizedFinding = { code: "WORKER_EVIDENCE_MISMATCH", signature: mismatch.signature, violations: mismatch.violations.map(item => ({ type: item.type, contractId: item.contractId })), instruction: "quality contractと実diffに一致するreportへ修正してください。" };
         history.push({ attempt, signature: mismatch.signature, violations: sanitizedFinding.violations, errors: mismatch.errors, actualPaths: mismatch.actualPaths, reportedPaths: mismatch.reportedPaths });
         if (repeated) {
-          metadata.plannerReason = "同一signatureのquality evidence違反がquality repair後も再発したため、Planner裁定でLunaからSol Workerへ切り替える必要があります。";
-          metadata.qualityFallback = { reason: metadata.plannerReason, from: "Luna", to: "Sol Worker", automatic: false, trigger: "QC_REPEAT_UNREACHABLE" };
-          await atomicWrite(path.join(artifactDir, "quality-planner-escalation.json"), json(metadata.qualityFallback));
+          metadata.plannerReason = "同一signatureのquality evidence違反が同一Workerの有限quality repair後も再発しました。追加のモデル切替やfallbackは行わず、Plannerの判断が必要です。";
+          metadata.qualityStop = { reason: metadata.plannerReason, trigger: "QC_REPEAT_UNREACHABLE", remediation: "same-worker repair exhausted; no model switch or fallback", attempts: history.length, model: MODELS.implement };
+          await atomicWrite(path.join(artifactDir, "quality-planner-stop.json"), json(metadata.qualityStop));
           return "NEEDS_PLANNER";
         }
         if (history.length > 1) return "WORKER_EVIDENCE_MISMATCH";
-        metadata.qualityRepair = { status: "requested", sourceAttempt: attempt, nextAttempt: attempt + 1, paneId: metadata.panes.find((p: Pane) => p.name === INFO.implement.label)?.paneId, artifact: `quality-repair-${attempt}.json`, finding: sanitizedFinding };
+        metadata.qualityRepair = { status: "requested", sourceAttempt: attempt, nextAttempt: attempt + 1, paneId: metadata.panes.find((p: Pane) => p.name === INFO.implement.label)?.paneId, model: MODELS.implement, sameWorker: true, modelSwitch: false, artifact: `quality-repair-${attempt}.json`, finding: sanitizedFinding };
         await atomicWrite(path.join(artifactDir, `quality-repair-${attempt}.json`), json(sanitizedFinding));
         await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
         return "QUALITY_REPAIR";
       }
-      const gate = await runQualityGate(qualityContract, cwd, attempt, signal);
+      const gate = await runQualityGate(qualityContract, cwd, attempt, artifactDir, signal);
       const gateFile = `quality-gate-${attempt}.json`;
       await atomicWrite(path.join(artifactDir, gateFile), json(gate));
       metadata.qualityGates = [...(metadata.qualityGates ?? []), { ...gate, artifact: gateFile }];
