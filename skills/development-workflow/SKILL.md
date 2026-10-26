@@ -24,7 +24,7 @@ pstack の考え方（関連codeの理解 → domain/data shape の選択 → �
 2. **domain/data shape を選ぶ。** 状態機械、typed model、table/registry、境界のどれで表すかを実装前に決める。条件分岐の散在を増やさない。
 3. **最小の安全なscopeと成功条件を決める。** 何を変えないか、どの実ユーザー面で何を観測すれば成功かを先に書く。成功条件はcompilationや自己申告ではなく、command・出力・終了code・画面・保存値で表す。
 4. **親で計画を合意する。** 計画、変更予定path、独立check、対象のverification Skill/feature mapを`approvedPlan`と`qualityContract`へ入れる。人間レビューが必要なら既存の`planReviewMode`/`diffReviewMode`を使う。
-5. **子へ実装を委譲する。** 親は実装を重複しない。子は固定モデル（`opencode-go/deepseek-v4.1-flash`）で、明示的に渡されたこのSkill、playbook、対象checkoutのverify Skill/feature mapを読む。
+5. **子へ実装を委譲する。** 親は実装を重複しない。子は固定モデル（piでは`opencode-go/deepseek-v4.1-flash`、Claude Codeでは起動時に設定したClaudeモデル）で、明示的に渡されたこのSkill、playbook、対象checkoutのverify Skill/feature mapを読む。
 6. **実ユーザー面で検証する。** 対象のlaunch/doctor/drive/evidence/cleanup手順を使う。UIなら実操作、CLIなら実command、APIなら実request、libraryなら実呼び出し。mockはproduction境界が既に外部系を隔離している箇所だけ。
 7. **独立checkとread-only reviewを行う。** qualityContractのrequiredChecksをsandboxで実行し、Reviewerはsourceを変更せずdiffと証跡を確認する。
 8. **同一モデルで有限回修正する。** blocking findingとquality evidence違反は、同じWorkerペインへの有限回のrepairだけを許可する。モデルの切替・fallback・無限loopはしない。上限到達や同一signature再発は`NEEDS_PLANNER`/`CHANGES_REQUIRED`で止め、理由をartifactへ残す。

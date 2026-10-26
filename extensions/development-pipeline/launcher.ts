@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { INFO, MODELS, type Stage } from "./models.ts";
+import { INFO, MODELS, RUNTIME, type Stage } from "./models.ts";
 
 export const WORKFLOW_NAMES = ["feature", "bug-fix", "refactoring"] as const;
 export type WorkflowName = (typeof WORKFLOW_NAMES)[number];
@@ -133,6 +133,8 @@ export type LauncherOptions = {
   workflow: WorkflowName;
   verifySkills: string[];
   piBin?: string;
+  claudeBin?: string;
+  nodeBin?: string;
 };
 
 type WriteLauncherOptions = LauncherOptions & { promptFileContent: string };
@@ -143,6 +145,7 @@ type WriteLauncherOptions = LauncherOptions & { promptFileContent: string };
  * a pane.
  */
 export function renderLauncher(options: LauncherOptions): string {
+  if (RUNTIME === "claude") return renderClaudeLauncher(options);
   const stage = options.stage;
   const role = INFO[stage].label;
   const schema = stage === "implement" ? "worker" : "reviewer";
@@ -178,10 +181,77 @@ exec ${shellQuote(piBin)} --name ${shellQuote(options.name)} --model ${shellQuot
 `;
 }
 
+export function claudeMcpConfigPath(options: Pick<LauncherOptions, "promptFile" | "stage">) {
+  return path.join(path.dirname(options.promptFile), `${options.stage}-mcp.json`);
+}
+
+/** Tool names a Claude Code child sees from the stage-scoped Yorishiro MCP server. */
+export function claudeMcpTools(stage: Stage) {
+  return stage === "review" ? ["submit_stage_report", "run_verification_command"] : ["submit_stage_report"];
+}
+
+/**
+ * MCP server definition for one Claude Code child. The server runs the same
+ * report validator and sandbox verifier as the Pi extensions, scoped by env.
+ */
+export function renderClaudeMcpConfig(options: LauncherOptions) {
+  const stage = options.stage;
+  const env: Record<string, string> = {
+    YORISHIRO_RUNTIME: "claude",
+    YORISHIRO_MCP_TOOLS: claudeMcpTools(stage).join(","),
+    YORISHIRO_REPORT_SCHEMA: stage === "implement" ? "worker" : "reviewer",
+    YORISHIRO_REPORT_STAGE: stage,
+    YORISHIRO_ROLE: INFO[stage].label,
+    YORISHIRO_REPORT_PATH: options.reportPath,
+    YORISHIRO_EVIDENCE_ROOT: path.join(options.artifactDir, "evidence"),
+    ...(stage === "review" ? { YORISHIRO_TARGET_CWD: options.cwd } : {}),
+    ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
+    ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
+  };
+  const server = path.join(options.root, "extensions", "development-pipeline", "claude-mcp.mjs");
+  return { mcpServers: { yorishiro: { type: "stdio", command: options.nodeBin ?? process.execPath, args: ["--experimental-strip-types", "--disable-warning=ExperimentalWarning", "--disable-warning=MODULE_TYPELESS_PACKAGE_JSON", server], env } } };
+}
+
+/**
+ * Claude Code child launcher. Variadic options (`--tools`, `--allowedTools`,
+ * `--add-dir`) come first and single-value options last, so the positional
+ * prompt is never consumed as an option value.
+ */
+export function renderClaudeLauncher(options: LauncherOptions): string {
+  const stage = options.stage;
+  const claudeBin = options.claudeBin ?? process.env.YORISHIRO_CLAUDE_BIN ?? "claude";
+  const mcpTools = claudeMcpTools(stage).map(name => `mcp__yorishiro__${name}`);
+  const allowed = stage === "implement" ? ["Bash", "Edit", "Write", ...mcpTools] : mcpTools;
+  const dirs = [options.artifactDir, options.workflowSkillDir];
+  const exports = [
+    `export YORISHIRO_RUNTIME=${shellQuote("claude")}`,
+    `export YORISHIRO_REPORT_STAGE=${shellQuote(stage)}`,
+    `export YORISHIRO_ROLE=${shellQuote(INFO[stage].label)}`,
+    `export YORISHIRO_PROMPT_PATH=${shellQuote(options.promptFile)}`,
+    `export YORISHIRO_EXPECTED_MODEL=${shellQuote(MODELS[stage])}`,
+    `export YORISHIRO_WORKFLOW=${shellQuote(options.workflow)}`,
+    `export YORISHIRO_WORKFLOW_BRIEF=${shellQuote(options.workflowBrief)}`,
+  ].join("\n");
+  // The Reviewer is read-only: --restricted drops code-running tools, ignores
+  // settings files, and confines file tools to the working directories.
+  const isolation = stage === "review" ? " --restricted" : ` --setting-sources ${shellQuote("project")}`;
+  return `#!/bin/sh
+set -eu
+${exports}
+prompt=$(cat -- ${shellQuote(options.promptFile)})
+exec ${shellQuote(claudeBin)}${isolation} --strict-mcp-config --mcp-config ${shellQuote(claudeMcpConfigPath(options))} --permission-mode ${shellQuote("dontAsk")} --tools ${shellQuote(INFO[stage].tools)} --allowedTools ${shellQuote(allowed.join(","))} --add-dir ${dirs.map(shellQuote).join(" ")} --effort ${shellQuote(INFO[stage].thinking)} --name ${shellQuote(options.name)} --model ${shellQuote(MODELS[stage])} "$prompt"
+`;
+}
+
 export async function writeLauncher(options: WriteLauncherOptions) {
   const promptFile = options.promptFile;
   const launcher = path.join(path.dirname(promptFile), `${options.stage}-launcher.sh`);
   await fs.writeFile(promptFile, options.promptFileContent, { encoding: "utf8", mode: 0o700 });
+  let mcpConfig: string | undefined;
+  if (RUNTIME === "claude") {
+    mcpConfig = claudeMcpConfigPath(options);
+    await fs.writeFile(mcpConfig, JSON.stringify(renderClaudeMcpConfig(options), null, 2), { encoding: "utf8", mode: 0o600 });
+  }
   await fs.writeFile(launcher, renderLauncher(options), { encoding: "utf8", mode: 0o700 });
-  return { promptFile, launcher };
+  return { promptFile, launcher, ...(mcpConfig ? { mcpConfig } : {}) };
 }

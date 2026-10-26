@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+CLAUDE_BIN="${YORISHIRO_CLAUDE_BIN:-claude}"
+
+# Skills reach the pipeline CLI through this variable.
+export YORISHIRO_ROOT="$ROOT"
+exec "$CLAUDE_BIN" --plugin-dir "$ROOT" "$@"

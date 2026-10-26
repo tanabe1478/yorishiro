@@ -10,7 +10,7 @@ license: MIT
 
 ## 実行主体（必須）
 
-監査で見つけた修正（SKILL.md、features/、Skill所有のhelper）は、固定モデル`opencode-go/deepseek-v4.1-flash`のWorkerへ委譲して編集します。親modelやread-only reviewerが自分でfileを書きません。`development_pipeline`の`workflow: "refactoring"`または`"feature"`を使い、編集可能pathをverify Skill directoryだけに限定し、product codeを変更しない契約にします。
+監査で見つけた修正（SKILL.md、features/、Skill所有のhelper）は、パイプラインの固定Workerへ委譲して編集します（piでは`opencode-go/deepseek-v4.1-flash`、Claude Codeでは起動時に設定したClaudeモデル）。親modelやread-only reviewerが自分でfileを書きません。`development_pipeline`（Claude Codeでは`yorishiro-pipeline run`）の`workflow: "refactoring"`または`"feature"`を使い、編集可能pathをverify Skill directoryだけに限定し、product codeを変更しない契約にします。
 
 read-only並行reviewerはsourceを読み、live driveの結果を確認するだけで、fileを編集しません。固定Workerを起動できない場合は、修正を適用せず**blocked**として報告します。
 

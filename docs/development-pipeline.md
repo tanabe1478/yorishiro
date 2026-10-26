@@ -14,6 +14,8 @@
 
 Plannerは親セッション自身であり、子Plannerは起動しません。親は実装を重複しません。
 
+Claude CodeとClaudeのモデルだけで動かす場合の役割・既定モデル・違いは[Claude Codeで使う](./claude-code.md)にあります。
+
 ### 旧providerからの移行
 
 旧`openai-codex/gpt-5.6-luna`と`openai-codex/gpt-5.6-sol`はこのPi環境のcatalogに存在しません。Reviewerは同じSol modelを提供するcanonical provider `openai`へ移行しました。親のモデルは変更しません。

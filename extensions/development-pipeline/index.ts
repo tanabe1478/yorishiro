@@ -16,9 +16,9 @@ import { reviewPlan, reviewDiff, resolveReviewMode, executeDiffProcess, type Pla
 import { assertSuccessQualityState, captureFingerprintMap, changedPathsBetween, compareWorkerEvidence, hashQualityContract, validateQualityContract, qualityContractArtifact, type QualityContract, type FingerprintMap } from "./quality-contract.ts";
 import { boundUtf8, runSandboxedVerification } from "./verifier-tools.ts";
 import { createHash } from "node:crypto";
-import { INFO, MODELS, ROLE_LABELS, STAGES, roleMetadata, roleModels, type Stage } from "./models.ts";
+import { AGENT_BINARY, INFO, MODELS, ROLE_LABELS, RUNTIME, STAGES, roleMetadata, roleModels, type Stage } from "./models.ts";
 import { discoverVerifySkills, isWorkflowName, shellQuote, writeLauncher, writeWorkflowBrief, type WorkflowName } from "./launcher.ts";
-import { preflightFixedModels } from "./model-preflight.ts";
+import { preflightClaudeModels, preflightFixedModels } from "./model-preflight.ts";
 export { routeMonitorFailure } from "./pane-monitor.ts";
 export function abortBeforePaneStart() { return { status: "aborted" as const, evidence: "pipeline aborted before pane startup; no child was started; pane preserved" }; }
 export function shouldSplitForAttempt(paneId: string) { return paneId.length === 0; }
@@ -156,7 +156,7 @@ type LaunchContext = {
   verifySkills: string[];
 };
 export async function interrupt(id: string, run: (program: string, args: string[]) => Promise<CommandResult> = (program, args) => command(program, args), getPane: (paneId: string) => Promise<unknown> = paneGet): Promise<boolean> { for (let attempt = 0; attempt < 2; attempt++) { const ctrl = await run("herdr", ["pane", "send-keys", id, "ctrl+c"]); const esc = await run("herdr", ["pane", "send-keys", id, "escape"]); const waited = await run("herdr", ["agent", "wait", id, "--until", "idle", "--timeout", "2000"]); const pane = await getPane(id); const status = field(pane, "agent_status"); if (!ctrl.code && !esc.code && !waited.code && (status === "idle" || status === "unknown")) return true; await new Promise(r => setTimeout(r, 250)); } return false; }
-async function startPane(stage: Stage, name: string, prompt: string, reportPath: string, workers: string[], context: LaunchContext, onPaneCreated: (paneId: string, files: { promptFile: string; launcher: string }) => Promise<void>) {
+async function startPane(stage: Stage, name: string, prompt: string, reportPath: string, workers: string[], context: LaunchContext, onPaneCreated: (paneId: string, files: { promptFile: string; launcher: string; mcpConfig?: string }) => Promise<void>) {
   const layoutIndex = workers.length;
   const target = layoutIndex === 0 ? context.parentPane : workers.at(-1)!;
   const direction = layoutIndex === 0 ? "right" as const : "down" as const;
@@ -210,6 +210,7 @@ async function waitPane(id: string, report: string, signal: AbortSignal | undefi
     startupGraceMs: STARTUP_GRACE_MS,
     reportSettlementGraceMs: REPORT_SETTLEMENT_GRACE_MS,
     pollIntervalMs: Number(process.env.YORISHIRO_POLL_INTERVAL_MS ?? 1000),
+    agentBinary: AGENT_BINARY,
     poll: async () => {
       await command("herdr", ["agent", "wait", id, "--until", "idle", "--timeout", "1000"], undefined, signal);
       const infoResult = await command("herdr", ["pane", "process-info", "--pane", id], undefined, signal);
@@ -246,7 +247,7 @@ export default function (pi: ExtensionAPI) {
     const herdr = await command("herdr", ["status"]); if (herdr.code) throw new Error(`Herdr is unavailable: ${herdr.stderr || herdr.stdout}`);
     try { if (!(await fs.stat(cwd)).isDirectory()) throw new Error(); } catch { throw new Error(`cwd does not exist: ${cwd}`); }
     await preflightVerifierSandbox(cwd);
-    const modelPreflight = signal?.aborted ? { status: "skipped" as const, reason: "pipeline aborted before model preflight", checkedAt: now(), models: [] } : await preflightFixedModels([MODELS.implement, MODELS.review], { signal });
+    const modelPreflight = signal?.aborted ? { status: "skipped" as const, reason: "pipeline aborted before model preflight", checkedAt: now(), models: [] } : RUNTIME === "claude" ? await preflightClaudeModels([MODELS.implement, MODELS.review], { signal }) : await preflightFixedModels([MODELS.implement, MODELS.review], { signal });
     const workflowSkillDir = path.join(rootDir(), "skills", "development-workflow");
     const workflowPlaybook = path.join(workflowSkillDir, "playbooks", `${workflow}.md`);
     if (!existsSync(path.join(workflowSkillDir, "SKILL.md")) || !existsSync(workflowPlaybook)) throw new Error(`Workflow skill or playbook is unavailable: ${workflow}`);
@@ -256,7 +257,7 @@ export default function (pi: ExtensionAPI) {
     await atomicWrite(path.join(artifactDir, "request.md"), `# 依頼\n\n${task}\n\n対象: ${cwd}\n`); await atomicWrite(path.join(artifactDir, "approved-plan.md"), `# 承認済み計画\n\n${approvedPlan}\n`); await atomicWrite(path.join(artifactDir, "quality-contract.json"), json(qualityContractArtifact(qualityContract))); await snapshot(cwd, diffs, "baseline");
     const baselineFingerprint = await fingerprintSnapshot(cwd, diffs, "baseline");
     const qualityContractHash = hashQualityContract(qualityContract);
-    const metadata: any = { targetRepository: path.basename(cwd), targetPath: cwd, startedAt: now(), qualityContractHash, qualityContract: { sha256: qualityContractHash, artifact: "quality-contract.json" }, baselineFingerprint: "diffs/baseline-fingerprint.json", parentPaneId: process.env.HERDR_PANE_ID, tabId: process.env.HERDR_TAB_ID, workspaceId: process.env.HERDR_WORKSPACE_ID, limitation: "baseline fingerprintとの差分で今回変化したpathを機械的に照合します。", models: roleModels(), roles: roleMetadata(), modelPreflight, modelGuard: { enabled: true, boundary: "pi tool_call", limitation: "意図的に敵対的なWorker、改変されたPi、任意のnested shellは防がない" }, workflow: { name: workflow, skill: path.relative(rootDir(), workflowSkillDir), playbook: path.relative(rootDir(), workflowPlaybook), briefs: { implement: path.basename(workflowBriefs.implement), review: path.basename(workflowBriefs.review) }, targetVerifySkills: verifySkills.map(dir => path.relative(cwd, dir)) }, evidenceRoot: "evidence", planning: { status: "pending", mode: planReviewMode, source: "親Plannerセッション", artifact: "approved-plan.md" }, humanReview: { planMode: planReviewMode, diffMode: diffReviewMode }, stages: Object.fromEntries(stages.filter(s => s !== "plan").map(s => [s, { status: "pending", attempts: [] }])), panes: [], repairCycles: 0, qualityGates: [], qualityContractBaselineCount: Object.keys(baselineFingerprint).length };
+    const metadata: any = { targetRepository: path.basename(cwd), targetPath: cwd, startedAt: now(), qualityContractHash, qualityContract: { sha256: qualityContractHash, artifact: "quality-contract.json" }, baselineFingerprint: "diffs/baseline-fingerprint.json", parentPaneId: process.env.HERDR_PANE_ID, tabId: process.env.HERDR_TAB_ID, workspaceId: process.env.HERDR_WORKSPACE_ID, limitation: "baseline fingerprintとの差分で今回変化したpathを機械的に照合します。", runtime: RUNTIME, models: roleModels(), roles: roleMetadata(), modelPreflight, modelGuard: RUNTIME === "claude" ? { enabled: false, boundary: "claude --model", limitation: "子はClaude Codeの--modelで固定して起動する。tool_call境界のmodel guardはなく、子ペインのTUIで人間が/modelを使えば変更できる" } : { enabled: true, boundary: "pi tool_call", limitation: "意図的に敵対的なWorker、改変されたPi、任意のnested shellは防がない" }, workflow: { name: workflow, skill: path.relative(rootDir(), workflowSkillDir), playbook: path.relative(rootDir(), workflowPlaybook), briefs: { implement: path.basename(workflowBriefs.implement), review: path.basename(workflowBriefs.review) }, targetVerifySkills: verifySkills.map(dir => path.relative(cwd, dir)) }, evidenceRoot: "evidence", planning: { status: "pending", mode: planReviewMode, source: "親Plannerセッション", artifact: "approved-plan.md" }, humanReview: { planMode: planReviewMode, diffMode: diffReviewMode }, stages: Object.fromEntries(stages.filter(s => s !== "plan").map(s => [s, { status: "pending", attempts: [] }])), panes: [], repairCycles: 0, qualityGates: [], qualityContractBaselineCount: Object.keys(baselineFingerprint).length };
     await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
     const parentPaneId = metadata.parentPaneId as string;
     const launchContext: LaunchContext = { cwd, artifactDir, root: rootDir(), parentPane: parentPaneId, workflow, workflowSkillDir, workflowPlaybook, verifySkills };
@@ -297,7 +298,7 @@ export default function (pi: ExtensionAPI) {
             const started = await startPane(stage, pane.name, text, pendingReport, workerIds, launchContext, async (paneId, files) => {
               pane.paneId = paneId;
               record.paneId = paneId;
-              metadata.launchers = [...(metadata.launchers ?? []), ...[files.launcher, files.promptFile].map(file => path.basename(file))];
+              metadata.launchers = [...(metadata.launchers ?? []), ...[files.launcher, files.promptFile, ...(files.mcpConfig ? [files.mcpConfig] : [])].map(file => path.basename(file))];
               await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
             });
             metadata.layout = { ...(metadata.layout ?? {}), intended: { parentPaneId, roleOrder: ROLE_LABELS }, actual: started.layout, error: undefined };

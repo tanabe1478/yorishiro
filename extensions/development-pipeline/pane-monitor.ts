@@ -16,14 +16,14 @@ export async function routeMonitorFailure(state: PaneMonitorState, stop: () => P
 }
 
 /** Herdr process-info may be nested, but the executable identity must be exact. */
-export function hasExactPiIdentity(value: unknown): boolean {
+export function hasExactPiIdentity(value: unknown, binary = "pi"): boolean {
   if (!value || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
-  if (record.argv0 === "pi") return true;
+  if (record.argv0 === binary) return true;
   // Newer Herdr returns foreground_processes:[{ argv: ["pi", ...], ... }]
   // with no argv0. Only argv[0] is authoritative; cmdline/name are display data.
-  if (Array.isArray(record.argv) && record.argv[0] === "pi") return true;
-  return Object.values(record).some(hasExactPiIdentity);
+  if (Array.isArray(record.argv) && record.argv[0] === binary) return true;
+  return Object.values(record).some(child => hasExactPiIdentity(child, binary));
 }
 
 const QUIESCENT_STATUSES = new Set(["idle", "done", "completed"]);
@@ -50,6 +50,8 @@ export async function monitorPane(options: {
   pollIntervalMs?: number;
   reportSettlementGraceMs?: number;
   reportMissingGraceMs?: number;
+  /** argv[0] of the child agent: `pi` or `claude`. */
+  agentBinary?: string;
 }): Promise<PaneMonitorState> {
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? ((milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds)));
@@ -74,7 +76,7 @@ export async function monitorPane(options: {
       continue;
     }
     invalidProcessInfoPolls = 0;
-    const hasPi = hasExactPiIdentity(observation.processInfo);
+    const hasPi = hasExactPiIdentity(observation.processInfo, options.agentBinary ?? "pi");
     if (hasPi) state = "monitoring";
     if (state === "monitoring") {
       if (!hasPi) return "exited";
@@ -100,7 +102,9 @@ export async function monitorPane(options: {
           reportMissingSince = undefined;
         }
       }
-      await options.onUpdate(`pane is ${observation.status ?? "unknown"}`);
+      // Claude Code reports permission and workspace-trust prompts as "blocked".
+      // Waiting for the human is expected; the stage deadline still applies.
+      await options.onUpdate(observation.status?.toLowerCase() === "blocked" ? "子ペインが人間の確認待ちです（Herdr status: blocked）。ペインの表示を確認してください" : `pane is ${observation.status ?? "unknown"}`);
     } else if (now() >= startupDeadline) {
       return "startup-timeout";
     } else {

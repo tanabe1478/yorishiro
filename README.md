@@ -42,6 +42,7 @@ cd work/example
 | observer の起動、通知、Web ダッシュボード、Claude Code hook | [docs/observer.md](docs/observer.md) |
 | 検証Skillの作り方・保守・Yorishiro 自身の検証範囲 | [docs/verification.md](docs/verification.md) |
 | pstack から何を取り込み、何を採らなかったか | [docs/pstack-adoption.md](docs/pstack-adoption.md) |
+| pi を使わず Claude Code と Claude のモデルだけで使う | [docs/claude-code.md](docs/claude-code.md) |
 
 常設の原則は [`AGENTS.md`](AGENTS.md)、実行時の手順は `skills/*/SKILL.md`、判定の閾値や設定の全項目は [docs/observer-reference.md](docs/observer-reference.md) にあります。
 

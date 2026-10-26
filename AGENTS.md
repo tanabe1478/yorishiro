@@ -24,6 +24,6 @@ At the start of a task, read `AGENTS.local.md` when it exists. It contains priva
 - Keep generated artifacts and working repositories out of Git.
 - Keep entry points short and apply progressive disclosure: read the detailed docs and Skills only when the current task needs them.
 
-For non-trivial feature, bug-fix, or refactoring work, read `skills/development-workflow/SKILL.md` and the matching playbook before planning. When creating or auditing a project-local verification Skill, read `skills/create-verification-skill/SKILL.md` or `skills/maintain-verification-skill/SKILL.md`. Delegate all generated verification files to the fixed DeepSeek Worker.
+For non-trivial feature, bug-fix, or refactoring work, read `skills/development-workflow/SKILL.md` and the matching playbook before planning. When creating or auditing a project-local verification Skill, read `skills/create-verification-skill/SKILL.md` or `skills/maintain-verification-skill/SKILL.md`. Delegate all generated verification files to the pipeline's fixed Worker.
 
 Do not add a Skill or Extension speculatively. Introduce one after a repeated need or a concrete enforcement requirement appears.

@@ -101,3 +101,42 @@ export async function preflightFixedModels(models: readonly string[], options: {
   }
   return { status: "ready" as const, checkedAt: new Date().toISOString(), models: checked };
 }
+
+/**
+ * Parse `claude auth status` output, keeping only non-identifying readiness
+ * fields (no email, organization, or credential material).
+ */
+export function parseClaudeAuthStatus(output: string): { loggedIn: boolean; authMethod?: string; apiProvider?: string; subscriptionType?: string } {
+  let parsed: unknown;
+  try { parsed = JSON.parse(output.trim()); } catch { return { loggedIn: false }; }
+  if (!parsed || typeof parsed !== "object") return { loggedIn: false };
+  const value = parsed as Record<string, unknown>;
+  return {
+    loggedIn: value.loggedIn === true,
+    ...(typeof value.authMethod === "string" ? { authMethod: value.authMethod } : {}),
+    ...(typeof value.apiProvider === "string" ? { apiProvider: value.apiProvider } : {}),
+    ...(typeof value.subscriptionType === "string" ? { subscriptionType: value.subscriptionType } : {}),
+  };
+}
+
+/**
+ * Check Claude Code readiness before any child pane is created. Claude Code
+ * has no offline catalog, so the model ids are recorded as configured but
+ * their availability is only proven when a child starts.
+ */
+export async function preflightClaudeModels(models: readonly string[], options: { run?: AuthRunner; claudeBin?: string; signal?: AbortSignal; env?: NodeJS.ProcessEnv } = {}) {
+  const claudeBin = options.claudeBin ?? process.env.YORISHIRO_CLAUDE_BIN ?? "claude";
+  const env = options.env ?? process.env;
+  const run = options.run ?? ((program, args, signal) => runProcess(program, args, signal));
+  const result = await run(claudeBin, ["auth", "status"], options.signal);
+  const auth = parseClaudeAuthStatus(result.stdout);
+  const apiKeyEnv = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"].filter(name => !!env[name]);
+  if (!auth.loggedIn && apiKeyEnv.length === 0) throw new Error("MODEL_PREFLIGHT_FAILED: Claude Code is not logged in (claude auth status)");
+  return {
+    status: "ready" as const,
+    checkedAt: new Date().toISOString(),
+    runtime: "claude" as const,
+    auth: { ...auth, apiKeyEnv, ...(["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"].some(name => !!env[name]) ? { cloudProviderEnv: true } : {}) },
+    models: [...new Set(models)].map(model => ({ model, availability: "unverified-until-child-start" })),
+  };
+}

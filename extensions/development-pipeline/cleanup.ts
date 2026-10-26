@@ -11,8 +11,10 @@ export const CLEANUP_ORDER = ["Review · Sol", "Verify · Terra", "Implement · 
 export const LEGACY_MODERN_CLEANUP_ORDER = ["Reviewer · Sol", "Worker · Luna"] as const;
 /** Current two-role layout. */
 export const CURRENT_CLEANUP_ORDER = ["Reviewer · Sol", "Worker · DeepSeek"] as const;
-const ALL_ROLES = new Set<string>([...CLEANUP_ORDER, ...LEGACY_MODERN_CLEANUP_ORDER, ...CURRENT_CLEANUP_ORDER]);
-export type CleanupMode = "current" | "legacy-modern" | "legacy";
+/** Two-role layout of the Claude Code runtime. */
+export const CLAUDE_CLEANUP_ORDER = ["Reviewer · Claude", "Worker · Claude"] as const;
+const ALL_ROLES = new Set<string>([...CLEANUP_ORDER, ...LEGACY_MODERN_CLEANUP_ORDER, ...CURRENT_CLEANUP_ORDER, ...CLAUDE_CLEANUP_ORDER]);
+export type CleanupMode = "current" | "legacy-modern" | "legacy" | "claude";
 export type CleanupResolution = { status: "ok"; mode: CleanupMode; order: readonly string[] } | { status: "ambiguous"; recognized: string[] };
 
 /**
@@ -26,8 +28,10 @@ export function resolveCleanupMode(panes: Array<{ name?: string }>): CleanupReso
   const legacyModern = names.has("Worker · Luna");
   const legacy = CLEANUP_ORDER.some(name => names.has(name));
   const modernReviewer = names.has("Reviewer · Sol");
-  if ([current, legacyModern, legacy].filter(Boolean).length > 1 || (modernReviewer && legacy)) return { status: "ambiguous", recognized: [...names].filter(name => ALL_ROLES.has(name)) };
+  const claude = CLAUDE_CLEANUP_ORDER.some(name => names.has(name));
+  if ([current, legacyModern, legacy, claude].filter(Boolean).length > 1 || (modernReviewer && (legacy || claude))) return { status: "ambiguous", recognized: [...names].filter(name => ALL_ROLES.has(name)) };
   if (current) return { status: "ok", mode: "current", order: CURRENT_CLEANUP_ORDER.filter(name => names.has(name)) };
+  if (claude) return { status: "ok", mode: "claude", order: CLAUDE_CLEANUP_ORDER.filter(name => names.has(name)) };
   if (legacyModern) return { status: "ok", mode: "legacy-modern", order: LEGACY_MODERN_CLEANUP_ORDER.filter(name => names.has(name)) };
   if (legacy) return { status: "ok", mode: "legacy", order: CLEANUP_ORDER };
   return { status: "ok", mode: "current", order: CURRENT_CLEANUP_ORDER.filter(name => names.has(name)) };

@@ -10,7 +10,7 @@ license: MIT
 
 ## 実行主体（必須）
 
-生成するSkill、feature map、harness、helperの**すべてのfile編集**は、固定モデル`opencode-go/deepseek-v4.1-flash`のWorkerへ委譲します。親modelが自分でfileを書きません。`development_pipeline`を使い、`workflow: "feature"`、生成対象path、成功条件、実行する検証を`qualityContract`へ入れます。read-only Reviewerは独立確認だけを行い、fileを書きません。
+生成するSkill、feature map、harness、helperの**すべてのfile編集**は、パイプラインの固定Workerへ委譲します（piでは`opencode-go/deepseek-v4.1-flash`、Claude Codeでは起動時に設定したClaudeモデル）。親modelが自分でfileを書きません。`development_pipeline`（Claude Codeでは`yorishiro-pipeline run`）を使い、`workflow: "feature"`、生成対象path、成功条件、実行する検証を`qualityContract`へ入れます。read-only Reviewerは独立確認だけを行い、fileを書きません。
 
 委譲環境が無い、または固定Workerを起動できない場合は、生成物を書かずに**blocked**として理由を報告します。親modelによる代筆は、このSkillの完了条件を満たしません。
 
