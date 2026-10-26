@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,7 +20,7 @@ try {
   await mkdir(path.join(safeSkill, "features"), { recursive: true });
   await writeFile(path.join(safeSkill, "SKILL.md"), "---\nname: verify-demo\ndescription: demo\n---\n# Demo\n");
   await writeFile(path.join(safeSkill, "features", "README.md"), "# Demo map\n");
-  assert.deepEqual(await discoverVerifySkills(safeCwd), [safeSkill]);
+  assert.deepEqual(await discoverVerifySkills(safeCwd), [await realpath(safeSkill)], "discovered skills are canonical paths");
 
   const outside = path.join(base, "outside");
   const outsideSkill = path.join(outside, ".pi", "skills", "verify-evil");

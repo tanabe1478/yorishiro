@@ -33,7 +33,8 @@ try {
   assert.ok(blockedJson.checks.some(check => check.name === "pi" && !check.ok && check.required));
 
   const realPi = spawnSync("sh", ["-c", "command -v pi"], { encoding: "utf8" }).stdout.trim();
-  const degraded = invoke(["doctor", "--json"], { YORISHIRO_PI_BIN: realPi, PATH: path.dirname(realPi) });
+  // pi is a `#!/usr/bin/env node` script, so keep node resolvable while hiding herdr.
+  const degraded = invoke(["doctor", "--json"], { YORISHIRO_PI_BIN: realPi, PATH: [path.dirname(realPi), path.dirname(process.execPath)].join(path.delimiter) });
   assert.equal(degraded.status, 0, degraded.stderr);
   const degradedJson = JSON.parse(degraded.stdout);
   assert.equal(degradedJson.status, "degraded");
