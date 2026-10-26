@@ -9,59 +9,34 @@ description: Run the approved development pipeline in stable Herdr worker panes 
 
 ## 実行条件
 
-親PiがHerdr内で動作し、`HERDR_PANE_ID`、`HERDR_TAB_ID`、`HERDR_WORKSPACE_ID`、`HERDR_SOCKET_PATH`が利用できること。対象リポジトリはread-only検証sandboxを利用できる必要がある。未対応環境や`/tmp`配下の対象は開始前に拒否される。
+- Herdr内の親Piで、`HERDR_PANE_ID`、`HERDR_TAB_ID`、`HERDR_WORKSPACE_ID`、`HERDR_SOCKET_PATH`が使えること。
+- 対象リポジトリがread-only検証sandboxを使えること。未対応環境、sandbox未導入、`/tmp`配下の対象は開始前に拒否される。
+- 開始時に親以外のペインがある場合は`LAYOUT_OCCUPIED`として停止する。
 
-## 役割とペイン
+## 役割
 
-- Planner: 親セッション。要件、計画、Reviewer指摘の採否を判断する。
-- Worker · DeepSeek: `opencode-go/deepseek-v4.1-flash`、既定thinking `high`。実装、テスト、ビルド、動作確認、修正を行う。
-- Reviewer · Sol: `openai/gpt-5.6-sol`、既定thinking `medium`。read-onlyレビューとsandbox検証を行う。
+- Planner: 親セッション。要件、計画、Reviewer指摘の採否。
+- Worker · DeepSeek: `opencode-go/deepseek-v4.1-flash`（thinking `high`）。実装、test、build、動作確認、修正。
+- Reviewer · Sol: `openai/gpt-5.6-sol`（thinking `medium`）。read-only reviewとsandbox検証。
 
-`workflow`には`feature`（既定）、`bug-fix`、`refactoring`を指定する。子は`workflow-brief-<stage>.md`、`development-workflow`、対応playbook、対象checkoutの`.pi/skills/verify-*/`とfeature mapを明示`--skill`で読む。親だけがworkflowを知る状態にはしない。
+`workflow`は`feature`（既定）、`bug-fix`、`refactoring`。子は`workflow-brief-<stage>.md`、`development-workflow`、対応playbook、`.pi/skills/verify-*/`を明示`--skill`で読むため、親だけがworkflowを知る状態にはならない。通常実行は現在タブを親55%・右45%（Worker上／Reviewer下）へ分割し、修正・再reviewでは同じペインを使う。子は再帰起動できない。
 
-通常実行では別タブを作らず、呼出元の現在タブを親55%、右45%とし、右列をWorker上／Reviewer下へ分割する。子は可視の通常Pi TUIであり、修正・再レビューでは同じペインを再利用する。子はYorishiroのSkillとExtensionを自動ロードせず、再帰起動できない。修正版Extensionを新規ロードする隔離E2Eだけは使い捨てタブを許可し、確認後に閉じる。
+## 手順
 
-## 報告と判定
+1. 親で計画と`qualityContract`を確定する。
+2. `development_pipeline`を実行する。固定modelはpane起動前に`pi auth check`とcatalogで確認され、`model-guard.ts`が`tool_call`境界で不一致・不明を拒否する。
+3. Workerの`COMPLETED`／`BLOCKED` reportを中央validatorが検査する。契約IDのexact一致、実diff一致、prefix遵守が必須で、report各fieldの仕様は[詳細](../../docs/development-pipeline.md#qualitycontractとreport)だけに置く。
+4. requiredChecksをsandbox snapshotで実行する。1件でも失敗すれば`QUALITY_GATE_FAILED`。
+5. Reviewer判定（`APPROVED`／`APPROVED_WITH_NOTES`／`CHANGES_REQUESTED`／`NEEDS_PLANNER`）に従い、blocking findingだけをsanitizedでWorkerへ返す。
+6. 成功時だけ`cleanupMode`（既定`ask`）で整理する。失敗・中断・`NEEDS_PLANNER`・`CHANGES_REQUIRED`ではペインと証跡を残し、`development_pipeline_reset`で別途resetする。
 
-WorkerとReviewerは`submit_stage_report`で構造化JSONを提出する。中央validatorを通過しない報告は失敗として扱う。`development_pipeline`の必須`qualityContract`は、非空でIDが一意な`planItems`／`requiredChecks`と任意の`allowedPathPrefixes`から成ります。契約はSHA-256で`quality-contract.json`と`run.json`へ記録します。
+## 安全境界
 
-`COMPLETED` reportは契約の全項目を一度ずつ示す日本語の`completedPlanItems`、repository-relativeで一意な`changedPaths`、allowed prefix遵守を必須とする。baselineとWorker終了時のgit fingerprint差分をexact set照合する。`BLOCKED`は`completedPlanItems`を完了済みcontract IDのsubsetとし（unknown／duplicate禁止）、`changedPaths`はactual exact、prefixは必須とする。正当なBLOCKEDでは独立checksとReviewerを起動せず`IMPLEMENTATION_BLOCKED`とするが、unknown item、虚偽path、prefix違反は`WORKER_EVIDENCE_MISMATCH`である。
+- 修正は同一Workerペインで`maxReviewCycles`（既定2、上限3。旧`maxRepairCycles`は互換入力）まで。モデル切替・fallbackはせず、再発や上限到達は`NEEDS_PLANNER`／`CHANGES_REQUIRED`で止める。
+- 証跡は`$YORISHIRO_EVIDENCE_DIR`からorchestratorが上限付きで回収する。Reviewerは元checkoutを書き換えられない。
+- `planReviewMode`／`diffReviewMode`（`ask`既定）の人間gateを尊重し、commit・pushは行わない。
+- model guardは敵対的Workerやnested shellへのsecurity sandboxではない。
 
-Quality evidence不一致の初回だけ、違反種別とcontract item/check IDから作るstable signatureおよびpath本文を含まないsanitized findingを、同じWorkerペインへ送りquality repairを1回許可する。この時点ではReviewerを起動しない。同じsignatureが再発したら同一Workerの有限repairを使い切ったものとして、モデル切替・fallbackを行わず`NEEDS_PLANNER`で停止し、`quality-planner-stop.json`と`run.json`へ理由を残す。異なる違反が2回目に出たら`WORKER_EVIDENCE_MISMATCH`で終端する。追加fallbackや無限loopは禁止する。
+## 詳細
 
-COMPLETEDのWorker終了後、Reviewer開始前にrequiredChecksをshellなしで順次実行します。対象checkoutは使い捨てsnapshotへ複製し、そのsnapshotだけを書き込み可能にしたkernel sandboxを使うため、ビルドやfixture生成を許しつつ元checkoutはread-onlyです。結果（argv、exit、timeout/cancel、出力SHA-256、最大4KiBの診断抜粋、要約）は`quality-gate-N.json`へ保存し、1件でも失敗すれば`QUALITY_GATE_FAILED`です。修正attemptごとに再実行します。validator通過したCOMPLETED event、当該attemptのquality gate eventとartifactが揃わない限り`SUCCESS`にしてはならない。
-
-起動前に`pi auth check --model ... --json --no-refresh`と`pi --offline --list-models`で固定modelのcatalog存在とprovider readinessを確認します。credentialは保存・表示しません。子launcherは`--model`で固定し、`model-guard.ts`が`tool_call`境界でmodel不一致・不明を拒否します。これは偶発的な選択・cycle・restoreを止めるguardであり、敵対的Workerやnested shellへのsecurity sandboxではありません。
-
-Reviewer判定:
-
-- `APPROVED`: 成功
-- `APPROVED_WITH_NOTES`: noteを残して成功
-- `CHANGES_REQUESTED`: blocking findingだけをWorkerへ渡す
-- `NEEDS_PLANNER`: 自動処理を止め、親Plannerへ戻す
-
-Workerへはsanitized findingだけを渡し、Reviewerのsummary、note、生出力、transcriptを渡さない。同じ指摘IDが続いた場合や、修正後に`discovery: initial`の新規blockingが追加された場合は`NEEDS_PLANNER`で止める。`repair_regression`と、理由を明示した`previously_missed`は新規指摘として許可する。
-
-`maxReviewCycles`は既定2、上限3。旧`maxRepairCycles`は互換入力であり、両方指定時は`maxReviewCycles`を優先する。上限到達時は`CHANGES_REQUIRED`で終了する。
-
-## 証跡と安全性
-
-`artifacts/<repository>/<run-id>/`へ依頼、承認済み計画、stage別workflow brief、quality contract、各attemptのreport、quality gate、terminal記録、baseline／stage別status・diff・fingerprint、`model-guard.log`、`run.json`を保存する。baseline fingerprintとの差分で既存dirty pathの内容変更、untracked・deleted・renameも検出する。
-
-検証証跡は、checkがsnapshot内の`$YORISHIRO_EVIDENCE_DIR`へ書いた通常fileを、teardown前にrun artifactの`evidence/`へ回収する。snapshotの`.yorishiro-evidence`は毎回空から作成する。symlink、special file、path escape、上限超過はskipし、`skippedCount`/`truncated`で可視化する。Reviewerの`run_verification_command`もorchestrator所有の証跡先を使い、modelが任意のwrite先を指定できない。
-
-起動、process-info、timeout、中断、欠落・不正reportはfail closedで扱う。監視はHerdrの特定status名だけに依存しない。exact Pi identityとdurable reportを必須とし、identityは`argv0 === "pi"`またはHerdr 0.9の`foreground_processes[].argv[0] === "pi"`だけを受理し、path・引数・`cmdline`/`name`だけの一致は拒否します。監視のagent待機は`--until`を使います。reportがないまま既知のquiescent status（`idle`／`done`／`completed`）になった場合は、active観測済みなら直ちに、起動直後からquiescentならstartup grace後に有限のreport-missing猶予を計測して失敗します。猶予中のreportは通常settle、active復帰はtimer解除とし、未知・undefined statusだけでは欠落と断定しません。report-missing時はterminal transcript、heartbeat、`run.json`へ診断を残してペインを保持します。transcriptはagent readが終了済みagentで失敗した場合に`pane read --raw`へfallbackします。待機理由と時刻を`run.json` heartbeatへ継続記録する。中断時は`ctrl+c`と`escape`で停止を試み、証跡とペインを残す。Reviewerのコマンドも使い捨ての書き込み可能snapshot内だけで実行し、元checkoutへの書き込みはkernel sandboxで拒否する。
-
-## cleanup
-
-成功時だけ`cleanupMode`を適用する。
-
-- `ask`（既定）: UI確認後に閉じる
-- `on-success`: 成功時に閉じる
-- `never`: 残す
-
-失敗、中断、`NEEDS_PLANNER`、`CHANGES_REQUIRED`では自動cleanupしない。成功用cleanupとは別の`development_pipeline_reset`を、canonical runDir・記録済みpane identity・workspace/tab・親保護・idle確認・明示confirmを満たす場合だけ使える。開始時に親以外のペインがある場合は`LAYOUT_OCCUPIED`として対象pane IDを記録して安全停止し、他人のペインを自動削除しない。後から`development_pipeline_cleanup`を使える。現行は`Reviewer · Sol`→`Worker · DeepSeek`、旧2役は`Reviewer · Sol`→`Worker · Luna`、旧3役は`Review · Sol`→`Verify · Terra`→`Implement · Luna`の順で処理し、混在runはmode ambiguityとして閉じない。親、非idle、別runのペインを保護する。
-
-## 人間レビュー
-
-`planReviewMode`と`diffReviewMode`は`ask`（既定）、`required`、`skip`から選びます。計画レビューは子ペイン起動前、差分レビューはReviewer完了後かつcleanup前にforegroundで実行されます。結果と計画SHA-256は`plan-review.json`／`diff-review.json`へ保存されます。`required`の拒否・利用不可・timeout・中断は安全側で停止し、差分の変更要求は`HUMAN_CHANGES_REQUESTED`になります。commit・pushは自動実行しません。
+正確な状態遷移、既定値、evidence回収上限、監視（`argv0`／`foreground_processes`、`--until`、report-missing猶予）、cleanup/reset互換、旧providerからの移行は、必要なときに[`../../docs/development-pipeline.md`](../../docs/development-pipeline.md)を読む。workflowの進め方は[`../development-workflow/SKILL.md`](../development-workflow/SKILL.md)。全文を常時先読みしない。
