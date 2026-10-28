@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -141,6 +141,30 @@ try {
   assert.equal(reviewerMcp.mcpServers.yorishiro.env.YORISHIRO_EVIDENCE_ROOT, path.join(artifactDir, "evidence"));
   assert.deepEqual(renderClaudeMcpConfig({ ...common, stage: "implement", name: "x", promptFile: path.join(artifactDir, "p.md"), reportPath: "/r.json", workflowBrief: "/b.md" }).mcpServers.yorishiro.env.YORISHIRO_RUNTIME, "claude");
   assert.doesNotMatch(renderLauncher({ ...common, stage: "implement", name: "x", promptFile: "/p.md", reportPath: "/r.json", workflowBrief: "/b.md" }), / -e | --no-extensions| --skill /, "Pi-only flags must not leak into Claude launchers");
+
+  // bin/yorishiro-claude: Claude Code finds AGENTS.md itself below the harness;
+  // anywhere else the launcher must hand the instructions over.
+  const parentLauncher = async from => {
+    const run = spawnSync(path.join(root, "bin", "yorishiro-claude"), ["--model", "m"], { cwd: from, encoding: "utf8", env: { ...process.env, YORISHIRO_CLAUDE_BIN: fakeClaude } });
+    assert.equal(run.status, 0, run.stderr);
+    return JSON.parse(await readFile(argvLog, "utf8"));
+  };
+  const realRoot = await realpath(root);
+  assert.deepEqual(await parentLauncher(root), ["--plugin-dir", realRoot, "--model", "m"]);
+  assert.deepEqual(await parentLauncher(path.join(root, "work")), ["--plugin-dir", realRoot, "--model", "m"]);
+  const outside = await parentLauncher(cwd);
+  assert.deepEqual([outside[0], outside[1], outside[2], ...outside.slice(-2)], ["--plugin-dir", realRoot, "--append-system-prompt", "--model", "m"]);
+  assert.ok(outside[3].includes(`Yorishiro ハーネス（${realRoot}）`), "the prompt names the harness root for relative paths");
+  assert.ok(outside[3].includes(await readFile(path.join(root, "AGENTS.md"), "utf8").then(text => text.trim())), "AGENTS.md is appended verbatim");
+  // Linked onto PATH (through a relative link and a link to that link), the
+  // launcher must still find the harness rather than the link's directory.
+  const pathBin = path.join(base, "path-bin");
+  await mkdir(pathBin, { recursive: true });
+  await symlink(path.relative(await realpath(pathBin), path.join(realRoot, "bin", "yorishiro-claude")), path.join(pathBin, "yorishiro-claude-relative"));
+  await symlink(path.join(pathBin, "yorishiro-claude-relative"), path.join(pathBin, "yorishiro-claude"));
+  const linked = spawnSync(path.join(pathBin, "yorishiro-claude"), ["--model", "m"], { cwd, encoding: "utf8", env: { ...process.env, YORISHIRO_CLAUDE_BIN: fakeClaude } });
+  assert.equal(linked.status, 0, linked.stderr || String(linked.error));
+  assert.deepEqual(JSON.parse(await readFile(argvLog, "utf8")), outside, "a PATH symlink behaves like the real launcher");
 } finally {
   await rm(base, { recursive: true, force: true });
 }

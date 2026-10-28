@@ -1,9 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# Follow symlinks so the launcher also works when linked onto PATH.
+source="${BASH_SOURCE[0]}"
+while [[ -L "$source" ]]; do
+  dir="$(cd -- "$(dirname -- "$source")" && pwd -P)"
+  source="$(readlink -- "$source")"
+  [[ "$source" == /* ]] || source="$dir/$source"
+done
+ROOT="$(cd -- "$(dirname -- "$source")/.." && pwd -P)"
 CLAUDE_BIN="${YORISHIRO_CLAUDE_BIN:-claude}"
 
 # Skills reach the pipeline CLI through this variable.
 export YORISHIRO_ROOT="$ROOT"
-exec "$CLAUDE_BIN" --plugin-dir "$ROOT" "$@"
+
+# Claude Code loads AGENTS.md from the working directory and its parents, so
+# below ROOT the harness instructions arrive on their own. Elsewhere, append
+# them (and the untracked local notes) to the system prompt.
+harness_args=()
+case "$(pwd -P)/" in
+  "$ROOT"/*) ;;
+  *)
+    prompt="# Yorishiro ハーネス
+
+このセッションは Yorishiro ハーネス（${ROOT}）から起動されている。以下は Yorishiro の指示で、文中の相対パスは ${ROOT} を基準に読む。\`work/\` 配下の作業リポジトリについての記述は、現在の作業ディレクトリにも当てはめる。
+
+$(cat "$ROOT/AGENTS.md")"
+    if [[ -f "$ROOT/AGENTS.local.md" ]]; then
+      prompt+="
+
+# AGENTS.local.md
+
+$(cat "$ROOT/AGENTS.local.md")"
+    fi
+    harness_args=(--append-system-prompt "$prompt")
+    ;;
+esac
+
+exec "$CLAUDE_BIN" --plugin-dir "$ROOT" ${harness_args[@]+"${harness_args[@]}"} "$@"

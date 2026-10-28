@@ -10,7 +10,26 @@ pi を使わず、Claude Code と Claude のモデルだけで Yorishiro を使�
 ./bin/yorishiro-claude
 ```
 
-`claude --plugin-dir <yorishiro>` を実行し、`skills/` の Skill を plugin として読み込みます。あわせて、Skill が CLI を呼ぶための `YORISHIRO_ROOT` を設定します。作業リポジトリは pi 版と同じく `work/` の下に置けます。
+`claude --plugin-dir <yorishiro>` を実行し、`skills/` の Skill を plugin として読み込みます。あわせて、Skill が CLI を呼ぶための `YORISHIRO_ROOT` を設定します。残りの引数はそのまま `claude` に渡します。
+
+起動したディレクトリが作業場所になります。作業リポジトリは `work/` の下に置いても、任意のディレクトリにあってもかまいません。
+
+```bash
+cd ~/src/example
+~/path/to/yorishiro/bin/yorishiro-claude
+```
+
+PATH の通ったディレクトリにシンボリックリンクを置けば、どこでも `yorishiro-claude` だけで起動できます。ランチャーはリンクをたどって yorishiro の場所を見つけます。
+
+```bash
+ln -s ~/path/to/yorishiro/bin/yorishiro-claude ~/.local/bin/yorishiro-claude
+cd ~/src/example
+yorishiro-claude
+```
+
+- yorishiro の中（`work/` の下を含む）では、Claude Code が親ディレクトリをたどって yorishiro の `AGENTS.md` を自分で読み込みます。
+- それ以外の場所では、ランチャーが `AGENTS.md`（あれば `AGENTS.local.md` も）を `--append-system-prompt` で渡します。文中の相対パスは yorishiro を基準に読むよう添えます。作業ディレクトリにある `CLAUDE.md` などのプロジェクトの指示も、通常どおり読み込まれます。
+- パイプラインの対象は、入力で `cwd` を省いた場合、CLI を実行したディレクトリ（ふつうは起動したディレクトリ）です。証跡は、どこで起動しても yorishiro の `artifacts/<対象ディレクトリ名>/` に保存されます。
 
 ## 開発パイプライン
 
@@ -50,7 +69,7 @@ Claude Code には pi のツール登録の仕組みがないので、パイプ�
 
 ### 初回の信頼確認
 
-Claude Code は、初めて開くフォルダで「このフォルダを信頼するか」を確認します。子がこの確認で止まると、Herdr はペインを `blocked` と表示し、パイプラインは「人間の確認待ち」と進捗に出したまま待ちます（stage の期限は既定で 30 分です）。ペインで承認すれば続きます。前もって対象リポジトリで一度 `claude` を起動して承認しておけば、確認は出ません。
+Claude Code は、初めて開くフォルダで「このフォルダを信頼するか」を確認します。子がこの確認で止まると、Herdr はペインを `blocked` と表示し、パイプラインは「人間の確認待ち」と進捗に出したまま待ちます（stage の期限は既定で 30 分です）。ペインで承認すれば続きます。対象リポジトリで `yorishiro-claude` を起動したときに親の確認で承認していれば、同じディレクトリで動く子には確認は出ません。
 
 ### 利用枠
 
