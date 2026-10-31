@@ -1,5 +1,5 @@
 export type PaneMonitorState = "settled" | "exited" | "report-missing" | "startup-timeout" | "timeout" | "process-info-failure" | "aborted";
-export type PanePoll = { status?: string; processInfo: unknown; processInfoValid: boolean };
+export type PanePoll = { status?: string; processInfo: unknown; processInfoValid: boolean; /** Bash-tool shells still running under the agent (Claude runtime only). */ backgroundShells?: number };
 export type MonitorStopResult = { stopped: boolean; evidence: string };
 
 export async function stopAfterMonitorFailure(state: PaneMonitorState, stop: () => Promise<boolean>): Promise<MonitorStopResult | undefined> {
@@ -87,8 +87,13 @@ export async function monitorPane(options: {
         await options.onUpdate("durable reportを検出し、Piの完了状態を確認しています");
       }
       if (hasReport && (quiescent || now() - reportObservedAt! >= reportSettlementGraceMs)) return "settled";
+      const backgroundShells = observation.backgroundShells ?? 0;
       if (!hasReport) {
-        if (isActiveAgentStatus(observation.status)) {
+        if (backgroundShells > 0) {
+          // A child waiting on a background job looks idle to Herdr. Not evidence that it stopped; the stage deadline still applies.
+          activeObserved = true;
+          reportMissingSince = undefined;
+        } else if (isActiveAgentStatus(observation.status)) {
           activeObserved = true;
           reportMissingSince = undefined;
         } else if (quiescent && (activeObserved || now() >= startupDeadline)) {
@@ -104,7 +109,8 @@ export async function monitorPane(options: {
       }
       // Claude Code reports permission and workspace-trust prompts as "blocked".
       // Waiting for the human is expected; the stage deadline still applies.
-      await options.onUpdate(observation.status?.toLowerCase() === "blocked" ? "子ペインが人間の確認待ちです（Herdr status: blocked）。ペインの表示を確認してください" : `pane is ${observation.status ?? "unknown"}`);
+      const blocked = observation.status?.toLowerCase() === "blocked";
+      await options.onUpdate(blocked ? "子ペインが人間の確認待ちです（Herdr status: blocked）。ペインのダイアログ（ワークスペース信頼、権限確認など）に応答してください" : backgroundShells > 0 && !hasReport ? `pane is ${observation.status ?? "unknown"}。バックグラウンドのシェルが${backgroundShells}個実行中です` : `pane is ${observation.status ?? "unknown"}`);
     } else if (now() >= startupDeadline) {
       return "startup-timeout";
     } else {

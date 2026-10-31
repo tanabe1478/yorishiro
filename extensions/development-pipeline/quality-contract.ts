@@ -139,6 +139,42 @@ export function pathsWithinPrefixes(paths: string[], prefixes: string[] | undefi
   const normalized = prefixes.map(item => item.replace(/\/+$/, ""));
   return paths.filter(file => !normalized.some(item => file === item || file.startsWith(`${item}/`)));
 }
+/**
+ * allowedPathPrefixes は「パス区切り単位」で照合する（'tsconfig' は tsconfig.json に一致しない）。
+ * 違反pathが prefix 文字列で前方一致している場合だけ、書き損じとみなして提案を返す。
+ */
+export function prefixHints(outside: string[], prefixes: string[] | undefined): string[] {
+  if (prefixes === undefined) return [];
+  const normalized = prefixes.map(item => item.replace(/\/+$/, ""));
+  const hints: string[] = [];
+  for (const file of outside) {
+    const near = normalized.find(item => file !== item && file.startsWith(item) && !file.startsWith(`${item}/`));
+    if (near !== undefined) hints.push(`prefixはパス区切り単位で照合します。${file} を許可するなら '${file}' を明示してください（現在の '${near}' は ${file} に一致しません）`);
+  }
+  return hints;
+}
+export const MISMATCH_PATH_LIMIT = 50;
+function limited(paths: string[]) { return paths.filter(isRepositoryRelativePath).slice(0, MISMATCH_PATH_LIMIT); }
+/** Worker へ返す修正findingと結果messageへ載せる違反pathの要約。リポジトリ相対pathだけを、各50件まで含める。 */
+export function summarizeMismatchPaths(input: { outside: string[]; missingPaths: string[]; unknownPaths: string[]; prefixHints: string[] }) {
+  const omitted: Record<string, number> = {};
+  const take = (name: string, paths: string[]) => { const kept = limited(paths); if (paths.length > kept.length) omitted[name] = paths.length - kept.length; return kept; };
+  return {
+    outsidePaths: take("outsidePaths", input.outside),
+    missingPaths: take("missingPaths", input.missingPaths),
+    unknownPaths: take("unknownPaths", input.unknownPaths),
+    prefixHints: input.prefixHints.slice(0, MISMATCH_PATH_LIMIT),
+    ...(Object.keys(omitted).length ? { omitted } : {}),
+  };
+}
+export function describeMismatchPaths(summary: ReturnType<typeof summarizeMismatchPaths>): string {
+  const lines: string[] = [];
+  if (summary.outsidePaths.length) lines.push(`prefix違反のpath: ${summary.outsidePaths.join(", ")}`);
+  if (summary.missingPaths.length) lines.push(`changedPathsに無い実diffのpath: ${summary.missingPaths.join(", ")}`);
+  if (summary.unknownPaths.length) lines.push(`実diffに無いchangedPaths: ${summary.unknownPaths.join(", ")}`);
+  for (const hint of summary.prefixHints) lines.push(`提案: ${hint}`);
+  return lines.join("\n");
+}
 export type EvidenceViolation = { type: "missing-item" | "unknown-item" | "path-mismatch-missing" | "path-mismatch-unknown" | "prefix"; contractId: string };
 export function assertSuccessQualityState(metadata: any, contract: QualityContract, artifactNames: string[]) {
   const validations = Array.isArray(metadata?.workerValidations) ? metadata.workerValidations : [];
@@ -177,6 +213,7 @@ export function compareWorkerEvidence(report: { verdict?: "COMPLETED" | "BLOCKED
   if (missingPaths.length) violations.push({ type: "path-mismatch-missing", contractId: "changedPaths" });
   if (unknownPaths.length) violations.push({ type: "path-mismatch-unknown", contractId: "changedPaths" });
   if (missingPaths.length || unknownPaths.length) errors.push(`changedPathsが実diffと一致しません（実際=${actualSorted.join(",")}、報告=${reportedPaths.join(",")}）`);
-  if (outside.length) { violations.push({ type: "prefix", contractId: "allowedPathPrefixes" }); errors.push(`許可されていない変更pathがあります（${outside.join(",")}）`); }
-  return { valid: violations.length === 0, errors, outside, violations, signature: evidenceViolationSignature(violations) };
+  const hints = prefixHints(outside, contract.allowedPathPrefixes);
+  if (outside.length) { violations.push({ type: "prefix", contractId: "allowedPathPrefixes" }); errors.push(`許可されていない変更pathがあります（${outside.join(",")}）`); for (const hint of hints) errors.push(hint); }
+  return { valid: violations.length === 0, errors, outside, missingPaths, unknownPaths, prefixHints: hints, violations, signature: evidenceViolationSignature(violations) };
 }

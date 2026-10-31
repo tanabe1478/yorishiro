@@ -4,7 +4,28 @@ import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-type Result = { paneId: string; name: string; status: string; reason?: string };
+type Result = { paneId: string; name: string; status: string; reason?: string; note?: string };
+type PaneRecord = { paneId?: string; name?: string; terminalId?: string };
+/**
+ * Decide whether a live Herdr pane is the pane this run created.
+ * Herdr only returns a label after `pane rename`, and the pipeline renames a child only once it settles,
+ * so a pane that failed earlier (REPORT_MISSING, timeout) has no label. The label is therefore display data:
+ * when the run recorded the pane's immutable terminal_id, that id (plus workspace/tab) is the identity and a
+ * differing label is only noted. Runs recorded before terminalId existed keep the label comparison.
+ */
+export function verifyLivePane(info: unknown, record: PaneRecord, expected: { workspaceId: string; tabId: string }): { ok: true; note?: string } | { ok: false; reason: "incomplete" | "changed" } {
+  const workspace = field(info, ["workspace_id", "workspaceId"]), tab = field(info, ["tab_id", "tabId"]), actualName = field(info, ["name", "title", "label"]);
+  const recordedTerminal = typeof record.terminalId === "string" && record.terminalId.length > 0 ? record.terminalId : undefined;
+  const liveTerminal = field(info, ["terminal_id", "terminalId"]);
+  if (!workspace || !tab) return { ok: false, reason: "incomplete" };
+  if (recordedTerminal === undefined) {
+    if (!actualName) return { ok: false, reason: "incomplete" };
+    return workspace !== expected.workspaceId || tab !== expected.tabId || actualName !== record.name ? { ok: false, reason: "changed" } : { ok: true };
+  }
+  if (!liveTerminal) return { ok: false, reason: "incomplete" };
+  if (workspace !== expected.workspaceId || tab !== expected.tabId || liveTerminal !== recordedTerminal) return { ok: false, reason: "changed" };
+  return { ok: true, ...(actualName !== record.name ? { note: `表示名が記録と異なります（記録: ${record.name ?? "なし"}、実際: ${actualName ?? "なし"}）。terminal_idで同一性を確認しました` } : {}) };
+}
 /** Historical three-role layout. Keep this order for old runs. */
 export const CLEANUP_ORDER = ["Review · Sol", "Verify · Terra", "Implement · Luna"] as const;
 /** Historical two-role layout used before the fixed Worker model migration. */
@@ -60,7 +81,7 @@ export async function cleanupRun(runDir: string, root: string, currentPane?: str
   if (metadata.outcome !== "SUCCESS") throw new Error("cleanup is permitted only for SUCCESS runs");
   if (!currentPane) throw new Error("current pane identity is required for cleanup");
   if (![metadata.parentPaneId,metadata.workspaceId,metadata.tabId].every(v=>typeof v === "string" && v.length>0)) throw new Error("cleanup run identity is incomplete");
-  const panes=(metadata.panes ?? []) as Array<{paneId?:string;name?:string}>;
+  const panes=(metadata.panes ?? []) as PaneRecord[];
   const resolution = resolveCleanupMode(panes);
   const modeAmbiguous = resolution.status === "ambiguous";
   const order = resolution.status === "ambiguous" ? [] : resolution.mode === "legacy" ? resolution.order : resolution.order.filter(name => panes.some(p => p.name === name));
@@ -85,13 +106,13 @@ export async function cleanupRun(runDir: string, root: string, currentPane?: str
     if(candidate.paneId===metadata.parentPaneId || candidate.paneId===currentPane) { results.push({paneId:candidate.paneId,name,status:"skipped",reason:"parent/current pane protected"}); continue; }
     const infoResult=await command(["pane","get",candidate.paneId],signal), info=parse(infoResult.stdout); if (signal?.aborted) { results.push(cancelledResult(candidate,name)); for (let i=index+1;i<order.length;i++) results.push(cancelledResult(panes.find(p=>p.name===order[i]) ?? {}, order[i])); break; }
     if(infoResult.code || !info) { results.push({paneId:candidate.paneId,name,status:"skipped",reason:"pane unavailable"}); continue; }
-    const workspace=field(info,["workspace_id","workspaceId"]), tab=field(info,["tab_id","tabId"]), actualName=field(info,["name","title","label"]), state=field(info,["agent_status","agentStatus"]);
-    if(!workspace || !tab || !actualName || !state) { results.push({paneId:candidate.paneId,name,status:"skipped",reason:"live pane identity is incomplete"}); continue; }
-    if(workspace!==metadata.workspaceId || tab!==metadata.tabId || actualName!==name) { results.push({paneId:candidate.paneId,name,status:"skipped",reason:"pane identity changed"}); continue; }
-    if(!["idle","done"].includes(state)) { results.push({paneId:candidate.paneId,name,status:"skipped",reason:`pane is ${state}`}); continue; }
+    const state=field(info,["agent_status","agentStatus"]), identity=verifyLivePane(info,candidate,{workspaceId:metadata.workspaceId,tabId:metadata.tabId});
+    if(!state || (!identity.ok && identity.reason==="incomplete")) { results.push({paneId:candidate.paneId,name,status:"skipped",reason:"live pane identity is incomplete"}); continue; }
+    if(!identity.ok) { results.push({paneId:candidate.paneId,name,status:"skipped",reason:"pane identity changed"}); continue; }
+    if(!["idle","done"].includes(state ?? "")) { results.push({paneId:candidate.paneId,name,status:"skipped",reason:`pane is ${state}`}); continue; }
     const closed=await command(["pane","close",candidate.paneId],signal);
     if (closed.code === 0) {
-      results.push({paneId:candidate.paneId,name,status:"closed"});
+      results.push({paneId:candidate.paneId,name,status:"closed",...(identity.note?{note:identity.note}:{})});
       if (signal?.aborted) { for (let i=index+1;i<order.length;i++) results.push(cancelledResult(panes.find(p=>p.name===order[i]) ?? {}, order[i])); break; }
     } else if (closed.cancelled) { results.push({paneId:candidate.paneId,name,status:"cancelled",reason:"close dispatched; cancellation interrupted close"}); for (let i=index+1;i<order.length;i++) results.push(cancelledResult(panes.find(p=>p.name===order[i]) ?? {}, order[i])); break; }
     else results.push({paneId:candidate.paneId,name,status:"failed",reason:closed.stderr||closed.stdout||"close failed"});
@@ -114,7 +135,7 @@ export async function resetRun(runDir: string, root: string, context: { paneId?:
   const currentIdentity = [context.paneId, context.workspaceId, context.tabId];
   if (![...runIdentity, ...currentIdentity].every(value => typeof value === "string" && value.length > 0)) throw new Error("run/current identityが不完全です");
   if (context.paneId !== metadata.parentPaneId || context.workspaceId !== metadata.workspaceId || context.tabId !== metadata.tabId) throw new Error("現在のpane/workspace/tab identityがrun親と一致しません");
-  const panes = (metadata.panes ?? []) as Array<{ paneId?: string; name?: string }>;
+  const panes = (metadata.panes ?? []) as PaneRecord[];
   const resolution = resolveCleanupMode(panes);
   const allowed = resolution.status === "ok" ? new Set<string>(resolution.order) : new Set<string>();
   const paneIds = panes.map(pane => pane.paneId).filter((paneId): paneId is string => typeof paneId === "string" && paneId.length > 0);
@@ -127,11 +148,11 @@ export async function resetRun(runDir: string, root: string, context: { paneId?:
     if (signal?.aborted) { results.push(cancelledResult(pane, pane.name ?? "")); continue; }
     const infoResult = await command(["pane", "get", pane.paneId], signal), info = parse(infoResult.stdout);
     if (infoResult.code || !info) { results.push({ paneId: pane.paneId, name: pane.name ?? "", status: "skipped", reason: "pane unavailable" }); continue; }
-    const workspace = field(info, ["workspace_id", "workspaceId"]), tab = field(info, ["tab_id", "tabId"]), actualName = field(info, ["name", "title", "label"]), state = field(info, ["agent_status", "agentStatus"]);
-    if (workspace !== metadata.workspaceId || tab !== metadata.tabId || actualName !== pane.name) { results.push({ paneId: pane.paneId, name: pane.name ?? "", status: "skipped", reason: "pane identity changed or incomplete" }); continue; }
+    const state = field(info, ["agent_status", "agentStatus"]), identity = verifyLivePane(info, pane, { workspaceId: metadata.workspaceId, tabId: metadata.tabId });
+    if (!identity.ok) { results.push({ paneId: pane.paneId, name: pane.name ?? "", status: "skipped", reason: "pane identity changed or incomplete" }); continue; }
     if (!["idle", "done"].includes(state ?? "")) { results.push({ paneId: pane.paneId, name: pane.name ?? "", status: "skipped", reason: `pane is ${state ?? "unknown"}` }); continue; }
     const closed = await command(["pane", "close", pane.paneId], signal);
-    results.push(closed.code === 0 ? { paneId: pane.paneId, name: pane.name ?? "", status: "closed" } : { paneId: pane.paneId, name: pane.name ?? "", status: "failed", reason: closed.stderr || "close failed" });
+    results.push(closed.code === 0 ? { paneId: pane.paneId, name: pane.name ?? "", status: "closed", ...(identity.note ? { note: identity.note } : {}) } : { paneId: pane.paneId, name: pane.name ?? "", status: "failed", reason: closed.stderr || "close failed" });
   }
   metadata.reset = { status: results.length > 0 && results.every(result => result.status === "closed") ? "completed" : "partial", finishedAt: new Date().toISOString(), results };
   await atomic(file, metadata);

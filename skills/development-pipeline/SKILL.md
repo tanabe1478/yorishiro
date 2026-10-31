@@ -49,6 +49,10 @@ Herdr内のClaude Codeから、`"$YORISHIRO_ROOT/bin/yorishiro-pipeline"`をBash
 
 CLIには人間レビューのUIがない。計画の承認は会話で取り、`planReviewMode`／`diffReviewMode`に`required`を指定しない（指定すると開始前にexit 2で止まる）。`cleanupMode`の`ask`は確認できないためペインを残す。
 
+## 失敗したrunの立て直し
+
+reset（閉じなければ`herdr pane close`）→ `git stash push -u`で成果を退避 → 原因を直す → 新runの計画の先頭に`git stash pop`と経緯を書く → 成功後に`git stash list`と`git status`を確認。`reset`は作業ツリーを戻さない。詳細は[docs](../../docs/development-pipeline.md#失敗したrunの立て直し)。
+
 ## 詳細
 
 正確な状態遷移、既定値、evidence回収上限、監視（`argv0`／`foreground_processes`、`--until`、report-missing猶予）、cleanup/reset互換、旧providerからの移行は、必要なときに[`../../docs/development-pipeline.md`](../../docs/development-pipeline.md)を読む。workflowの進め方は[`../development-workflow/SKILL.md`](../development-workflow/SKILL.md)。全文を常時先読みしない。

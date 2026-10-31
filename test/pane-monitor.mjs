@@ -178,4 +178,40 @@ try {
 } finally {
   await rm(transcriptDir, { recursive: true, force: true });
 }
+// Y2: a child waiting on a background shell looks idle to Herdr. That is not report-missing while the shell runs.
+{
+  const claudeInfo = { foreground_processes: [{ argv: ["claude"], argv0: "claude", pid: 4242 }] };
+  const shellObservations = (shellCounts, status = "idle") => shellCounts.map(count => ({ status, processInfo: claudeInfo, backgroundShells: count }));
+  const updates = [];
+  // idle with shells for 30 polls (far beyond the 2ms grace), then the shell is gone: report-missing only after a fresh grace.
+  fake = fakeHerdr(shellObservations([...Array(30).fill(2), 0, 0, 0, 0]), false);
+  let polls = 0, firstZeroPoll = -1;
+  const countingPoll = fake.poll;
+  fake.poll = async () => { const result = await countingPoll(); polls++; if (result.backgroundShells === 0 && firstZeroPoll < 0) firstZeroPoll = polls; return result; };
+  assert.equal(await monitorPane({ ...fake, timeoutMs: 1_000_000, startupGraceMs: 0, reportMissingGraceMs: 2, pollIntervalMs: 1, agentBinary: "claude", onUpdate: message => updates.push(message) }), "report-missing");
+  assert.equal(firstZeroPoll, 31, "report-missing must not be declared while background shells are running");
+  assert.ok(polls >= 33, `grace must restart after the shell exits (polls=${polls})`);
+  assert.ok(updates.some(message => message.includes("バックグラウンドのシェルが2個実行中")), "the update must say how many shells run");
+
+  // While shells run the stage deadline still ends the wait.
+  fake = fakeHerdr(shellObservations([1]), false);
+  assert.equal(await monitorPane({ ...fake, timeoutMs: 50, startupGraceMs: 0, reportMissingGraceMs: 2, pollIntervalMs: 1, agentBinary: "claude", onUpdate() {} }), "timeout", "a never-ending background shell is bounded by the stage timeout");
+
+  // A durable report still settles immediately even with shells running.
+  fake = fakeHerdr(shellObservations([1]), true);
+  assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 0, reportMissingGraceMs: 2, pollIntervalMs: 1, agentBinary: "claude", onUpdate() {} }), "settled");
+
+  // Without shell information (Pi runtime) the behavior is unchanged.
+  fake = fakeHerdr([{ status: "running", processInfo: { argv0: "pi" } }, { status: "idle", processInfo: { argv0: "pi" } }], false);
+  assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 2_000, reportMissingGraceMs: 2, pollIntervalMs: 1, onUpdate() {} }), "report-missing");
+}
+
+// Y5: the blocked message names the dialog to answer.
+{
+  const messages = [];
+  fake = fakeHerdr([{ status: "blocked", processInfo: { argv0: "pi" } }, { status: "idle", processInfo: { argv0: "pi" } }], (_clock, index) => index >= 2);
+  assert.equal(await monitorPane({ ...fake, timeoutMs: 10_000, startupGraceMs: 0, pollIntervalMs: 1, onUpdate: message => messages.push(message) }), "settled");
+  assert.ok(messages.some(message => message.includes("ペインのダイアログ（ワークスペース信頼") && message.includes("応答してください")), messages.join("|"));
+}
+
 console.log("deterministic pane startup/exit and interrupt tests passed");

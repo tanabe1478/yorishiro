@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { INFO, MODELS, RUNTIME, type Stage } from "./models.ts";
+import { renderInputFilesSection, type InputFilesReport } from "./input-files.ts";
 
 export const WORKFLOW_NAMES = ["feature", "bug-fix", "refactoring"] as const;
 export type WorkflowName = (typeof WORKFLOW_NAMES)[number];
@@ -66,6 +67,8 @@ export type WorkflowBriefOptions = {
   playbookPath: string;
   verifySkills: string[];
   stage: Stage;
+  /** External files copied into the artifact because the child cannot read their original location. */
+  inputFiles?: InputFilesReport;
 };
 
 export async function writeWorkflowBrief(options: WorkflowBriefOptions) {
@@ -101,7 +104,7 @@ ${verify}
 
 feature mapを読み、変更に対応するjourneyを実ユーザー面で実行する。存在しないcommandを捏造しない。実行できなかった場合は、試したcommandと未達の前提条件を証跡へ残す。
 
-## 必須の進め方
+${renderInputFilesSection(options.inputFiles)}## 必須の進め方
 
 1. 関連codeを読み、domain/data shapeを選ぶ。
 2. 最小の安全なscopeと成功条件を決める。

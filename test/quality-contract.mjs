@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-const { validateQualityContract, hashQualityContract, compareWorkerEvidence, pathsWithinPrefixes, captureFingerprintMap, changedPathsBetween } = await import("../extensions/development-pipeline/quality-contract.ts");
+const { validateQualityContract, hashQualityContract, compareWorkerEvidence, pathsWithinPrefixes, captureFingerprintMap, changedPathsBetween, prefixHints, summarizeMismatchPaths, describeMismatchPaths } = await import("../extensions/development-pipeline/quality-contract.ts");
 const { validateWorkerReport } = await import("../extensions/development-pipeline/role-contracts.ts");
 
 const valid = { planItems: [{ id: "IMPLEMENT", description: "実装する" }], requiredChecks: [{ id: "TEST", program: "/usr/bin/true", args: [], timeoutMs: 1000 }], allowedPathPrefixes: ["src"] };
@@ -37,6 +37,45 @@ for (const bad of [
   { ...blockedSubset, changedPaths: ["src/fake.ts"] },
 ]) assert.equal(compareWorkerEvidence(bad, valid, ["src/a.ts"]).valid, false);
 assert.equal(compareWorkerEvidence({ ...blockedSubset, changedPaths: ["README.md"] }, valid, ["README.md"]).valid, false);
+
+// Y7: prefixes match per path segment; a partial-string prefix is detected and a fix is suggested.
+assert.deepEqual(pathsWithinPrefixes(["tsconfig.json", "tsconfig/base.json"], ["tsconfig"]), ["tsconfig.json"], "'tsconfig' does not match tsconfig.json");
+assert.deepEqual(prefixHints(["tsconfig.json"], ["tsconfig", "src"]).length, 1);
+assert.match(prefixHints(["tsconfig.json"], ["tsconfig"])[0], /パス区切り単位で照合します。tsconfig\.json を許可するなら 'tsconfig\.json' を明示してください/);
+assert.deepEqual(prefixHints(["README.md"], ["tsconfig"]), [], "no hint when the path is not a string-prefix match");
+assert.deepEqual(prefixHints(["tsconfig.json"], undefined), []);
+assert.deepEqual(prefixHints(["tsconfig.json"], ["tsconfig/"]).length, 1, "a trailing slash does not change the hint");
+{
+  const contract = { ...valid, allowedPathPrefixes: ["tsconfig", "src"] };
+  const report = { verdict: "COMPLETED", completedPlanItems: valid.planItems.map(item => ({ id: item.id, evidence: "確認" })), changedPaths: ["tsconfig.json", "src/a.ts"] };
+  const result = compareWorkerEvidence(report, contract, ["tsconfig.json", "src/a.ts"]);
+  assert.equal(result.valid, false);
+  assert.deepEqual(result.outside, ["tsconfig.json"]);
+  assert.equal(result.prefixHints.length, 1);
+  assert.ok(result.errors.some(error => error.includes("'tsconfig.json' を明示してください")), "the suggestion is part of the errors");
+  assert.equal(result.signature, "prefix:allowedPathPrefixes", "the hint must not change the signature");
+  const fixed = compareWorkerEvidence(report, { ...contract, allowedPathPrefixes: ["tsconfig.json", "src"] }, ["tsconfig.json", "src/a.ts"]);
+  assert.equal(fixed.valid, true, "following the suggestion makes the evidence valid");
+}
+
+// Y6: the repair finding names violating repository-relative paths, capped at 50 each, and nothing else.
+{
+  const many = Array.from({ length: 60 }, (_item, index) => `out/file-${String(index).padStart(2, "0")}.ts`);
+  const summary = summarizeMismatchPaths({ outside: [...many, "/abs/leak.ts", "../up.ts"], missingPaths: ["src/missing.ts"], unknownPaths: ["src/ghost.ts"], prefixHints: [] });
+  assert.equal(summary.outsidePaths.length, 50);
+  assert.equal(summary.outsidePaths.includes("/abs/leak.ts"), false, "absolute paths are never included");
+  assert.equal(summary.outsidePaths.includes("../up.ts"), false);
+  assert.deepEqual(summary.missingPaths, ["src/missing.ts"]);
+  assert.deepEqual(summary.unknownPaths, ["src/ghost.ts"]);
+  assert.deepEqual(summary.omitted, { outsidePaths: 12 }, "truncation is reported, not silent");
+  const text = describeMismatchPaths(summarizeMismatchPaths({ outside: ["tsconfig.json"], missingPaths: [], unknownPaths: ["x.ts"], prefixHints: prefixHints(["tsconfig.json"], ["tsconfig"]) }));
+  assert.match(text, /prefix違反のpath: tsconfig\.json/);
+  assert.match(text, /実diffに無いchangedPaths: x\.ts/);
+  assert.match(text, /提案: prefixはパス区切り単位/);
+  const mismatch = compareWorkerEvidence({ ...completed, changedPaths: ["src/ghost.ts"] }, valid, ["src/real.ts"]);
+  assert.deepEqual(mismatch.missingPaths, ["src/real.ts"]);
+  assert.deepEqual(mismatch.unknownPaths, ["src/ghost.ts"]);
+}
 
 const reportBase = { verdict: "COMPLETED", summary: "完了しました", changedScope: "変更しました", evidence: "確認しました", completedPlanItems: completed.completedPlanItems, changedPaths: [] };
 assert.equal(validateWorkerReport(reportBase, valid).valid, true);
