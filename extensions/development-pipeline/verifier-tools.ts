@@ -23,19 +23,34 @@ export function trimUtf8(buffer: Buffer, max: number) {
   return buffer.subarray(0, end);
 }
 export function boundUtf8(text: string, max = MAX_OUTPUT) { return trimUtf8(Buffer.from(text, "utf8"), max).toString("utf8"); }
-export function run(program: string, args: string[], cwd: string, timeout: number, signal?: AbortSignal, env?: Record<string, string>): Promise<{ code: number; stdout: string; stderr: string; truncated: boolean; cancelled: boolean; timedOut: boolean }> {
+/** Last `max` bytes of the buffer, starting on a UTF-8 character boundary. */
+export function trimUtf8Tail(buffer: Buffer, max: number) {
+  let start = Math.max(0, buffer.length - max);
+  while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start++;
+  return buffer.subarray(start);
+}
+export function boundUtf8Tail(text: string, max = MAX_OUTPUT) { return trimUtf8Tail(Buffer.from(text, "utf8"), max).toString("utf8"); }
+/**
+ * `tail` is the last MAX_OUTPUT bytes of stdout and stderr in arrival order. It is only
+ * filled when more than MAX_OUTPUT bytes were produced; `totalBytes` is the byte count seen.
+ */
+export type RunResult = { code: number; stdout: string; stderr: string; truncated: boolean; cancelled: boolean; timedOut: boolean; tail?: string; totalBytes?: number };
+/** `env` is added to `process.env`, or used as the whole environment when `replaceEnv` is set. */
+export function run(program: string, args: string[], cwd: string, timeout: number, signal?: AbortSignal, env?: Record<string, string>, replaceEnv = false): Promise<RunResult> {
   return new Promise((resolve) => {
-    const child = spawn(program, args, { cwd, shell: false, detached: true, env: env ? { ...process.env, ...env } : undefined, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = Buffer.alloc(0), stderr = Buffer.alloc(0), truncated = false, cancelled = false, timedOut = false, settled = false;
+    const child = spawn(program, args, { cwd, shell: false, detached: true, env: env ? (replaceEnv ? env : { ...process.env, ...env }) : undefined, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = Buffer.alloc(0), stderr = Buffer.alloc(0), tail = Buffer.alloc(0), totalBytes = 0, truncated = false, cancelled = false, timedOut = false, settled = false;
+    const keepTail = (chunk: Buffer) => { totalBytes += chunk.length; tail = Buffer.concat([tail, chunk]); if (tail.length > MAX_OUTPUT * 2) tail = Buffer.from(tail.subarray(tail.length - MAX_OUTPUT)); };
+    const tailText = () => totalBytes > MAX_OUTPUT ? trimUtf8Tail(tail, MAX_OUTPUT).toString("utf8") : "";
     const append = (current: Buffer, chunk: Buffer) => { const limit = MAX_OUTPUT + 4; if (current.length >= limit) { truncated = true; return current; } const combined = Buffer.concat([current, chunk]); if (combined.length > limit) truncated = true; return combined.subarray(0, limit); };
     const normalized = () => { const combined = Buffer.concat([stdout, stderr]); let decoded: string; try { decoded = new TextDecoder("utf-8", { fatal: true }).decode(combined); } catch { decoded = new TextDecoder("utf-8").decode(combined); truncated = true; } const visible = boundUtf8(decoded, MAX_OUTPUT); if (Buffer.byteLength(visible, "utf8") < Buffer.byteLength(decoded, "utf8")) truncated = true; return visible; };
     const stop = (reason: "cancelled" | "timeout") => { if (reason === "cancelled") cancelled = true; else timedOut = true; killTree(child.pid!, "SIGTERM"); setTimeout(() => { if (!settled) killTree(child.pid!, "SIGKILL"); }, 1000).unref(); };
     const timer = setTimeout(() => { stop("timeout"); }, timeout);
     const onAbort = () => stop("cancelled");
     if (signal) { if (signal.aborted) stop("cancelled"); else signal.addEventListener("abort", onAbort, { once: true }); }
-    child.stdout.on("data", d => { stdout = append(stdout, Buffer.from(d)); }); child.stderr.on("data", d => { stderr = append(stderr, Buffer.from(d)); });
-    child.once("error", e => { settled = true; clearTimeout(timer); signal?.removeEventListener("abort", onAbort); resolve({ code: 1, stdout: normalized(), stderr: e.message, truncated, cancelled, timedOut }); });
-    child.once("close", code => { settled = true; clearTimeout(timer); signal?.removeEventListener("abort", onAbort); resolve({ code: code ?? 1, stdout: normalized(), stderr: "", truncated, cancelled, timedOut }); });
+    child.stdout.on("data", d => { const chunk = Buffer.from(d); keepTail(chunk); stdout = append(stdout, chunk); }); child.stderr.on("data", d => { const chunk = Buffer.from(d); keepTail(chunk); stderr = append(stderr, chunk); });
+    child.once("error", e => { settled = true; clearTimeout(timer); signal?.removeEventListener("abort", onAbort); resolve({ code: 1, stdout: normalized(), stderr: e.message, truncated, cancelled, timedOut, tail: tailText(), totalBytes }); });
+    child.once("close", code => { settled = true; clearTimeout(timer); signal?.removeEventListener("abort", onAbort); resolve({ code: code ?? 1, stdout: normalized(), stderr: "", truncated, cancelled, timedOut, tail: tailText(), totalBytes }); });
   });
 }
 
@@ -47,6 +62,28 @@ export function sandboxCommand(program: string, args: string[], cwd: string): st
   }
   if (process.platform === "linux") return ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--bind", cwd, cwd, "--dev", "/dev", "--proc", "/proc", "--chdir", cwd, "--", program, ...args];
   throw new Error(`Verifier sandbox is unsupported on ${process.platform}`);
+}
+
+/** Variables that describe the orchestrator's own session (its root, runtime, role, Herdr pane). A verification command must not inherit them. */
+const ORCHESTRATOR_ENV = /^(?:YORISHIRO_|HERDR_)/;
+/**
+ * The whole environment of a verification command: the caller's environment without the
+ * orchestrator's YORISHIRO_* and HERDR_* variables, with temp and cache directories and
+ * YORISHIRO_EVIDENCE_DIR pointing into the snapshot. Inheriting YORISHIRO_ROOT sent a
+ * checked tree's own pipeline to the real checkout's artifacts, which the sandbox cannot write.
+ */
+export function verificationEnvironment(workspace: { temp: string; cache: string; evidence: string }, base: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const inherited: Record<string, string> = {};
+  for (const [name, value] of Object.entries(base)) if (value !== undefined && !ORCHESTRATOR_ENV.test(name)) inherited[name] = value;
+  return {
+    ...inherited,
+    TMPDIR: workspace.temp,
+    TMP: workspace.temp,
+    TEMP: workspace.temp,
+    npm_config_cache: path.join(workspace.cache, "npm"),
+    XDG_CACHE_HOME: path.join(workspace.cache, "xdg"),
+    YORISHIRO_EVIDENCE_DIR: workspace.evidence,
+  };
 }
 
 type VerificationWorkspace = { root: string; cwd: string; temp: string; cache: string; evidence: string };
@@ -187,14 +224,7 @@ export async function runSandboxedVerification(program: string, args: string[], 
   }
   try {
     const command = sandboxCommand(program, args, workspace.cwd);
-    const result = await run(command[0], command.slice(1), workspace.cwd, timeoutMs, signal, {
-      TMPDIR: workspace.temp,
-      TMP: workspace.temp,
-      TEMP: workspace.temp,
-      npm_config_cache: path.join(workspace.cache, "npm"),
-      XDG_CACHE_HOME: path.join(workspace.cache, "xdg"),
-      YORISHIRO_EVIDENCE_DIR: workspace.evidence,
-    });
+    const result = await run(command[0], command.slice(1), workspace.cwd, timeoutMs, signal, verificationEnvironment(workspace), true);
     if (!options.evidenceDir) return result;
     try {
       const evidence = await collectEvidence(workspace.evidence, options.evidenceDir);

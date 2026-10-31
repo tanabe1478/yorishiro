@@ -14,7 +14,7 @@ import { transitionAfterReview } from "./three-role-flow.ts";
 import { monitorPane, routeMonitorFailure } from "./pane-monitor.ts";
 import { reviewPlan, reviewDiff, resolveReviewMode, executeDiffProcess, type PlanGateResult, type DiffGateResult } from "./human-review-gates.ts";
 import { assertSuccessQualityState, captureFingerprintMap, changedPathsBetween, compareWorkerEvidence, hashQualityContract, validateQualityContract, qualityContractArtifact, type QualityContract, type FingerprintMap } from "./quality-contract.ts";
-import { boundUtf8, runSandboxedVerification } from "./verifier-tools.ts";
+import { boundUtf8, boundUtf8Tail, runSandboxedVerification } from "./verifier-tools.ts";
 import { createHash } from "node:crypto";
 import { AGENT_BINARY, INFO, MODELS, ROLE_LABELS, RUNTIME, STAGES, roleMetadata, roleModels, type Stage } from "./models.ts";
 import { discoverVerifySkills, isWorkflowName, shellQuote, writeLauncher, writeWorkflowBrief, type WorkflowName } from "./launcher.ts";
@@ -46,7 +46,7 @@ type StageStatus = "pending" | "running" | "passed" | "failed" | "blocked" | "ab
 type Input = { task: string; approvedPlan: string; qualityContract: QualityContract; workflow?: string; cwd?: string; maxRepairCycles?: number; maxReviewCycles?: number; cleanupMode?: "ask" | "on-success" | "never"; planReviewMode?: "ask" | "required" | "skip"; diffReviewMode?: "ask" | "required" | "skip" };
 type CommandResult = { code: number; stdout: string; stderr: string };
 type CheckEvidence = { status: string; dir: string; files: number; bytes: number; skipped: number; skippedCount: number; visited: number; truncated: boolean };
-type QualityGateResult = { gate: number; status: "passed" | "failed" | "cancelled"; checks: Array<{ id: string; argv: string[]; exit: number; exitCode: number; timeout: boolean; timedOut: boolean; cancelled: boolean; outputHash: string; outputExcerpt: string; outputTruncated: boolean; summary: string; evidence?: CheckEvidence; evidenceError?: string }> };
+type QualityGateResult = { gate: number; status: "passed" | "failed" | "cancelled"; checks: Array<{ id: string; argv: string[]; exit: number; exitCode: number; timeout: boolean; timedOut: boolean; cancelled: boolean; outputHash: string; outputExcerpt: string; outputTruncated: boolean; summary: string; outputLog?: string; outputLogError?: string; evidence?: CheckEvidence; evidenceError?: string }> };
 type QualityMismatch = { signature: string; errors: string[]; actualPaths: string[]; reportedPaths: string[]; violations: Array<{ type: string; contractId: string }> };
 type Attempt = { attempt: number; status: StageStatus; startedAt: string; finishedAt?: string; reportFile: string; paneId: string; verdict?: string; error?: string };
 type Pane = { paneId: string; name: string; model: string; attempts: Attempt[] };
@@ -93,22 +93,54 @@ export function evidenceSegment(id: string, index: number) {
   const digest = createHash("sha256").update(id, "utf8").digest("hex").slice(0, 8);
   return `${index + 1}-${slug}-${digest}`;
 }
-async function runQualityGate(contract: QualityContract, cwd: string, gate: number, artifactDir: string, signal?: AbortSignal): Promise<QualityGateResult> {
+const EXCERPT_HEAD_BYTES = 1024, EXCERPT_TAIL_BYTES = 3072, DIAGNOSTIC_BYTES = 300;
+const FAILURE_LINE = /Error|AssertionError|assert|FAIL|failed|not ok/;
+// A stack frame ("at assertScenario (...)") or npm's closing "npm error command failed" says where or that something failed, not what.
+const NOISE_LINE = /^(?:at\s|npm (?:error|ERR!))/;
+const ERROR_NAME_LINE = /^[A-Za-z]*Error\b/;
+/** Excerpt for quality-gate-N.json: whole output when it fits in 4KiB, otherwise the first 1KiB and last 3KiB. `tail` is the end of the output when `head` was cut. */
+export function buildOutputExcerpt(head: string, tail = "") {
+  const end = tail || head;
+  if (!tail && Buffer.byteLength(head, "utf8") <= EXCERPT_HEAD_BYTES + EXCERPT_TAIL_BYTES) return head;
+  return `${boundUtf8(head, EXCERPT_HEAD_BYTES)}\n[... 中略 ...]\n${boundUtf8Tail(end, EXCERPT_TAIL_BYTES)}`;
+}
+/** One line for the summary: for a failed check the last "...Error" line, else the last failure-looking line, else the last non-empty line, of the end of the output with stack frames and npm error lines left out; otherwise the first non-empty line. */
+export function pickDiagnosticLine(head: string, tail: string, failed: boolean) {
+  const nonEmpty = (text: string) => text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const line = failed ? (() => { const all = nonEmpty(tail || head), kept = all.filter(item => !NOISE_LINE.test(item)), lines = kept.length > 0 ? kept : all; return lines.findLast(item => ERROR_NAME_LINE.test(item)) ?? lines.findLast(item => FAILURE_LINE.test(item)) ?? lines.at(-1); })() : nonEmpty(head)[0];
+  return line === undefined ? undefined : boundUtf8(line, DIAGNOSTIC_BYTES);
+}
+/** Full retained output for the per-check log file. A one-line notice marks where the middle was dropped. */
+export function buildOutputLog(head: string, tail = "", totalBytes = 0) {
+  if (!tail) return head;
+  const kept = Buffer.byteLength(head, "utf8") + Buffer.byteLength(tail, "utf8");
+  const notice = totalBytes > kept ? `[... 先頭と末尾の間の出力を省略（出力全体 ${totalBytes} bytes、保存 ${kept} bytes）...]` : `[... 以下は出力の末尾。先頭部分と重なる場合がある（出力全体 ${totalBytes} bytes）...]`;
+  return `${head}${head.endsWith("\n") || head === "" ? "" : "\n"}${notice}\n${tail}`;
+}
+export async function runQualityGate(contract: QualityContract, cwd: string, gate: number, artifactDir: string, signal?: AbortSignal): Promise<QualityGateResult> {
   const checks: QualityGateResult["checks"] = [];
   for (const [index, check] of contract.requiredChecks.entries()) {
     const timeoutMs = check.timeoutMs ?? 120000;
-    const evidenceDir = path.join(artifactDir, "evidence", `quality-gate-${gate}`, evidenceSegment(check.id, index));
-    let result: { code: number; stdout: string; stderr: string; truncated: boolean; cancelled: boolean; timedOut: boolean; evidence?: any; evidenceError?: string };
+    const segment = evidenceSegment(check.id, index);
+    const evidenceDir = path.join(artifactDir, "evidence", `quality-gate-${gate}`, segment);
+    let result: { code: number; stdout: string; stderr: string; truncated: boolean; cancelled: boolean; timedOut: boolean; tail?: string; totalBytes?: number; evidence?: any; evidenceError?: string };
     try { result = await runSandboxedVerification(check.program, check.args, cwd, timeoutMs, signal, { evidenceDir }); }
     catch (error) { result = { code: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error), truncated: false, cancelled: !!signal?.aborted, timedOut: false }; }
     const output = `${result.stdout}${result.stderr}`;
-    const outputExcerpt = boundUtf8(output, 4096);
-    const outputTruncated = result.truncated || Buffer.byteLength(outputExcerpt, "utf8") < Buffer.byteLength(output, "utf8");
-    const diagnostic = outputExcerpt.trim().split(/\r?\n/).find(Boolean);
+    const tail = result.tail ?? "";
+    const outputExcerpt = buildOutputExcerpt(output, tail);
+    const outputTruncated = result.truncated || Buffer.byteLength(output, "utf8") > EXCERPT_HEAD_BYTES + EXCERPT_TAIL_BYTES;
+    const failed = result.code !== 0 || result.timedOut || result.cancelled;
+    const diagnostic = pickDiagnosticLine(output, tail, failed);
+    const outputLog = path.join(`quality-gate-${gate}-output`, `${segment}.log`);
+    let outputLogError: string | undefined;
+    try { await fs.mkdir(path.join(artifactDir, path.dirname(outputLog)), { recursive: true }); await atomicWrite(path.join(artifactDir, outputLog), buildOutputLog(output, tail, result.totalBytes)); }
+    catch (error) { outputLogError = error instanceof Error ? error.message : String(error); }
     const status = result.timedOut ? "タイムアウトしました" : result.cancelled ? "キャンセルされました" : `終了コード${result.code}`;
     const evidence = result.evidence ? { status: result.evidence.status, dir: path.relative(artifactDir, evidenceDir), files: result.evidence.files.length, bytes: result.evidence.bytes, skipped: result.evidence.skipped.length, skippedCount: result.evidence.skippedCount, visited: result.evidence.visited, truncated: result.evidence.truncated } : undefined;
     const evidenceDetail = result.evidenceError ? ` 証跡回収に失敗しました: ${boundUtf8(result.evidenceError, 300)}` : result.evidence ? result.evidence.files.length ? ` 証跡${result.evidence.files.length}件を${evidence!.dir}へ保存しました。${result.evidence.truncated || result.evidence.skippedCount > 0 ? ` 証跡は不完全です（skip=${result.evidence.skippedCount}, truncated=${result.evidence.truncated}）。` : ""}` : ` 証跡は空です。${result.evidence.truncated || result.evidence.skippedCount > 0 ? ` 証跡は不完全です（skip=${result.evidence.skippedCount}, truncated=${result.evidence.truncated}）。` : ""}` : "";
-    checks.push({ id: check.id, argv: [check.program, ...check.args], exit: result.code, exitCode: result.code, timeout: result.timedOut, timedOut: result.timedOut, cancelled: result.cancelled, outputHash: hashOutput(output), outputExcerpt, outputTruncated, summary: `独立check「${check.id}」は${status}。出力はSHA-256と最大4KiBの診断抜粋で記録しました。${diagnostic ? ` 主な出力: ${diagnostic}` : ""}${evidenceDetail}`, ...(evidence ? { evidence } : {}), ...(result.evidenceError ? { evidenceError: result.evidenceError } : {}) });
+    const logDetail = outputLogError ? ` 出力ログの保存に失敗しました: ${boundUtf8(outputLogError, 300)}` : ` 出力ログ: ${outputLog}`;
+    checks.push({ id: check.id, argv: [check.program, ...check.args], exit: result.code, exitCode: result.code, timeout: result.timedOut, timedOut: result.timedOut, cancelled: result.cancelled, outputHash: hashOutput(output), outputExcerpt, outputTruncated, summary: `独立check「${check.id}」は${status}。出力はSHA-256と診断抜粋（先頭1KiB＋末尾3KiB）で記録しました。${diagnostic ? ` 主な出力: ${diagnostic}` : ""}${logDetail}${evidenceDetail}`, ...(outputLogError ? { outputLogError } : { outputLog }), ...(evidence ? { evidence } : {}), ...(result.evidenceError ? { evidenceError: result.evidenceError } : {}) });
   }
   return { gate, status: checks.every(check => check.exitCode === 0 && !check.timeout && !check.cancelled) ? "passed" : signal?.aborted ? "cancelled" : "failed", checks };
 }

@@ -9,6 +9,14 @@ const exists = async file => { try { await lstat(path.join(root, file)); return 
 const frontmatter = text => text.match(/^---\n([\s\S]*?)\n---\n/)?.[1] ?? "";
 const headings = text => [...text.matchAll(/^## (.+)$/gm)].map(match => match[1].trim());
 
+// The always-loaded instructions must keep the parent as Planner, so that a
+// plain "implement this" goes through the pipeline instead of the parent.
+const agents = await read("AGENTS.md");
+assert.match(agents, /the parent session is the Planner, not the implementer/);
+assert.match(agents, /does not authorize the parent to implement/);
+assert.match(agents, /skills\/development-pipeline\/SKILL\.md/);
+assert.match(agents, /instead of falling back to direct implementation/);
+
 const workflow = await read("skills/development-workflow/SKILL.md");
 const workflowFront = frontmatter(workflow);
 assert.match(workflowFront, /^name: development-workflow$/m);
@@ -103,6 +111,36 @@ assert.match(await read(".pi/skills/verify-yorishiro/scripts/verify-yorishiro.mj
 const pkg = JSON.parse(await read("package.json"));
 assert.deepEqual(pkg.pi.skills, ["./skills"]);
 assert.equal(pkg.pi.skills.includes(".pi"), false, "project-local verify-yorishiro is not exported");
+
+// npm run test:gate is the quality gate's required check when the pipeline
+// targets this repository. Every npm test suite missing from it must be listed,
+// with a reason, in test/gate-exclusions.json.
+const suitesOf = script => script.split("&&").map(part => part.trim().replace(/^npm run /, ""));
+const gateExclusionProblems = (scripts, exclusions) => {
+  const full = suitesOf(scripts.test), gate = suitesOf(scripts["test:gate"]), problems = [];
+  for (const suite of gate) {
+    if (!full.includes(suite)) problems.push(`${suite} is in test:gate but not in npm test`);
+    if (!(suite in scripts)) problems.push(`${suite} is in test:gate but is not a package script`);
+  }
+  for (const suite of full.filter(suite => !gate.includes(suite))) {
+    if (typeof exclusions[suite] !== "string" || exclusions[suite].trim().length < 20) problems.push(`${suite} is in npm test but not in test:gate, and has no reason in test/gate-exclusions.json`);
+  }
+  for (const suite of Object.keys(exclusions)) {
+    if (!full.includes(suite)) problems.push(`${suite} is listed in test/gate-exclusions.json but is not in npm test`);
+    else if (gate.includes(suite)) problems.push(`${suite} is listed in test/gate-exclusions.json but is in test:gate`);
+  }
+  return problems;
+};
+const gateExclusions = JSON.parse(await read("test/gate-exclusions.json")).suites;
+// The Skill tells a Yorishiro-targeting run what to put in requiredChecks.
+for (const needle of ["npm run test:gate", "git diff --check", "test/gate-exclusions.json"]) assert.ok(verifySkill.includes(needle), `verify-yorishiro SKILL.md mentions ${needle}`);
+assert.deepEqual(gateExclusionProblems(pkg.scripts, gateExclusions), []);
+// The check itself: a suite dropped from test:gate without a reason, a stale
+// entry, and an entry without a reason must each be reported.
+const withoutReporter = { ...pkg.scripts, "test:gate": suitesOf(pkg.scripts["test:gate"]).filter(suite => suite !== "test:reporter").map(suite => `npm run ${suite}`).join(" && ") };
+assert.deepEqual(gateExclusionProblems(withoutReporter, gateExclusions), ["test:reporter is in npm test but not in test:gate, and has no reason in test/gate-exclusions.json"]);
+assert.deepEqual(gateExclusionProblems(pkg.scripts, { ...gateExclusions, "test:reporter": "x" }), ["test:reporter is listed in test/gate-exclusions.json but is in test:gate"]);
+assert.deepEqual(gateExclusionProblems(pkg.scripts, { ...gateExclusions, "test:verifier-boundary": "" }), ["test:verifier-boundary is in npm test but not in test:gate, and has no reason in test/gate-exclusions.json"]);
 assert.equal(await exists("docs/licenses/pstack-MIT.txt"), true);
 const license = await read("docs/licenses/pstack-MIT.txt");
 assert.match(license, /MIT License/);

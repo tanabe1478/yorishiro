@@ -71,6 +71,16 @@ helperは同期spawnしたprocessの終了を待つため、常駐processを残�
 - `features/README.md` — baseline preconditions、driving convention、proof/skip reporting、feature index。
 - `features/*.md` — 各featureの4-H2 journey。
 
+## Yorishiro 自身を対象にする run の qualityContract
+
+`development_pipeline` の gate は、対象を disposable snapshot へコピーし、書き込みをその中に限る sandbox で `requiredChecks` を実行する。`npm test` をそのまま入れると、snapshot の中では通らないスイートがあるため必ず `QUALITY_GATE_FAILED` になる。
+
+- `requiredChecks` は次の2つにする。`npm test` は入れない。
+  - `npm run test:gate`（`program: "npm"`、`args: ["run", "test:gate"]`、`timeoutMs: 300000`）
+  - `git diff --check`（`program: "git"`、`args: ["diff", "--check"]`、`timeoutMs: 60000`）
+- 全件の `npm test` は Worker が sandbox の外で実行し、終了コードを report の evidence に書く。Reviewer は gate の証跡と合わせて確認する。
+- `test:gate` から外したスイートと理由は `test/gate-exclusions.json` にある。`npm test` と `test:gate` の差分がすべてそこに理由付きで載っていることは `npm run test:skill-integrity` が検査する。スイートを足したら `test:gate` に入れるか、理由を付けて一覧へ載せる。
+
 ## 限界
 
 - このSkillは実際のHerdr+LLM pane起動を検証しません。`npm test`のmocked production-flow testはpipeline制御の証拠ですが、実LLM runの代わりではありません。

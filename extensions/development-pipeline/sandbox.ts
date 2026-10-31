@@ -9,7 +9,11 @@ function probe(program: string, args: string[], cwd: string): Promise<boolean> {
 export async function preflightVerifierSandbox(cwd: string): Promise<void> {
   let target: string;
   try { await access(cwd); target = await realpath(cwd); } catch { throw new Error(`Verifier sandbox target is unavailable: ${cwd}`); }
-  const temporaryRoots = [await realpath(tmpdir()), "/tmp", "/private/tmp"]; if (temporaryRoots.some(root => { const relative = path.relative(root, target); return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".."); })) throw new Error("Verifier sandbox does not support repositories under /tmp; use a persistent checkout");
+  // The snapshot is a copy of the target and the checks write their temp files into it. A temp directory inside the
+  // target (as in the snapshot of a verification run) would be copied into the next snapshot, again and again.
+  const temporary = await realpath(tmpdir()), inside = path.relative(target, temporary);
+  if (inside === "" || (!inside.startsWith(`..${path.sep}`) && inside !== ".." && !path.isAbsolute(inside))) throw new Error(`Verifier sandbox cannot copy a target that contains the temporary directory (${temporary} is inside ${target}); run it from outside the target, or set TMPDIR to a directory outside it`);
+  const temporaryRoots = [temporary, "/tmp", "/private/tmp"]; if (temporaryRoots.some(root => { const relative = path.relative(root, target); return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".."); })) throw new Error("Verifier sandbox does not support repositories under /tmp; use a persistent checkout");
   if (process.platform === "darwin") {
     try { await access("/usr/bin/sandbox-exec"); } catch { throw new Error("Verifier requires /usr/bin/sandbox-exec on macOS"); }
     return;

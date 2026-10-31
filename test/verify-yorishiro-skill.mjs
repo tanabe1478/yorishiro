@@ -9,12 +9,16 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const helper = path.join(root, ".pi", "skills", "verify-yorishiro", "scripts", "verify-yorishiro.mjs");
 const evidenceRoot = await mkdtemp(path.join(os.tmpdir(), "yorishiro-verify-skill-evidence-"));
+// Every Pi the helper starts takes a lock under its agent directory. Use a
+// scratch one so the test neither writes to ~/.pi/agent nor fails where that
+// path is read-only (the quality gate's verification sandbox).
+const agentDir = await mkdtemp(path.join(os.tmpdir(), "yorishiro-verify-skill-agent-"));
 
 const invoke = (args, extraEnv = {}) => spawnSync(process.execPath, [helper, ...args], {
   cwd: root,
   encoding: "utf8",
   timeout: 60_000,
-  env: { ...process.env, YORISHIRO_VERIFY_EVIDENCE_ROOT: evidenceRoot, PI_OFFLINE: "1", ...extraEnv },
+  env: { ...process.env, YORISHIRO_VERIFY_EVIDENCE_ROOT: evidenceRoot, PI_OFFLINE: "1", PI_CODING_AGENT_DIR: agentDir, ...extraEnv },
 });
 
 try {
@@ -87,5 +91,6 @@ try {
   assert.match(readFileSync(path.join(root, ".pi", "skills", "verify-yorishiro", "SKILL.md"), "utf8"), /## Helpers/);
 } finally {
   await rm(evidenceRoot, { recursive: true, force: true });
+  await rm(agentDir, { recursive: true, force: true });
 }
 console.log("generated verify-yorishiro helper real-entry test passed");

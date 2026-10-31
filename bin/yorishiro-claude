@@ -32,6 +32,10 @@ $(cat "$ROOT/AGENTS.md")"
 # AGENTS.local.md
 
 $(cat "$ROOT/AGENTS.local.md")"
+    else
+      prompt+="
+
+AGENTS.local.md はこの端末にない。探したり、ないことを報告したりしなくてよい。"
     fi
     harness_args=(--append-system-prompt "$prompt")
     ;;

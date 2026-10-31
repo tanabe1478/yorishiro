@@ -25,7 +25,7 @@ Claude CodeとClaudeのモデルだけで動かす場合の役割・既定モデ
 ## 前提
 
 - 親PiがHerdr内で動作し、`HERDR_PANE_ID`、`HERDR_TAB_ID`、`HERDR_WORKSPACE_ID`、`HERDR_SOCKET_PATH`が利用できること。
-- 対象リポジトリがread-only検証sandboxを利用できること。未対応環境、sandbox未導入環境、`/tmp`配下の対象は作業開始前に拒否されます。
+- 対象リポジトリがread-only検証sandboxを利用できること。未対応環境、sandbox未導入環境、`/tmp`配下の対象、`TMPDIR`（`os.tmpdir()`）が対象の中にある場合は作業開始前に拒否されます。
 - 開始時に現在タブへ親以外のペインがある場合、`LAYOUT_OCCUPIED`として停止し、他人のペインを自動削除しません。
 
 ## レイアウト
@@ -55,7 +55,7 @@ WorkerとReviewerは`submit_stage_report`で中央validatorが検証する構造
 
 Quality evidence不一致の初回だけ、Reviewerを起動せず同じWorkerペインへpath本文を除いたsanitized findingを送り、quality repairを1回行います。signatureは違反種別とcontract item/check IDで安定化します。同じsignatureが再発した場合は、同一Workerの有限repairを使い切ったものとして`NEEDS_PLANNER`で停止し、モデル切替・fallbackは行わず、停止理由を`quality-planner-stop.json`と`run.json`へ残します。異なる2回目の違反は`WORKER_EVIDENCE_MISMATCH`で停止し、loopしません。
 
-COMPLETEDのReviewer開始前にはrequiredChecksをshellを介さず対象checkoutの使い捨てsnapshot上で順次実行し、失敗・timeout・cancelは`QUALITY_GATE_FAILED`として停止します。各checkは出力SHA-256に加えて最大4KiBの診断抜粋をartifactと失敗結果へ残します。結果は`quality-gate-N.json`へ保存し、修正attemptごとに再実行します。validator通過したCOMPLETED event、当該attemptのquality gate eventとartifactが揃わない限り`SUCCESS`にはなりません。
+COMPLETEDのReviewer開始前にはrequiredChecksをshellを介さず対象checkoutの使い捨てsnapshot上で順次実行し、失敗・timeout・cancelは`QUALITY_GATE_FAILED`として停止します。各checkは出力SHA-256と診断抜粋をartifactと失敗結果へ残します。抜粋（`outputExcerpt`）は、出力が4KiB以下ならそのまま、超えるなら先頭1KiBと末尾3KiBの間に`[... 中略 ...]`を挟んだものです（UTF-8の境界は崩しません）。出力の先頭64KiBと末尾64KiBは`quality-gate-N-output/<check別の名前>.log`（`evidence/`とは別の場所、`outputLog`に`artifacts`内の相対pathを記録）に保存し、64KiBを超えて間を省いた場合は、ログ内に1行その旨を入れます。失敗したcheckのsummaryの「主な出力」は、末尾側から、スタックフレーム（`at ...`で始まる行）と`npm error`／`npm ERR!`の行を除いた上で、`Error`で終わる名前から始まる最後の行（`AssertionError [ERR_ASSERTION]: ...`、`Error: ...`）、無ければ`Error`／`AssertionError`／`assert`／`FAIL`／`failed`／`not ok`を含む最後の行、それも無ければ最後の非空行を出します（除いた結果が空なら除く前の行から選びます）（成功したcheckは先頭の非空行）。末尾はstdoutとstderrを届いた順に並べたもので、2本のpipe間の順序は厳密ではありません。結果は`quality-gate-N.json`へ保存し、修正attemptごとに再実行します。validator通過したCOMPLETED event、当該attemptのquality gate eventとartifactが揃わない限り`SUCCESS`にはなりません。
 
 Reviewerの判定は次の4つです。
 
@@ -71,6 +71,10 @@ Workerへ戻す情報はsanitized blocking findingだけに制限し、Reviewer�
 ## sandbox
 
 Reviewerとquality gateの検証コマンドは、対象checkoutをcopy-on-write優先で使い捨てsnapshotへ複製し、そのsnapshotだけを書き込み可能にしたmacOSの`sandbox-exec`またはLinuxのbubblewrap/user namespace内で実行します。ビルド成果物やテストfixtureはsnapshotへ書けますが、元checkoutへの書き込みはkernelで拒否されます。
+
+検証コマンドの環境は、orchestratorの環境から`YORISHIRO_`で始まる変数（`YORISHIRO_ROOT`、`YORISHIRO_RUNTIME`、`YORISHIRO_ROLE`など）と`HERDR_`で始まる変数を取り除き、snapshot内を指す`TMPDIR`／`TMP`／`TEMP`、`npm_config_cache`、`XDG_CACHE_HOME`、`YORISHIRO_EVIDENCE_DIR`を設定したものです。`YORISHIRO_ROOT`を継承すると、snapshot内で動くpipelineが元checkoutの`artifacts/`へ書こうとしてsandboxに拒否されます。環境は`verifier-tools.ts`の`verificationEnvironment()`が組み立てます。
+
+snapshotは書き込みを閉じたsandboxの中なので、検証コマンドからさらにsandboxを起動する（macOSでは`sandbox-exec`の入れ子、つまりpipelineや`runSandboxedVerification`を呼ぶテスト）ことはできません。Yorishiro自身を対象にするrunの`requiredChecks`は`npm run test:gate`にし、入れ子になるスイートは`test/gate-exclusions.json`の理由付き一覧に載せ、Workerがsandboxの外で`npm test`を実行して確かめます。
 
 ## 証跡回収
 

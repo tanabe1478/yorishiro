@@ -3,6 +3,15 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import os from "node:os";
 import path from "node:path";
 
+// These tests drive the Pi-runtime pipeline against a fixture of their own. A
+// Yorishiro session (bin/yorishiro-pipeline, bin/yorishiro-claude) exports
+// YORISHIRO_ROOT=<real checkout> and a Claude-runtime run YORISHIRO_RUNTIME=claude,
+// and `npm test` inherits both. index.ts reads YORISHIRO_ROOT when it runs
+// (artifacts would go to the real checkout, which a sandboxed gate cannot write)
+// and models.ts reads YORISHIRO_RUNTIME at import time.
+delete process.env.YORISHIRO_ROOT;
+delete process.env.YORISHIRO_RUNTIME;
+
 const root = path.resolve(new URL("..", import.meta.url).pathname);
 const temp = await mkdtemp(path.join(os.tmpdir(), "yorishiro-cleanup-v3-"));
 const bin = path.join(temp, "bin");

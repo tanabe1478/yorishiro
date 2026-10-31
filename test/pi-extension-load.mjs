@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { rmSync } from "node:fs";
 import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
@@ -7,13 +8,18 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const pi = process.env.YORISHIRO_PI_BIN || "pi";
+// Pi takes a lock under its agent directory even for get_state. Give it a
+// scratch one so the test neither writes to ~/.pi/agent nor fails where that
+// path is read-only (the quality gate's verification sandbox).
+const agentDir = await mkdtemp(path.join(os.tmpdir(), "yorishiro-pi-agent-"));
+process.on("exit", () => rmSync(agentDir, { recursive: true, force: true }));
 const run = (extension) => spawnSync(pi, [
   "--mode", "rpc", "--no-session", "--no-tools", "--extension", extension,
 ], {
   cwd: root,
   input: '{"id":"probe","type":"get_state"}\n',
   encoding: "utf8",
-  env: { ...process.env, PI_OFFLINE: "1" },
+  env: { ...process.env, PI_OFFLINE: "1", PI_CODING_AGENT_DIR: agentDir },
   timeout: 30_000,
 });
 

@@ -150,19 +150,31 @@ try {
     return JSON.parse(await readFile(argvLog, "utf8"));
   };
   const realRoot = await realpath(root);
+  // The launcher compares `pwd -P` with the harness root, so "outside" has to
+  // hold after symlinks resolve. os.tmpdir() can itself be inside the harness
+  // (the quality gate's snapshot points TMPDIR at .yorishiro-tmp), so fall back
+  // to the filesystem root, which exists everywhere and is never inside it.
+  const insideHarness = async dir => `${await realpath(dir)}/`.startsWith(`${realRoot}/`);
+  const outsideCwd = await insideHarness(cwd) ? path.parse(realRoot).root : cwd;
+  assert.equal(await insideHarness(outsideCwd), false);
   assert.deepEqual(await parentLauncher(root), ["--plugin-dir", realRoot, "--model", "m"]);
   assert.deepEqual(await parentLauncher(path.join(root, "work")), ["--plugin-dir", realRoot, "--model", "m"]);
-  const outside = await parentLauncher(cwd);
+  const outside = await parentLauncher(outsideCwd);
   assert.deepEqual([outside[0], outside[1], outside[2], ...outside.slice(-2)], ["--plugin-dir", realRoot, "--append-system-prompt", "--model", "m"]);
   assert.ok(outside[3].includes(`Yorishiro ハーネス（${realRoot}）`), "the prompt names the harness root for relative paths");
   assert.ok(outside[3].includes(await readFile(path.join(root, "AGENTS.md"), "utf8").then(text => text.trim())), "AGENTS.md is appended verbatim");
+  // The local notes are appended when present; otherwise the prompt says they
+  // are absent so the session does not go looking for them.
+  const localNotes = await readFile(path.join(root, "AGENTS.local.md"), "utf8").catch(() => null);
+  if (localNotes === null) assert.ok(outside[3].includes("AGENTS.local.md はこの端末にない"), "a missing AGENTS.local.md is stated");
+  else assert.ok(outside[3].includes(localNotes.trim()), "AGENTS.local.md is appended verbatim");
   // Linked onto PATH (through a relative link and a link to that link), the
   // launcher must still find the harness rather than the link's directory.
   const pathBin = path.join(base, "path-bin");
   await mkdir(pathBin, { recursive: true });
   await symlink(path.relative(await realpath(pathBin), path.join(realRoot, "bin", "yorishiro-claude")), path.join(pathBin, "yorishiro-claude-relative"));
   await symlink(path.join(pathBin, "yorishiro-claude-relative"), path.join(pathBin, "yorishiro-claude"));
-  const linked = spawnSync(path.join(pathBin, "yorishiro-claude"), ["--model", "m"], { cwd, encoding: "utf8", env: { ...process.env, YORISHIRO_CLAUDE_BIN: fakeClaude } });
+  const linked = spawnSync(path.join(pathBin, "yorishiro-claude"), ["--model", "m"], { cwd: outsideCwd, encoding: "utf8", env: { ...process.env, YORISHIRO_CLAUDE_BIN: fakeClaude } });
   assert.equal(linked.status, 0, linked.stderr || String(linked.error));
   assert.deepEqual(JSON.parse(await readFile(argvLog, "utf8")), outside, "a PATH symlink behaves like the real launcher");
 } finally {

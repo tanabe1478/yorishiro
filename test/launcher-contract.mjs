@@ -5,6 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+// These tests drive the Pi-runtime pipeline. A Claude-runtime run exports
+// YORISHIRO_RUNTIME=claude to its gate, and models.ts reads it at import time.
+delete process.env.YORISHIRO_RUNTIME;
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const { discoverVerifySkills, isWorkflowName, renderLauncher, writeLauncher, writeWorkflowBrief } = await import("../extensions/development-pipeline/launcher.ts");
 

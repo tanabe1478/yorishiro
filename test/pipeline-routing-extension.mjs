@@ -1,10 +1,23 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { installFakePi } from "./support/fake-pi.mjs";
 
+// These tests drive the Pi-runtime pipeline against a fixture of their own. A
+// Yorishiro session (bin/yorishiro-pipeline, bin/yorishiro-claude) exports
+// YORISHIRO_ROOT=<real checkout> and a Claude-runtime run YORISHIRO_RUNTIME=claude,
+// and `npm test` inherits both. index.ts reads YORISHIRO_ROOT when it runs
+// (artifacts would go to the real checkout, which a sandboxed gate cannot write)
+// and models.ts reads YORISHIRO_RUNTIME at import time.
+delete process.env.YORISHIRO_ROOT;
+delete process.env.YORISHIRO_RUNTIME;
 const root = path.resolve(new URL("..", import.meta.url).pathname);
+// The sandbox preflight refuses a target that contains the temporary directory.
+// In the quality gate TMPDIR is inside this checkout (the snapshot), so run the
+// pipeline against an empty directory beside it. Elsewhere the checkout is the target.
+const tmpInsideRoot = `${await realpath(os.tmpdir())}${path.sep}`.startsWith(`${await realpath(root)}${path.sep}`);
+const target = tmpInsideRoot ? await mkdtemp(path.join(root, "yorishiro-routing-target-")) : root;
 const herdrDir = await mkdtemp(path.join(os.tmpdir(), "yorishiro-fake-herdr-"));
 const log = path.join(herdrDir, "herdr.log");
 const socket = path.join(herdrDir, "socket");
@@ -62,9 +75,9 @@ async function executeScenario(scenario, aborted = false) {
   process.env.FAKE_HERDR_STARTS = "";
   const controller = new AbortController();
   if (aborted) controller.abort();
-  const result = await pipeline.execute("test", { task: "routing test", approvedPlan: "approved", qualityContract: { planItems: [{ id: "PLAN-1", description: "実装する" }], requiredChecks: [{ id: "CHECK-1", program: "/usr/bin/true", args: [] }] }, cwd: root, cleanupMode: "never" }, controller.signal, update => {
+  const result = await pipeline.execute("test", { task: "routing test", approvedPlan: "approved", qualityContract: { planItems: [{ id: "PLAN-1", description: "実装する" }], requiredChecks: [{ id: "CHECK-1", program: "/usr/bin/true", args: [] }] }, cwd: target, cleanupMode: "never" }, controller.signal, update => {
     if (scenario === "abort" && update?.content?.[0]?.text.includes("pane is running")) controller.abort();
-  }, { cwd: root, hasUI: false });
+  }, { cwd: target, hasUI: false });
   const artifact = result.details.artifactDir;
   const metadata = JSON.parse(await readFile(path.join(artifact, "run.json"), "utf8"));
   const calls = (await readFile(log, "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
@@ -85,7 +98,7 @@ for (const [scenario, expectedError] of [["startup", /startup deadline expired/]
   else assert.equal(metadata.panes[0].paneId, "fake:split1");
   assert.match(attempt.error, expectedError);
   assert.equal(calls.filter(a => a[0] === "agent" && a[1] === "start").length, 0);
-  assert.deepEqual(calls.filter(a => a[0] === "pane" && a[1] === "split").map(a => a.slice(2)), [["parent", "--direction", "right", "--ratio", "0.55", "--cwd", root, "--no-focus"]]);
+  assert.deepEqual(calls.filter(a => a[0] === "pane" && a[1] === "split").map(a => a.slice(2)), [["parent", "--direction", "right", "--ratio", "0.55", "--cwd", target, "--no-focus"]]);
   assert.equal(calls.filter(a => a[0] === "pane" && a[1] === "run").length, scenario === "layout-failure" ? 0 : 1);
   assert.equal(calls.filter(a => a[0] === "pane" && a[1] === "layout").length, 2);
   const interrupts = calls.filter(a => a[0] === "pane" && a[1] === "send-keys").map(a => a.slice(2));
@@ -128,7 +141,7 @@ async function expectPreflightFailure(env, pattern) {
   Object.assign(process.env, env);
   await writeFile(log, "");
   try {
-    await assert.rejects(() => pipeline.execute("preflight", { task: "preflight", approvedPlan: "approved", qualityContract: preflightContract, cwd: root, cleanupMode: "never" }, new AbortController().signal, () => {}, { cwd: root, hasUI: false }), pattern);
+    await assert.rejects(() => pipeline.execute("preflight", { task: "preflight", approvedPlan: "approved", qualityContract: preflightContract, cwd: target, cleanupMode: "never" }, new AbortController().signal, () => {}, { cwd: target, hasUI: false }), pattern);
     const calls = (await readFile(log, "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
     assert.equal(calls.filter(args => args[0] === "pane" && (args[1] === "split" || args[1] === "run")).length, 0, "preflight failure must not start a pane");
   } finally {
@@ -142,4 +155,5 @@ await expectPreflightFailure({ FAKE_PI_AUTH_EXIT: "1" }, /MODEL_PREFLIGHT_FAILED
 await expectPreflightFailure({ FAKE_PI_PROVIDER: "other" }, /MODEL_PREFLIGHT_FAILED.*resolved to provider other/);
 
 await rm(herdrDir, { recursive: true, force: true });
+if (target !== root) await rm(target, { recursive: true, force: true });
 console.log("registered production routing fake-Herdr test passed");
