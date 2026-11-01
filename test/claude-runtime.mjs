@@ -86,27 +86,33 @@ try {
   await mkdir(artifactDir, { recursive: true });
   await mkdir(cwd, { recursive: true });
   const fakeClaude = path.join(base, "claude");
-  const argvLog = path.join(base, "argv.json");
-  await writeFile(fakeClaude, `#!/bin/sh\nnode -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(2)))' ${JSON.stringify(argvLog)} "$@"\n`);
+  const argvLog = path.join(base, "argv.json"), envLog = path.join(base, "evidence-dir.txt");
+  await writeFile(fakeClaude, `#!/bin/sh\nprintf '%s' "\${YORISHIRO_EVIDENCE_DIR-unset}" > ${JSON.stringify(envLog)}\nnode -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(2)))' ${JSON.stringify(argvLog)} "$@"\n`);
   await chmod(fakeClaude, 0o755);
   const skillDir = path.join(root, "skills", "development-workflow");
   const common = { cwd, artifactDir, root, workflowSkillDir: skillDir, workflowPlaybook: path.join(skillDir, "playbooks", "feature.md"), workflow: "feature", verifySkills: [], claudeBin: fakeClaude };
   const prompt = "あなたはWorker · Claudeです。\n--model を含む複数行の\"依頼\"";
   const runLauncher = async stage => {
     const files = await writeLauncher({ ...common, stage, name: models.INFO[stage].label, promptFile: path.join(artifactDir, `${stage}-prompt.md`), promptFileContent: prompt, reportPath: path.join(artifactDir, `${stage}-pending.json`), workflowBrief: path.join(artifactDir, `workflow-brief-${stage}.md`) });
-    const run = spawnSync("/bin/sh", [files.launcher], { encoding: "utf8" });
+    // The quality gate sets YORISHIRO_EVIDENCE_DIR for its own checks; the launcher must decide it for itself.
+    const { YORISHIRO_EVIDENCE_DIR: _inherited, ...cleanEnv } = process.env;
+    const run = spawnSync("/bin/sh", [files.launcher], { encoding: "utf8", env: cleanEnv });
     assert.equal(run.status, 0, run.stderr);
     return { files, argv: JSON.parse(await readFile(argvLog, "utf8")) };
   };
   const option = (argv, name) => argv[argv.indexOf(name) + 1];
 
   const worker = await runLauncher("implement");
+  // The Worker writes its screenshots and observation JSON straight into the artifact.
+  const workerEvidence = path.join(artifactDir, "evidence", "worker");
+  assert.equal(await readFile(envLog, "utf8"), workerEvidence, "the Worker's YORISHIRO_EVIDENCE_DIR points into the artifact");
+  assert.equal(existsSync(workerEvidence), true, "the directory exists before the child starts");
   assert.equal(worker.argv.at(-1), prompt, "the prompt must stay the last positional argument");
   assert.equal(option(worker.argv, "--model"), "claude-sonnet-5-5");
   assert.equal(option(worker.argv, "--effort"), "high");
   assert.equal(option(worker.argv, "--name"), "Worker · Claude");
   assert.equal(option(worker.argv, "--tools"), "Read,Grep,Glob,Bash,Edit,Write");
-  assert.equal(option(worker.argv, "--allowedTools"), "Bash,Edit,Write,mcp__yorishiro__submit_stage_report");
+  assert.equal(option(worker.argv, "--allowedTools"), "Bash,Edit,Write,mcp__yorishiro__submit_stage_report,mcp__yorishiro__run_verification_command");
   assert.equal(option(worker.argv, "--setting-sources"), "project");
   assert.equal(option(worker.argv, "--permission-mode"), "dontAsk");
   assert.ok(worker.argv.includes("--strict-mcp-config"));
@@ -116,6 +122,7 @@ try {
   assert.ok(worker.argv.indexOf("--add-dir") < worker.argv.indexOf("--model"), "variadic options must precede single-value options");
 
   const reviewer = await runLauncher("review");
+  assert.equal(await readFile(envLog, "utf8"), "unset", "the Reviewer's evidence goes through run_verification_command, not a variable of its own");
   assert.equal(reviewer.argv.at(-1), prompt);
   assert.equal(option(reviewer.argv, "--model"), "claude-opus-5-5");
   assert.equal(option(reviewer.argv, "--effort"), "medium");
@@ -123,6 +130,7 @@ try {
   assert.equal(reviewer.argv.includes("--setting-sources"), false);
   assert.equal(option(reviewer.argv, "--tools"), "Read,Grep,Glob");
   assert.equal(option(reviewer.argv, "--allowedTools"), "mcp__yorishiro__submit_stage_report,mcp__yorishiro__run_verification_command");
+  assert.equal(option(worker.argv, "--allowedTools").split(",").filter(name => name.startsWith("mcp__")).join(","), option(reviewer.argv, "--allowedTools").split(",").join(","), "both roles get the same MCP tools");
   assert.doesNotMatch(option(reviewer.argv, "--allowedTools"), /Bash|Edit|Write/);
 
   const workerMcp = JSON.parse(await readFile(worker.files.mcpConfig, "utf8"));
@@ -131,16 +139,34 @@ try {
   assert.equal(server.type, "stdio");
   assert.equal(server.command, process.execPath);
   assert.equal(existsSync(server.args.at(-1)), true, "MCP server entry must exist");
-  assert.equal(server.env.YORISHIRO_MCP_TOOLS, "submit_stage_report");
+  assert.equal(server.env.YORISHIRO_MCP_TOOLS, "submit_stage_report,run_verification_command", "the Worker gets the same verifier as the Reviewer");
   assert.equal(server.env.YORISHIRO_REPORT_SCHEMA, "worker");
   assert.equal(server.env.YORISHIRO_REPORT_PATH, path.join(artifactDir, "implement-pending.json"));
-  assert.equal(server.env.YORISHIRO_TARGET_CWD, undefined, "the Worker gets no sandbox verifier");
+  assert.equal(server.env.YORISHIRO_TARGET_CWD, cwd, "the verifier snapshots the target checkout, which stays writable for the Worker");
+  assert.equal(server.env.YORISHIRO_EVIDENCE_ROOT, path.join(artifactDir, "evidence"));
   assert.equal(reviewerMcp.mcpServers.yorishiro.env.YORISHIRO_MCP_TOOLS, "submit_stage_report,run_verification_command");
   assert.equal(reviewerMcp.mcpServers.yorishiro.env.YORISHIRO_REPORT_SCHEMA, "reviewer");
   assert.equal(reviewerMcp.mcpServers.yorishiro.env.YORISHIRO_TARGET_CWD, cwd);
   assert.equal(reviewerMcp.mcpServers.yorishiro.env.YORISHIRO_EVIDENCE_ROOT, path.join(artifactDir, "evidence"));
   assert.deepEqual(renderClaudeMcpConfig({ ...common, stage: "implement", name: "x", promptFile: path.join(artifactDir, "p.md"), reportPath: "/r.json", workflowBrief: "/b.md" }).mcpServers.yorishiro.env.YORISHIRO_RUNTIME, "claude");
   assert.doesNotMatch(renderLauncher({ ...common, stage: "implement", name: "x", promptFile: "/p.md", reportPath: "/r.json", workflowBrief: "/b.md" }), / -e | --no-extensions| --skill /, "Pi-only flags must not leak into Claude launchers");
+
+  // The Worker's brief and prompt tell it to check requiredChecks with the verifier and where evidence goes. The Reviewer's do not change.
+  const { writeWorkflowBrief } = await import("../extensions/development-pipeline/launcher.ts");
+  const { promptFor } = await import("../extensions/development-pipeline/index.ts");
+  const briefOptions = { artifactDir, cwd, workflow: "bug-fix", skillDir, playbookPath: path.join(skillDir, "playbooks", "bug-fix.md"), verifySkills: [] };
+  const workerBrief = await readFile(await writeWorkflowBrief({ ...briefOptions, stage: "implement" }), "utf8");
+  const reviewerBrief = await readFile(await writeWorkflowBrief({ ...briefOptions, stage: "review" }), "utf8");
+  for (const [label, text] of [["brief", workerBrief], ["prompt", promptFor("implement", "依頼", artifactDir, "計画", "", 2, "", "", "{}")]]) {
+    assert.match(text, /run_verification_command/, `the Worker ${label} names the verifier`);
+    assert.match(text, /requiredChecks/, `the Worker ${label} ties it to the contract's requiredChecks`);
+    assert.match(text, /exit 0/, `the Worker ${label} asks for exit 0`);
+    assert.match(text, /手作りしない/, `the Worker ${label} forbids hand-made clones and sandboxes`);
+    assert.ok(text.includes("$YORISHIRO_EVIDENCE_DIR") && text.includes(workerEvidence), `the Worker ${label} says where evidence goes`);
+  }
+  assert.ok(promptFor("implement", "依頼", artifactDir, "計画", "", 2, "", "", "{}").includes(path.join(workerEvidence, "attempt-2")), "the prompt names the attempt's subdirectory");
+  assert.doesNotMatch(reviewerBrief, /手作りしない|Workerの道具/);
+  assert.doesNotMatch(promptFor("review", "依頼", artifactDir, "計画", "", 1, "/w.json", "{}", "{}", "/g.json", "{}", 1), /手作りしない/);
 
   // bin/yorishiro-claude: Claude Code finds AGENTS.md itself below the harness;
   // anywhere else the launcher must hand the instructions over.

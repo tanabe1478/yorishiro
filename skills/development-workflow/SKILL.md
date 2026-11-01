@@ -36,7 +36,8 @@ pstack の考え方（関連codeの理解 → domain/data shape の選択 → �
 
 - 最初にbrief、このSKILL.md、指定playbook、対象checkoutの`.pi/skills/verify-*/SKILL.md`と`features/README.md`を読む。
 - briefにないpathや存在しないcommandを捏造しない。
-- **Worker:** 対象checkoutの承認済みpathを編集してよい。commit、push、PR作成、merge、外部messageは行わない。run artifactはorchestrator所有であり、指定されたreport以外を書き換えない。秘密情報を保存しない。他者のsessionやペインへ介入しない。
+- **Worker:** 対象checkoutの承認済みpathを編集してよい。commit、push、PR作成、merge、外部messageは行わない。run artifactはorchestrator所有であり、指定されたreport以外を書き換えない（Claude Codeでは`$YORISHIRO_EVIDENCE_DIR`だけ例外で、証跡をそこへ書く）。秘密情報を保存しない。他者のsessionやペインへ介入しない。
+- **Worker（Claude Code）:** 報告前に、qualityContractのrequiredChecksを`run_verification_command`で実行してexit 0を確かめる。本番のgateと同じsnapshotとsandboxで動くので、検証用の複製やsandboxを手作りしない。スクリーンショットや観測JSONは`$YORISHIRO_EVIDENCE_DIR`（artifactの`evidence/worker/`）の下の`attempt-<n>/`に置く。
 - **Reviewer:** sourceと対象checkoutを編集しない。検証は`run_verification_command`などでdisposable snapshot内だけを書き込み可能にし、元checkoutを変更しない。永続writeは`submit_stage_report`とorchestratorが回収する`YORISHIRO_EVIDENCE_DIR`に限る。commit、push、PR作成、merge、外部messageは行わない。
 - 検証commandの証跡は`YORISHIRO_EVIDENCE_DIR`（snapshot内）へ書き、orchestratorがartifactへ回収する。cleanupで消えるtempへ置いたままにしない。
 - 固定モデルと異なるモデルが選択された場合、model guardがtool実行を拒否する。モデルを切り替えず、親Plannerへ戻る。

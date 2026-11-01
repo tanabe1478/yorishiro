@@ -249,7 +249,9 @@ export default function (pi: ExtensionAPI) {
       if (!cwd) throw new Error("Verifier sandbox is not configured");
       const evidenceRoot = process.env.YORISHIRO_EVIDENCE_ROOT;
       if (evidenceRoot && !path.isAbsolute(evidenceRoot)) throw new Error("Verifier evidence root must be an absolute orchestrator path");
-      const evidenceDir = evidenceRoot ? path.join(evidenceRoot, "reviewer", `${Date.now()}-${process.pid}-${++evidenceCounter}`) : undefined;
+      // The Claude Worker uses this tool too (before reporting); keep its snapshot evidence apart from the Reviewer's.
+      const evidenceOwner = process.env.YORISHIRO_REPORT_STAGE === "implement" ? "worker-verification" : "reviewer";
+      const evidenceDir = evidenceRoot ? path.join(evidenceRoot, evidenceOwner, `${Date.now()}-${process.pid}-${++evidenceCounter}`) : undefined;
       const timeout = input.timeoutMs ?? 120000;
       const result = await runSandboxedVerification(input.program, input.args, cwd, timeout, signal, evidenceDir ? { evidenceDir } : {});
       const status = result.timedOut ? "TIMEOUT" : result.cancelled ? "CANCELLED" : "EXIT";

@@ -17,7 +17,9 @@ import { assertSuccessQualityState, captureFingerprintMap, changedPathsBetween, 
 import { boundUtf8, boundUtf8Tail, runSandboxedVerification } from "./verifier-tools.ts";
 import { createHash } from "node:crypto";
 import { AGENT_BINARY, INFO, MODELS, ROLE_LABELS, RUNTIME, STAGES, roleMetadata, roleModels, type Stage } from "./models.ts";
-import { discoverVerifySkills, isWorkflowName, shellQuote, writeLauncher, writeWorkflowBrief, type WorkflowName } from "./launcher.ts";
+import { discoverVerifySkills, isWorkflowName, shellQuote, workerToolingInstructions, writeLauncher, writeWorkflowBrief, type WorkflowName } from "./launcher.ts";
+import { PROMPT_NOT_SUBMITTED, PromptNotSubmittedError, deliverPrompt, describePromptFailure, writeFollowUpPrompt, type PromptDeliveryDeps } from "./prompt-delivery.ts";
+import { inventoryWorkerEvidence } from "./worker-evidence.ts";
 import { preflightClaudeModels, preflightFixedModels } from "./model-preflight.ts";
 import { detectBackgroundShells } from "./background-shells.ts";
 import { checkWorkspaceTrust, workspaceTrustWarning } from "./workspace-trust.ts";
@@ -227,6 +229,23 @@ async function startPane(stage: Stage, name: string, prompt: string, reportPath:
   return { paneId: split.paneId, layout, files };
 }
 async function sendPrompt(id: string, prompt: string) { const sent = await command("herdr", ["pane", "send-text", id, prompt]); if (sent.code) throw new Error(`Could not send prompt: ${sent.stderr || sent.stdout || `exit ${sent.code}`}`); const enter = await command("herdr", ["pane", "send-keys", id, "enter"]); if (enter.code) throw new Error(`Could not submit prompt: ${enter.stderr || enter.stdout}`); }
+/**
+ * Claude runtime, second and later instructions to a reused pane. The full text goes to
+ * `<stage>-prompt-<attempt>.md` and the pane only gets a one-line pointer; then the pane
+ * has to start working, or Enter is pressed again a bounded number of times.
+ */
+export async function sendFollowUpPrompt(paneId: string, artifactDir: string, stage: Stage, attempt: number, text: string, reportPath: string, signal?: AbortSignal, timing: Pick<PromptDeliveryDeps, "confirmWindowMs" | "maxEnterRetries" | "pollIntervalMs" | "settleBeforeEnterMs"> = {}) {
+  const { file, instruction } = await writeFollowUpPrompt(artifactDir, stage, attempt, text);
+  const result = await deliverPrompt(instruction, {
+    sendText: value => command("herdr", ["pane", "send-text", paneId, value]),
+    sendEnter: () => command("herdr", ["pane", "send-keys", paneId, "enter"]),
+    readStatus: async () => field(await paneGet(paneId), "agent_status"),
+    reportExists: () => existsSync(reportPath),
+    signal,
+    ...timing,
+  });
+  return { file, instruction, result };
+}
 export async function captureTranscript(id: string, file: string, run: (program: string, args: string[]) => Promise<CommandResult> = (program, args) => command(program, args)) {
   const primary = await run("herdr", ["agent", "read", id, "--source", "recent-unwrapped", "--lines", "200", "--format", "text"]);
   if (!primary.code) { await atomicWrite(file, primary.stdout); return { source: "agent" as const, bytes: Buffer.byteLength(primary.stdout, "utf8") }; }
@@ -259,11 +278,11 @@ async function waitPane(id: string, report: string, signal: AbortSignal | undefi
     },
   });
 }
-function promptFor(stage: Stage, task: string, dir: string, plan: string, review: string, attempt: number, workerReportPath = "", workerReportContent = "", contractJson = "", qualityGatePath = "", qualityGateContent = "", workerSnapshotAttempt = attempt) {
+export function promptFor(stage: Stage, task: string, dir: string, plan: string, review: string, attempt: number, workerReportPath = "", workerReportContent = "", contractJson = "", qualityGatePath = "", qualityGateContent = "", workerSnapshotAttempt = attempt) {
   const label = INFO[stage].label, report = path.join(dir, `${stage}-${attempt}.json`);
   const common = `あなたは${label}です。可視化された逐次pipelineの一員として、現在のrepositoryで作業してください。\n作業内容：\n${task}\n\nartifact保存先：${dir}。今回のattempt：${attempt}。\n最初に必ず ${path.join(dir, `workflow-brief-${stage}.md`)} を最後まで読み、そこに示されたworkflow Skill、playbook、対象checkoutのverification Skill / feature mapを実ファイルとして読んでから進めてください。skill自動探索は無効ですが、briefに書かれたpathを明示的に読む必要があります。compilationだけを成功証拠にせず、対象の実ユーザー面で確認してください。commit、push、PR作成、外部messageは行わないでください。バックグラウンドジョブの完了待ちでターンを終えないでください。長いコマンドはフォアグラウンドでtimeoutを指定して実行してください。`;
   const reportInstruction = `最後に必ずsubmit_stage_reportを呼び出し、structured JSON契約で報告してください。orchestratorが指定したpending先は${report}（attempt ${attempt}）です。ツールの成功応答（Submitted ... report）で書き込み成功を確認してください。validation errorが返った場合はexpected/missing/unexpected fieldsを確認してpayloadを修正し、同じpending先へ成功するまで再提出してください。成功確認前に終了・idleにならないでください。`;
-  if (stage === "implement") return `${common}\n承認済み計画：\n${plan}\nquality contract（このJSONを厳守）：\n${contractJson}\n${review ? `\norchestratorからのsanitized修正finding（このstructured dataだけを使用）：\n${review}\n` : ""}承認済み計画の範囲だけを実装してください。sourceを変更し、実装・test・動作確認を行った結果を、COMPLETEDまたはBLOCKEDと日本語のsummary、changedScope、evidenceで報告してください。COMPLETEDのcompletedPlanItemsは契約の全planItemsをidごとに一度ずつ、BLOCKEDは実際に完了したcontract IDのsubsetだけを含め、日本語のevidenceを付けてください。どちらもchangedPathsにはbaseline以後のgit実diffを正確に列挙し、allowedPathPrefixesを守ってください。${reportInstruction}`;
+  if (stage === "implement") return `${common}\n承認済み計画：\n${plan}\nquality contract（このJSONを厳守）：\n${contractJson}\n${review ? `\norchestratorからのsanitized修正finding（このstructured dataだけを使用）：\n${review}\n` : ""}承認済み計画の範囲だけを実装してください。sourceを変更し、実装・test・動作確認を行った結果を、COMPLETEDまたはBLOCKEDと日本語のsummary、changedScope、evidenceで報告してください。COMPLETEDのcompletedPlanItemsは契約の全planItemsをidごとに一度ずつ、BLOCKEDは実際に完了したcontract IDのsubsetだけを含め、日本語のevidenceを付けてください。どちらもchangedPathsにはbaseline以後のgit実diffを正確に列挙し、allowedPathPrefixesを守ってください。${RUNTIME === "claude" ? `\n${workerToolingInstructions(dir, attempt).join("\n")}\n` : ""}${reportInstruction}`;
   return `${common}\n承認済み計画：\n${plan}\nquality contract（validator済み）：\n${contractJson}\n現在のWorker report path：${workerReportPath}\nvalidator済みWorker report JSON本文：\n${workerReportContent}\ncurrent quality-gate artifact path：${qualityGatePath}\nvalidator済みquality-gate内容：\n${qualityGateContent}\n今回のWorker attemptのactual snapshot：${path.join(dir, `diffs/implement-${workerSnapshotAttempt}-status.txt`)} / ${path.join(dir, `diffs/implement-${workerSnapshotAttempt}-diff.patch`)} / ${path.join(dir, `diffs/implement-${workerSnapshotAttempt}-fingerprint.json`)}\nbaseline：${path.join(dir, "diffs/baseline-status.txt")} / ${path.join(dir, "diffs/baseline-diff.patch")} / ${path.join(dir, "diffs/baseline-fingerprint.json")}\nread-onlyの確認手段だけを使い、sourceを変更しないでください。Workerの自己申告ではなくactual changed pathsと独立check結果を確認し、APPROVED、APPROVED_WITH_NOTES、CHANGES_REQUESTED、NEEDS_PLANNERとstructuredな日本語fieldを報告してください。${reportInstruction}`;
 }
 
@@ -311,8 +330,8 @@ export default function (pi: ExtensionAPI) {
       emit(stage, `進捗: 試行${attempt}、${reason}`);
     };
     let activePane: string | undefined, abortWork: Promise<boolean> | undefined, plan = approvedPlan, verification = "", review = "";
-    const runStage = async (stage: Stage, text: string, attempt: number): Promise<{ valid: boolean; positive: boolean; verdict?: string; text: string; qualityMismatch?: QualityMismatch }> => {
-      const reportFile = path.join(artifactDir, `${stage}-${attempt}.json`), pendingReport = path.join(artifactDir, `${stage}-pending.json`), terminalFile = path.join(artifactDir, `${stage}-${attempt}.terminal.txt`), record: Attempt = { attempt, status: "running", startedAt: now(), reportFile: path.basename(reportFile), paneId: "" }; let terminalCaptured = false, snapshotSucceeded = true, parsed: any, report = ""; let stageResult: { valid: boolean; positive: boolean; verdict?: string; text: string; qualityMismatch?: QualityMismatch } = { valid: false, positive: false, text: "" };
+    const runStage = async (stage: Stage, text: string, attempt: number): Promise<{ valid: boolean; positive: boolean; verdict?: string; text: string; qualityMismatch?: QualityMismatch; failureCode?: string }> => {
+      const reportFile = path.join(artifactDir, `${stage}-${attempt}.json`), pendingReport = path.join(artifactDir, `${stage}-pending.json`), terminalFile = path.join(artifactDir, `${stage}-${attempt}.terminal.txt`), record: Attempt = { attempt, status: "running", startedAt: now(), reportFile: path.basename(reportFile), paneId: "" }; let terminalCaptured = false, snapshotSucceeded = true, parsed: any, report = "", failureCode: string | undefined; let stageResult: { valid: boolean; positive: boolean; verdict?: string; text: string; qualityMismatch?: QualityMismatch } = { valid: false, positive: false, text: "" };
       const stageData = metadata.stages[stage]; stageData.status = "running"; stageData.attempts.push(record); let pane = metadata.panes.find((p: Pane) => p.name === INFO[stage].label) as Pane | undefined;
       if (!pane) { pane = { paneId: "", name: INFO[stage].label, model: MODELS[stage], attempts: [] }; metadata.panes.push(pane); }
       pane.attempts.push(record); await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
@@ -351,7 +370,24 @@ export default function (pi: ExtensionAPI) {
             throw error;
           }
           await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
-        } else { record.paneId = pane.paneId; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); await sendPrompt(pane.paneId, text); }
+        } else {
+          record.paneId = pane.paneId; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
+          if (RUNTIME !== "claude") await sendPrompt(pane.paneId, text);
+          else {
+            const sent = await sendFollowUpPrompt(pane.paneId, artifactDir, stage, attempt, text, pendingReport, signal);
+            const promptFile = path.basename(sent.file);
+            metadata.launchers = [...(metadata.launchers ?? []), promptFile];
+            const delivery = sent.result;
+            metadata.promptDeliveries = [...(metadata.promptDeliveries ?? []), { stage, attempt, paneId: pane.paneId, promptFile, instruction: sent.instruction, submitted: delivery.submitted, ...(delivery.submitted ? { via: delivery.via } : {}), enterPresses: delivery.enterPresses, status: delivery.submitted ? delivery.status : delivery.lastStatus, elapsedMs: delivery.elapsedMs, ...(!delivery.submitted && delivery.aborted ? { aborted: true } : {}), recordedAt: now() }];
+            if (!delivery.submitted && !delivery.aborted) {
+              const diagnostic = describePromptFailure(pane.paneId, delivery, sent.file);
+              metadata.promptFailures = [...(metadata.promptFailures ?? []), { code: PROMPT_NOT_SUBMITTED, stage, attempt, paneId: pane.paneId, promptFile, enterPresses: delivery.enterPresses, lastStatus: delivery.lastStatus, diagnostic, recordedAt: now() }];
+              await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
+              throw new PromptNotSubmittedError(diagnostic, { paneId: pane.paneId, promptFile: sent.file, enterPresses: delivery.enterPresses, lastStatus: delivery.lastStatus });
+            }
+            await atomicWrite(path.join(artifactDir, "run.json"), json(metadata));
+          }
+        }
         if (signal?.aborted) { const result = await routeMonitorFailure("aborted", abortWork ? () => abortWork! : () => interrupt(pane.paneId)); record.status = result!.status; stageData.status = result!.status; record.error = result!.evidence; return { valid: false, positive: false, text: "" }; }
         activePane = pane.paneId; await heartbeat(stage, attempt, `${pane.paneId}（${pane.name}）の完了を待機しています`);
         let lastHeartbeatAt = 0;
@@ -383,15 +419,16 @@ export default function (pi: ExtensionAPI) {
         record.status = valid ? (positive ? "passed" : "failed") : "failed"; stageData.status = record.status; if (!valid) record.error = record.error || (checked as any).error; stageResult.valid = valid; stageResult.positive = positive; stageResult.verdict = v; stageResult.text = report; return stageResult;
       } catch (e) {
         record.status = signal?.aborted ? "aborted" : "failed"; stageData.status = record.status; record.error = e instanceof Error ? e.message : String(e);
+        if (e instanceof PromptNotSubmittedError && !signal?.aborted) failureCode = e.code;
         if (pane?.paneId && (record.status === "aborted" || record.paneId === pane.paneId)) {
           abortWork ??= interrupt(pane.paneId);
           const stopped = await abortWork;
           if (!stopped) record.error += "; 子ペインをidleにできませんでした";
           else if (!record.error.includes("pane preserved")) record.error += "; active child stopped; pane preserved";
         }
-        return { valid: false, positive: false, text: "" };
+        return { valid: false, positive: false, text: "", ...(failureCode ? { failureCode } : {}) };
       }
-      finally { if (pane?.paneId && !terminalCaptured) { try { await captureTranscript(pane.paneId, terminalFile); } catch (e) { record.error = record.error || `terminal capture failed: ${e instanceof Error ? e.message : String(e)}`; } } record.finishedAt = now(); stageData.finishedAt = record.finishedAt; try { await snapshot(cwd, diffs, `${stage}-${attempt}`); const currentFingerprint = await fingerprintSnapshot(cwd, diffs, `${stage}-${attempt}`); stageData.fingerprint = `diffs/${stage}-${attempt}-fingerprint.json`; if (stage === "implement" && stageResult.valid && parsed) { const actualPaths = changedPathsBetween(baselineFingerprint, currentFingerprint); const evidence = compareWorkerEvidence(parsed, qualityContract, actualPaths); if (!evidence.valid) { const mismatch = { signature: evidence.signature, errors: evidence.errors, actualPaths, reportedPaths: parsed.changedPaths ?? [], violations: evidence.violations, paths: summarizeMismatchPaths({ outside: evidence.outside, missingPaths: evidence.missingPaths, unknownPaths: evidence.unknownPaths, prefixHints: evidence.prefixHints }) }; stageResult.qualityMismatch = mismatch; stageResult.valid = false; stageResult.positive = false; record.status = "failed"; stageData.status = "failed"; record.error = "WORKER_EVIDENCE_MISMATCH: " + evidence.errors.join("。 "); await atomicWrite(path.join(artifactDir, `quality-gate-${attempt}.json`), json({ gate: attempt, status: "failed", code: "WORKER_EVIDENCE_MISMATCH", details: "Workerの自己申告と実diffまたはquality contractが一致しません。", errors: evidence.errors, actualPaths, reportedPaths: parsed.changedPaths ?? [], ...mismatch.paths })); } } } catch (e) { if (record.status !== "aborted") { record.status = "failed"; stageData.status = "failed"; snapshotSucceeded = false; record.error = `stage fingerprint failed: ${e instanceof Error ? e.message : String(e)}`; stageResult.valid = false; stageResult.positive = false; stageResult.text = ""; } } if (signal?.aborted && pane?.paneId) { abortWork ??= interrupt(pane.paneId); const stopped = await abortWork; if (!stopped) record.error = record.error || "abort could not be confirmed"; } const finalized = finalizeStage(stageResult, snapshotSucceeded); stageResult.valid = finalized.valid; stageResult.positive = finalized.positive; stageResult.text = finalized.text; signal?.removeEventListener("abort", abortHandler); await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); }
+      finally { if (pane?.paneId && !terminalCaptured) { try { await captureTranscript(pane.paneId, terminalFile); } catch (e) { record.error = record.error || `terminal capture failed: ${e instanceof Error ? e.message : String(e)}`; } } record.finishedAt = now(); stageData.finishedAt = record.finishedAt; if (stage === "implement" && RUNTIME === "claude" && pane?.paneId) { try { metadata.workerEvidence = [...(metadata.workerEvidence ?? []).filter((entry: any) => entry.attempt !== attempt), { attempt, ...(await inventoryWorkerEvidence(artifactDir)) }]; } catch (e) { metadata.workerEvidence = [...(metadata.workerEvidence ?? []).filter((entry: any) => entry.attempt !== attempt), { attempt, error: e instanceof Error ? e.message : String(e) }]; } } try { await snapshot(cwd, diffs, `${stage}-${attempt}`); const currentFingerprint = await fingerprintSnapshot(cwd, diffs, `${stage}-${attempt}`); stageData.fingerprint = `diffs/${stage}-${attempt}-fingerprint.json`; if (stage === "implement" && stageResult.valid && parsed) { const actualPaths = changedPathsBetween(baselineFingerprint, currentFingerprint); const evidence = compareWorkerEvidence(parsed, qualityContract, actualPaths); if (!evidence.valid) { const mismatch = { signature: evidence.signature, errors: evidence.errors, actualPaths, reportedPaths: parsed.changedPaths ?? [], violations: evidence.violations, paths: summarizeMismatchPaths({ outside: evidence.outside, missingPaths: evidence.missingPaths, unknownPaths: evidence.unknownPaths, prefixHints: evidence.prefixHints }) }; stageResult.qualityMismatch = mismatch; stageResult.valid = false; stageResult.positive = false; record.status = "failed"; stageData.status = "failed"; record.error = "WORKER_EVIDENCE_MISMATCH: " + evidence.errors.join("。 "); await atomicWrite(path.join(artifactDir, `quality-gate-${attempt}.json`), json({ gate: attempt, status: "failed", code: "WORKER_EVIDENCE_MISMATCH", details: "Workerの自己申告と実diffまたはquality contractが一致しません。", errors: evidence.errors, actualPaths, reportedPaths: parsed.changedPaths ?? [], ...mismatch.paths })); } } } catch (e) { if (record.status !== "aborted") { record.status = "failed"; stageData.status = "failed"; snapshotSucceeded = false; record.error = `stage fingerprint failed: ${e instanceof Error ? e.message : String(e)}`; stageResult.valid = false; stageResult.positive = false; stageResult.text = ""; } } if (signal?.aborted && pane?.paneId) { abortWork ??= interrupt(pane.paneId); const stopped = await abortWork; if (!stopped) record.error = record.error || "abort could not be confirmed"; } const finalized = finalizeStage(stageResult, snapshotSucceeded); stageResult.valid = finalized.valid; stageResult.positive = finalized.positive; stageResult.text = finalized.text; signal?.removeEventListener("abort", abortHandler); await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); }
     };
     const qualityAfterWorker = async (worker: { qualityMismatch?: QualityMismatch }, attempt: number): Promise<string | undefined> => {
       if (worker.qualityMismatch) {
@@ -433,7 +470,7 @@ export default function (pi: ExtensionAPI) {
       if (!repaired.qualityMismatch) return { worker: repaired };
       return { worker: repaired, outcome: await qualityAfterWorker(repaired, implementAttempt) };
     };
-    const finish = async (outcome: string) => { if (signal?.aborted) { if (activePane) { const stopped = abortWork ? await abortWork : await interrupt(activePane); if (!stopped) metadata.abortError = "Herdr could not confirm the active pane became idle"; } outcome = "ABORTED"; } if (outcome === "ABORTED" && !metadata.cleanup) metadata.cleanup = { status: "aborted", results: (metadata.panes ?? []).map((pane: Pane) => ({ paneId: pane.paneId, name: pane.name, status: "skipped", reason: "cleanupは中断されました" })) }; metadata.finishedAt = now(); metadata.outcome = outcome; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); const mismatchDetail = (outcome === "WORKER_EVIDENCE_MISMATCH" || (outcome === "NEEDS_PLANNER" && metadata.qualityStop)) && metadata.workerEvidenceMismatch ? describeMismatchPaths(metadata.workerEvidenceMismatch) : ""; const qualityDetail = mismatchDetail || (outcome === "QUALITY_GATE_FAILED" ? (metadata.qualityGates?.at(-1)?.checks ?? []).filter((check: any) => check.exitCode !== 0 || check.timeout || check.cancelled).map((check: any) => check.summary).join("\n") : ""); return { content: [{ type: "text", text: `${outcome}\n成果物: ${artifactDir}${qualityDetail ? `\n${qualityDetail}` : ""}\n${outcome === "SUCCESS" ? "cleanupの判断待ちです。" : "子ペインを保持しました。"}` }], details: { outcome, cleanupDecision: cleanupMode, artifactDir, panes: metadata.panes } }; };
+    const finish = async (outcome: string) => { if (signal?.aborted) { if (activePane) { const stopped = abortWork ? await abortWork : await interrupt(activePane); if (!stopped) metadata.abortError = "Herdr could not confirm the active pane became idle"; } outcome = "ABORTED"; } if (outcome === "ABORTED" && !metadata.cleanup) metadata.cleanup = { status: "aborted", results: (metadata.panes ?? []).map((pane: Pane) => ({ paneId: pane.paneId, name: pane.name, status: "skipped", reason: "cleanupは中断されました" })) }; metadata.finishedAt = now(); metadata.outcome = outcome; await atomicWrite(path.join(artifactDir, "run.json"), json(metadata)); const mismatchDetail = (outcome === "WORKER_EVIDENCE_MISMATCH" || (outcome === "NEEDS_PLANNER" && metadata.qualityStop)) && metadata.workerEvidenceMismatch ? describeMismatchPaths(metadata.workerEvidenceMismatch) : ""; const promptDetail = outcome === PROMPT_NOT_SUBMITTED ? (metadata.promptFailures?.at(-1)?.diagnostic ?? "") : ""; const qualityDetail = mismatchDetail || promptDetail || (outcome === "QUALITY_GATE_FAILED" ? (metadata.qualityGates?.at(-1)?.checks ?? []).filter((check: any) => check.exitCode !== 0 || check.timeout || check.cancelled).map((check: any) => check.summary).join("\n") : ""); return { content: [{ type: "text", text: `${outcome}\n成果物: ${artifactDir}${qualityDetail ? `\n${qualityDetail}` : ""}\n${outcome === "SUCCESS" ? "cleanupの判断待ちです。" : "子ペインを保持しました。"}` }], details: { outcome, cleanupDecision: cleanupMode, artifactDir, panes: metadata.panes } }; };
     let cycle = 0;
     const hasReviewEventBus = !!(pi as any).events;
     const reviewEventBus = (pi as any).events ?? { emit: async () => { throw new Error("review event bus is unavailable"); } };
@@ -452,11 +489,11 @@ export default function (pi: ExtensionAPI) {
     let implemented = await runStage("implement", promptFor("implement", task, artifactDir, plan, "", implementAttempt, "", "", json(qualityContract)), implementAttempt);
     let qualityResolution = await resolveQualityMismatch(implemented, "initial"); implemented = qualityResolution.worker;
     if (qualityResolution.outcome) return finish(signal?.aborted ? "ABORTED" : qualityResolution.outcome);
-    if (!implemented.positive) return finish(signal?.aborted ? "ABORTED" : implemented.valid ? "IMPLEMENTATION_BLOCKED" : "IMPLEMENTATION_FAILED");
+    if (!implemented.positive) return finish(signal?.aborted ? "ABORTED" : implemented.valid ? "IMPLEMENTATION_BLOCKED" : implemented.failureCode ?? "IMPLEMENTATION_FAILED");
     const initialQualityOutcome = await qualityAfterWorker(implemented, implementAttempt); if (initialQualityOutcome) return finish(initialQualityOutcome);
     const initialGateContent = await fs.readFile(path.join(artifactDir, `quality-gate-${implementAttempt}.json`), "utf8");
     let reviewed = await runStage("review", promptFor("review", task, artifactDir, plan, "", 1, path.join(artifactDir, `implement-${implementAttempt}.json`), implemented.text, json(qualityContract), path.join(artifactDir, `quality-gate-${implementAttempt}.json`), initialGateContent, implementAttempt), 1); review = reviewed.text;
-    if (!reviewed.valid) return finish(signal?.aborted ? "ABORTED" : "REVIEW_FAILED");
+    if (!reviewed.valid) return finish(signal?.aborted ? "ABORTED" : reviewed.failureCode ?? "REVIEW_FAILED");
     while (!reviewed.positive) {
       const reviewData = (() => { try { return JSON.parse(reviewed.text); } catch { return undefined; } })();
       if (!reviewData) return finish("REVIEW_FAILED");
@@ -470,11 +507,11 @@ export default function (pi: ExtensionAPI) {
       implemented = await runStage("implement", promptFor("implement", task, artifactDir, plan, handoff, implementAttempt, "", "", json(qualityContract)), implementAttempt);
       qualityResolution = await resolveQualityMismatch(implemented, `review-${cycle}`); implemented = qualityResolution.worker;
       if (qualityResolution.outcome) return finish(signal?.aborted ? "ABORTED" : qualityResolution.outcome);
-      if (!implemented.positive) return finish(signal?.aborted ? "ABORTED" : implemented.valid ? "IMPLEMENTATION_BLOCKED" : "IMPLEMENTATION_FAILED");
+      if (!implemented.positive) return finish(signal?.aborted ? "ABORTED" : implemented.valid ? "IMPLEMENTATION_BLOCKED" : implemented.failureCode ?? "IMPLEMENTATION_FAILED");
       const repairQualityOutcome = await qualityAfterWorker(implemented, implementAttempt); if (repairQualityOutcome) return finish(repairQualityOutcome);
       const repairGateContent = await fs.readFile(path.join(artifactDir, `quality-gate-${implementAttempt}.json`), "utf8");
       reviewed = await runStage("review", promptFor("review", task, artifactDir, plan, handoff, cycle + 1, path.join(artifactDir, `implement-${implementAttempt}.json`), implemented.text, json(qualityContract), path.join(artifactDir, `quality-gate-${implementAttempt}.json`), repairGateContent, implementAttempt), cycle + 1); review = reviewed.text;
-      if (!reviewed.valid) return finish(signal?.aborted ? "ABORTED" : "REVIEW_FAILED");
+      if (!reviewed.valid) return finish(signal?.aborted ? "ABORTED" : reviewed.failureCode ?? "REVIEW_FAILED");
     }
     const finalReview = JSON.parse(reviewed.text); const finalTransition = transitionAfterReview(finalReview, metadata.reviewIds ?? [], cycle, { maxReviewCycles: input.maxReviewCycles, maxRepairCycles: input.maxRepairCycles });
     metadata.reviewIds = finalTransition.reviewIds; metadata.reviewBudget = finalTransition.budget; metadata.repeatedIds = finalTransition.repeatedIds;

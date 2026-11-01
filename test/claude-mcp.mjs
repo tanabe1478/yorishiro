@@ -46,7 +46,7 @@ try {
   worker.notify("notifications/initialized");
   assert.deepEqual((await worker.request("ping")).result, {});
   const listed = await worker.request("tools/list");
-  assert.deepEqual(listed.result.tools.map(tool => tool.name), ["submit_stage_report"], "the Worker must not see the sandbox verifier");
+  assert.deepEqual(listed.result.tools.map(tool => tool.name), ["submit_stage_report"], "tools are exactly the ones named in YORISHIRO_MCP_TOOLS");
   const schema = listed.result.tools[0].inputSchema;
   assert.deepEqual(schema.required, ["verdict", "summary", "changedScope", "evidence", "completedPlanItems", "changedPaths"]);
   assert.deepEqual(schema.properties.verdict.enum, ["COMPLETED", "BLOCKED"]);

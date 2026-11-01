@@ -14,6 +14,27 @@ export function shellQuote(value: string) {
   return "'" + value.replaceAll("'", "'\\''") + "'";
 }
 
+/** Where a Claude Worker writes evidence directly (YORISHIRO_EVIDENCE_DIR). The Reviewer's evidence goes to `evidence/reviewer/` and `evidence/quality-gate-N/`. */
+export const WORKER_EVIDENCE_SUBDIR = "worker";
+
+export function workerEvidenceDir(artifactDir: string) {
+  return path.join(artifactDir, "evidence", WORKER_EVIDENCE_SUBDIR);
+}
+
+/**
+ * Worker-only instructions of the Claude runtime, shared by the brief and the
+ * prompt. The Worker has `run_verification_command` and a writable evidence
+ * directory only there; Pi Workers have neither, so they are not told about them.
+ */
+export function workerToolingInstructions(artifactDir: string, attempt?: number) {
+  const evidence = workerEvidenceDir(artifactDir);
+  const where = attempt === undefined ? `${evidence}/attempt-<n>/` : `${evidence}/attempt-${attempt}/`;
+  return [
+    "報告前に、qualityContractのrequiredChecksを`run_verification_command`（MCPツール。programとargsを渡す）で実行し、exit 0を確かめる。本番のquality gateと同じsnapshotとsandbox条件で実行されるので、gateで落ちる原因を報告前に見つけられる。APFS cloneやsandbox-execで検証用の複製や環境を手作りしない。",
+    `スクリーンショットや観測JSONなどの証跡は、環境変数\$YORISHIRO_EVIDENCE_DIR（${evidence}）の下の${where}に置く。orchestratorがartifactの一部として保存する。scratchpadやtempにだけ置かない。`,
+  ];
+}
+
 async function isRegularFile(file: string) {
   try {
     return (await fs.lstat(file)).isFile();
@@ -82,6 +103,9 @@ export async function writeWorkflowBrief(options: WorkflowBriefOptions) {
   const writeBoundary = options.stage === "review"
     ? "Reviewerはsourceと対象checkoutを編集しない。`run_verification_command`などの検証commandはdisposable snapshot内だけに書き込み、元checkoutを変更しない。永続writeは`submit_stage_report`とorchestratorが回収する`YORISHIRO_EVIDENCE_DIR`に限る。"
     : "Workerは対象checkoutの承認済みpathを編集してよい。run artifactはorchestrator所有であり、指定されたreport以外を書き換えない。対象外pathや他repositoryへ書き込まない。";
+  const workerTooling = options.stage === "implement" && RUNTIME === "claude"
+    ? `## Workerの道具と証跡\n\n${workerToolingInstructions(options.artifactDir).map(line => `- ${line}`).join("\n")}\n\n`
+    : "";
   const content = `# Child workflow brief
 
 role: ${INFO[options.stage].label}
@@ -104,7 +128,7 @@ ${verify}
 
 feature mapを読み、変更に対応するjourneyを実ユーザー面で実行する。存在しないcommandを捏造しない。実行できなかった場合は、試したcommandと未達の前提条件を証跡へ残す。
 
-${renderInputFilesSection(options.inputFiles)}## 必須の進め方
+${renderInputFilesSection(options.inputFiles)}${workerTooling}## 必須の進め方
 
 1. 関連codeを読み、domain/data shapeを選ぶ。
 2. 最小の安全なscopeと成功条件を決める。
@@ -189,8 +213,9 @@ export function claudeMcpConfigPath(options: Pick<LauncherOptions, "promptFile" 
 }
 
 /** Tool names a Claude Code child sees from the stage-scoped Yorishiro MCP server. */
-export function claudeMcpTools(stage: Stage) {
-  return stage === "review" ? ["submit_stage_report", "run_verification_command"] : ["submit_stage_report"];
+export function claudeMcpTools(_stage: Stage) {
+  // Both roles verify in the same disposable snapshot and sandbox the quality gate uses. The Worker's original checkout stays writable; only the snapshot is.
+  return ["submit_stage_report", "run_verification_command"];
 }
 
 /**
@@ -207,7 +232,7 @@ export function renderClaudeMcpConfig(options: LauncherOptions) {
     YORISHIRO_ROLE: INFO[stage].label,
     YORISHIRO_REPORT_PATH: options.reportPath,
     YORISHIRO_EVIDENCE_ROOT: path.join(options.artifactDir, "evidence"),
-    ...(stage === "review" ? { YORISHIRO_TARGET_CWD: options.cwd } : {}),
+    YORISHIRO_TARGET_CWD: options.cwd,
     ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
     ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
   };
@@ -234,6 +259,7 @@ export function renderClaudeLauncher(options: LauncherOptions): string {
     `export YORISHIRO_EXPECTED_MODEL=${shellQuote(MODELS[stage])}`,
     `export YORISHIRO_WORKFLOW=${shellQuote(options.workflow)}`,
     `export YORISHIRO_WORKFLOW_BRIEF=${shellQuote(options.workflowBrief)}`,
+    ...(stage === "implement" ? [`export YORISHIRO_EVIDENCE_DIR=${shellQuote(workerEvidenceDir(options.artifactDir))}`] : []),
   ].join("\n");
   // The Reviewer is read-only: --restricted drops code-running tools, ignores
   // settings files, and confines file tools to the working directories.
@@ -252,6 +278,7 @@ export async function writeLauncher(options: WriteLauncherOptions) {
   await fs.writeFile(promptFile, options.promptFileContent, { encoding: "utf8", mode: 0o700 });
   let mcpConfig: string | undefined;
   if (RUNTIME === "claude") {
+    if (options.stage === "implement") await fs.mkdir(workerEvidenceDir(options.artifactDir), { recursive: true });
     mcpConfig = claudeMcpConfigPath(options);
     await fs.writeFile(mcpConfig, JSON.stringify(renderClaudeMcpConfig(options), null, 2), { encoding: "utf8", mode: 0o600 });
   }

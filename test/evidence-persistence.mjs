@@ -100,6 +100,8 @@ try {
     const reviewerRoot = path.join(base, "reviewer-evidence");
     process.env.YORISHIRO_TARGET_CWD = checkout;
     process.env.YORISHIRO_EVIDENCE_ROOT = reviewerRoot;
+    // The stage decides the evidence owner; do not inherit it from the session that runs the tests (a Worker has implement).
+    process.env.YORISHIRO_REPORT_STAGE = "review";
     try {
       const script = "const fs=require('node:fs'),path=require('node:path');const dir=process.env.YORISHIRO_EVIDENCE_DIR;fs.writeFileSync(path.join(dir,'proof.txt'),'proof');fs.symlinkSync('/etc/passwd',path.join(dir,'leak'));";
       const reviewerResult = await tools[0].execute("test", { program: process.execPath, args: ["-e", script], timeoutMs: 10_000 }, new AbortController().signal);
@@ -111,9 +113,18 @@ try {
       assert.equal(runs.length, 1);
       assert.equal(existsSync(path.join(reviewerRoot, "reviewer", runs[0], "proof.txt")), true);
       assert.equal(existsSync(path.join(reviewerRoot, "reviewer", runs[0], "leak")), false);
+
+      // The Claude Worker uses the same tool before it reports; its snapshot evidence stays apart from the Reviewer's.
+      process.env.YORISHIRO_REPORT_STAGE = "implement";
+      const workerResult = await tools[0].execute("test", { program: process.execPath, args: ["-e", "require('node:fs').writeFileSync(require('node:path').join(process.env.YORISHIRO_EVIDENCE_DIR,'worker-proof.txt'),'w')"], timeoutMs: 10_000 }, new AbortController().signal);
+      assert.equal(workerResult.details.exitCode, 0, workerResult.content[0].text);
+      assert.ok(workerResult.details.evidence.dir.startsWith(path.join(reviewerRoot, "worker-verification") + path.sep), "Worker verification evidence lands under worker-verification/");
+      assert.equal(await readFile(path.join(workerResult.details.evidence.dir, "worker-proof.txt"), "utf8"), "w");
+      assert.equal((await readdir(path.join(reviewerRoot, "reviewer"))).length, 1, "the Reviewer's directory is not touched by the Worker's run");
     } finally {
       delete process.env.YORISHIRO_TARGET_CWD;
       delete process.env.YORISHIRO_EVIDENCE_ROOT;
+      delete process.env.YORISHIRO_REPORT_STAGE;
     }
   } finally {
     await rm(checkout, { recursive: true, force: true });

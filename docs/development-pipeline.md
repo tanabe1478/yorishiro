@@ -78,9 +78,24 @@ Reviewerとquality gateの検証コマンドは、対象checkoutをcopy-on-write
 
 snapshotは書き込みを閉じたsandboxの中なので、検証コマンドからさらにsandboxを起動する（macOSでは`sandbox-exec`の入れ子、つまりpipelineや`runSandboxedVerification`を呼ぶテスト）ことはできません。Yorishiro自身を対象にするrunの`requiredChecks`は`npm run test:gate`にし、入れ子になるスイートは`test/gate-exclusions.json`の理由付き一覧に載せ、Workerがsandboxの外で`npm test`を実行して確かめます。
 
+Claude Codeランタイムでは、Workerにも`run_verification_command`を渡します（Reviewerと同じ実装、同じsnapshotとsandbox条件、同じ出力上限）。Workerは報告前に、契約の`requiredChecks`をこのtoolで実行してexit 0を確かめます。本番のquality gateと同じ条件で動くので、APFS cloneや`sandbox-exec`で検証用の複製や環境を手作りする必要はありません（手作りの複製は、削除の権限拒否で巨大な複製が残る、sandbox条件の取り違えでgate失敗に気づけない、という問題を起こしました）。Workerの元checkoutは書き込み可能なままで、toolが実行するのはsnapshotの上だけです。このtoolの証跡は`evidence/worker-verification/`に回収されます（Reviewerは`evidence/reviewer/`）。この指示はWorkerのpromptとbrief（`## Workerの道具と証跡`）に入っています。Piランタイムの子は変わりません。
+
 ## 証跡回収
 
 検証の証跡を残す場合は、コマンドがsnapshot内の`$YORISHIRO_EVIDENCE_DIR`へfileを書きます。orchestratorはteardown前に、通常fileだけを上限付き（file数100、1file 1MiB、合計8MiB、深さ4、visited entry数1000）でrun artifactの`evidence/`へ回収します。snapshotに元からある`.yorishiro-evidence`は毎回削除して空から開始します。evidence rootや子のsymlink、special file、destination外へ出るpath、上限超過は拒否・skipし、`skippedCount`と`truncated`で可視化します。Reviewerの`run_verification_command`も同じ仕組みを使い、modelが任意のwrite先を指定することはできません。
+
+Claude Codeランタイムでは、Workerにも`YORISHIRO_EVIDENCE_DIR`（`artifacts/<repository>/<run-id>/evidence/worker/`）を設定し、スクリーンショットや観測JSONを直接artifactへ書けるようにします（子は`--add-dir`でartifactを書けます）。ペインを再利用するためattemptごとに変数は変えられないので、promptは`attempt-<n>/`の下に置くよう指示します。Workerの書き込みは回収（コピー）を挟まないため、orchestratorは各Worker stageの終了後にこのディレクトリの目録（file数、合計byte、skipしたpath）を`run.json`の`workerEvidence`へ記録します。上限はReviewerの回収と同じ値（file数100、1file 1MiB、合計8MiB、深さ4、visited entry数1000）で、超過分・symlink・special fileは目録でskip扱い（`truncated`）にするだけで、ファイル自体は消しません。Workerの証跡がscratchpadにしか残らず、Reviewerが「artifactに回収されていない」と指摘する問題への対処です。
+
+## 2回目以降の指示の送信（Claude Codeランタイム）
+
+修正・再レビューでは同じペインへ指示を送ります。長い複数行を`herdr pane send-text`で貼ると、Claude Codeが`[Pasted text #N +M lines]`に畳み、続く`send-keys enter`が取りこぼされて、指示が入力欄に未送信のまま残りました（子はidleのままで、orchestratorは`REPORT_MISSING`→`REVIEW_FAILED`としていました）。原因が貼り付けとEnterの競合かは、使い捨てペインでの観測ができておらず未確認です。次のように送ります。
+
+1. 指示全文を`<stage>-prompt-<attempt>.md`としてartifactへ書き、ペインには「次のファイルを最後まで読み、その指示に従ってください: <path>」の1行だけを`send-text`で送る。初回の指示（launcherの引数）は変わりません。
+2. `send-text`の300ms後に`send-keys enter`を押し、Herdrのagent statusが`working`などのactive、または`blocked`（権限・信頼ダイアログは送信後にしか出ません）になる、またはdurable reportが現れるのを5秒待つ（250ms間隔で確認）。
+3. 変わらなければEnterだけを再送する（2回まで、つまりEnterは最大3回）。指示文は再送しない。
+4. それでも変わらなければ、`REPORT_MISSING`ではなく結果`PROMPT_NOT_SUBMITTED`で止める。理由とペインIDは`run.json`の`promptFailures`、`stages.<stage>.attempts[].error`、CLIのmessageに残り、ペインは保持します（停止処理として`ctrl+c`と`escape`を送りますが、入力欄の未送信の文が消えるかは未確認です）。`PROMPT_NOT_SUBMITTED`で止まったrunも、他の非SUCCESS終端outcomeと同じ`development_pipeline_reset`（`yorishiro-pipeline reset --run <artifactDir> --confirm`）の対象で、terminal_idによるpane同一性、idle、親ペイン保護の確認を通ったペインだけを閉じます。送信の経過は成功時も`promptDeliveries`（Enterを押した回数、最後のstatus、経過時間）に残ります。
+
+`<stage>-prompt-<attempt>.md`は初回の`<stage>-prompt.md`と同様にlauncher扱いで、成功後のcleanupで消えます。Piランタイムの送信は変わりません。
 
 ## 監視とprocess identity
 
@@ -96,7 +111,7 @@ Claude Codeは初めて開くディレクトリで信頼ダイアログを出し
 
 ## artifact
 
-成果物は`artifacts/<repository>/<run-id>/`に保存されます。主な内容は依頼、承認済み計画、stage別workflow brief、`quality-contract.json`、`plan-review.json`、`diff-review.json`、各attemptの構造化report、quality gate結果と`evidence/`、report-missing時のterminal transcript診断、baselineと各Worker stageのstatus/diff/fingerprint、`model-guard.log`、`run.json`です。baseline fingerprintとの差分で既存dirty pathの内容変更、untracked・deleted・renameも検出します。
+成果物は`artifacts/<repository>/<run-id>/`に保存されます。主な内容は依頼、承認済み計画、stage別workflow brief、2回目以降の指示`<stage>-prompt-<attempt>.md`（Claudeランタイム）、Workerが直接置く`evidence/worker/`（Claudeランタイム）、`quality-contract.json`、`plan-review.json`、`diff-review.json`、各attemptの構造化report、quality gate結果と`evidence/`、report-missing時のterminal transcript診断、baselineと各Worker stageのstatus/diff/fingerprint、`model-guard.log`、`run.json`です。baseline fingerprintとの差分で既存dirty pathの内容変更、untracked・deleted・renameも検出します。
 
 ## cleanupとreset
 

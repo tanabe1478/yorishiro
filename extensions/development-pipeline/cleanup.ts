@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { PROMPT_NOT_SUBMITTED } from "./prompt-delivery.ts";
 
 type Result = { paneId: string; name: string; status: string; reason?: string; note?: string };
 type PaneRecord = { paneId?: string; name?: string; terminalId?: string };
@@ -123,7 +124,7 @@ export async function cleanupRun(runDir: string, root: string, currentPane?: str
   return {results,summary:results.map(r=>`${r.name}: ${r.status}${r.reason?` (${r.reason})`:""}`).join("; ")};
 }
 const RESETTABLE_OUTCOMES = new Set([
-  "ABORTED", "PLAN_REJECTED", "PLAN_REVIEW_UNAVAILABLE", "IMPLEMENTATION_BLOCKED", "IMPLEMENTATION_FAILED", "WORKER_EVIDENCE_MISMATCH", "QUALITY_GATE_FAILED", "REVIEW_FAILED", "NEEDS_PLANNER", "CHANGES_REQUIRED", "HUMAN_CHANGES_REQUESTED", "HUMAN_DIFF_REVIEW_TIMEOUT", "HUMAN_DIFF_REVIEW_REJECTED", "HUMAN_DIFF_REVIEW_SKIPPED", "HUMAN_DIFF_REVIEW_UNAVAILABLE", "HUMAN_DIFF_REVIEW_ERROR", "HUMAN_DIFF_REVIEW_INVALID",
+  "ABORTED", "PLAN_REJECTED", "PLAN_REVIEW_UNAVAILABLE", "IMPLEMENTATION_BLOCKED", "IMPLEMENTATION_FAILED", "WORKER_EVIDENCE_MISMATCH", "QUALITY_GATE_FAILED", "REVIEW_FAILED", PROMPT_NOT_SUBMITTED, "NEEDS_PLANNER", "CHANGES_REQUIRED", "HUMAN_CHANGES_REQUESTED", "HUMAN_DIFF_REVIEW_TIMEOUT", "HUMAN_DIFF_REVIEW_REJECTED", "HUMAN_DIFF_REVIEW_SKIPPED", "HUMAN_DIFF_REVIEW_UNAVAILABLE", "HUMAN_DIFF_REVIEW_ERROR", "HUMAN_DIFF_REVIEW_INVALID",
 ]);
 export async function resetRun(runDir: string, root: string, context: { paneId?: string; workspaceId?: string; tabId?: string }, confirm: boolean, signal?: AbortSignal): Promise<{ results: Result[]; summary: string }> {
   if (!confirm) throw new Error("resetには明示的なconfirm=trueが必要です");

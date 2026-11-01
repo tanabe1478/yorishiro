@@ -3,6 +3,7 @@ import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises
 import os from "node:os";
 import path from "node:path";
 import { resetRun, cleanupRun, verifyLivePane } from "../extensions/development-pipeline/cleanup.ts";
+import { PROMPT_NOT_SUBMITTED } from "../extensions/development-pipeline/prompt-delivery.ts";
 
 const base = await mkdtemp(path.join(os.tmpdir(), "yorishiro-reset-"));
 const artifacts = path.join(base, "artifacts"), bin = path.join(base, "bin"), log = path.join(base, "herdr.log");
@@ -39,7 +40,7 @@ const rejectsWithoutClose = async (name, overrides, current = context) => {
   assert.equal(await closeCount(), 0, `${name} must dispatch no close`);
 };
 try {
-  for (const outcome of ["IMPLEMENTATION_FAILED", "WORKER_EVIDENCE_MISMATCH", "QUALITY_GATE_FAILED", "ABORTED", "REVIEW_FAILED", "NEEDS_PLANNER", "HUMAN_CHANGES_REQUESTED"]) {
+  for (const outcome of ["IMPLEMENTATION_FAILED", "WORKER_EVIDENCE_MISMATCH", "QUALITY_GATE_FAILED", "ABORTED", "REVIEW_FAILED", PROMPT_NOT_SUBMITTED, "NEEDS_PLANNER", "HUMAN_CHANGES_REQUESTED"]) {
     await writeFile(log, ""); const dir = await make(`valid-${outcome}`, { outcome });
     const result = await resetRun(dir, artifacts, context, true); assert.equal(result.results[0].status, "closed");
   }
@@ -82,6 +83,20 @@ try {
     const missingTerminal = await resetOne("terminal-live-missing", claudePane("t-noterminal", "term_recorded"));
     assert.equal(missingTerminal.result.status, "skipped", "a recorded terminal_id the live pane does not report is not an identity");
     assert.equal(missingTerminal.closes, 0);
+    // PROMPT_NOT_SUBMITTED stops with the panes preserved, so reset has to take it through the same safety checks as any other terminal outcome.
+    const stuck = { outcome: PROMPT_NOT_SUBMITTED };
+    const stuckClosed = await resetOne("prompt-not-submitted-closed", claudePane("t-nolabel", "term_nolabel"), stuck);
+    assert.equal(stuckClosed.result.status, "closed");
+    assert.equal(stuckClosed.closes, 1);
+    assert.equal(stuckClosed.run.outcome, PROMPT_NOT_SUBMITTED, "reset keeps the recorded outcome");
+    const stuckBusy = await resetOne("prompt-not-submitted-busy", claudePane("t-busy", "term_busy"), stuck);
+    assert.equal(stuckBusy.result.reason, "pane is working", "a pane that is not idle is still protected");
+    assert.equal(stuckBusy.closes, 0);
+    const stuckSwapped = await resetOne("prompt-not-submitted-swapped", claudePane("t-swapped", "term_original"), stuck);
+    assert.equal(stuckSwapped.result.reason, "pane identity changed or incomplete");
+    assert.equal(stuckSwapped.closes, 0);
+    await rejectsWithoutClose("prompt-not-submitted-wrong-pane", stuck, { paneId: "other", workspaceId: "ws", tabId: "tab" });
+    await rejectsWithoutClose("prompt-not-submitted-unfinished", { ...stuck, finishedAt: undefined });
     // A run.json from before terminalId existed keeps the label comparison.
     const legacyNoLabel = await resetOne("legacy-nolabel", { paneId: "t-nolabel", name: "Worker · Claude" });
     assert.equal(legacyNoLabel.result.status, "skipped", "legacy records with no live label stay skipped");

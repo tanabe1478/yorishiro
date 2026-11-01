@@ -117,7 +117,7 @@ try {
   assert.equal(reviewerArgv[reviewerArgv.indexOf("--model") + 1], "claude-opus-5-5");
   assert.ok(reviewerArgv.includes("--restricted"));
   assert.match(workerArgv.at(-1), /あなたはWorker · Claudeです/);
-  assert.deepEqual(JSON.parse(await readFile(path.join(state, "tools-implement.json"), "utf8")), ["submit_stage_report"]);
+  assert.deepEqual(JSON.parse(await readFile(path.join(state, "tools-implement.json"), "utf8")), ["submit_stage_report", "run_verification_command"], "the Worker verifies requiredChecks with the same tool as the Reviewer");
   assert.deepEqual(JSON.parse(await readFile(path.join(state, "tools-review.json"), "utf8")), ["submit_stage_report", "run_verification_command"]);
 
   const usage = spawnSync(cli, ["run", "--input", "-"], { input: JSON.stringify({ ...input, diffReviewMode: "required" }), encoding: "utf8", env });
