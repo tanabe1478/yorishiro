@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 // index.ts reads YORISHIRO_RUNTIME when it is imported.
 delete process.env.YORISHIRO_RUNTIME;
 const { buildOutputExcerpt, pickDiagnosticLine, buildOutputLog } = await import("../extensions/development-pipeline/index.ts");
-const { run, verificationEnvironment, MAX_OUTPUT } = await import("../extensions/development-pipeline/verifier-tools.ts");
+const { run, verificationEnvironment, copyGradleProperties, darwinSandboxProfile, darwinUserTempDir, sandboxCommand, MAX_OUTPUT } = await import("../extensions/development-pipeline/verifier-tools.ts");
 
 const bytes = (text) => Buffer.byteLength(text, "utf8");
 const MARK = "[... 中略 ...]";
@@ -145,6 +148,87 @@ for (const unit of ["あ", "🙂", "é"]) {
   process.env.YORISHIRO_ROOT = "/inherited"; process.env.HERDR_PANE_ID = "inherited";
   try { const fromProcess = verificationEnvironment(workspace); assert.equal(fromProcess.YORISHIRO_ROOT, undefined); assert.equal(fromProcess.HERDR_PANE_ID, undefined); assert.equal(fromProcess.PATH, process.env.PATH); }
   finally { delete process.env.YORISHIRO_ROOT; delete process.env.HERDR_PANE_ID; }
+}
+
+// JVM 向けの既定: JAVA_TOOL_OPTIONS、GRADLE_USER_HOME、GRADLE_RO_DEP_CACHE、gradle.properties の複製。
+{
+  const workspace = { temp: "/w/.yorishiro-tmp", cache: "/w/.yorishiro-cache", evidence: "/w/.yorishiro-evidence" };
+  const gradleHome = await mkdtemp(path.join(os.tmpdir(), "yorishiro-gradle-env-"));
+  try {
+    // 元の Gradle ホームに caches がなければ GRADLE_RO_DEP_CACHE は付かない。GRADLE_USER_HOME と java.io.tmpdir は常に付く。
+    const bare = verificationEnvironment(workspace, { PATH: "/usr/bin", GRADLE_USER_HOME: gradleHome });
+    assert.equal(bare.JAVA_TOOL_OPTIONS, "-Djava.io.tmpdir=/w/.yorishiro-tmp");
+    assert.equal(bare.GRADLE_USER_HOME, "/w/.yorishiro-cache/gradle", "the caller's Gradle home is replaced by one in the snapshot");
+    assert.equal("GRADLE_RO_DEP_CACHE" in bare, false);
+    // JAVA_TOOL_OPTIONS は呼び出し元の値を残して追記する。
+    assert.equal(verificationEnvironment(workspace, { GRADLE_USER_HOME: gradleHome, JAVA_TOOL_OPTIONS: "-Xmx1g -Dfoo=bar" }).JAVA_TOOL_OPTIONS, "-Xmx1g -Dfoo=bar -Djava.io.tmpdir=/w/.yorishiro-tmp");
+    assert.equal(verificationEnvironment({ ...workspace, temp: "/w x/tmp" }, { GRADLE_USER_HOME: gradleHome }).JAVA_TOOL_OPTIONS, '-Djava.io.tmpdir="/w x/tmp"', "a temp path with spaces is quoted");
+    // caches があれば、その caches を GRADLE_RO_DEP_CACHE にする。
+    await mkdir(path.join(gradleHome, "caches"));
+    assert.equal(verificationEnvironment(workspace, { GRADLE_USER_HOME: gradleHome }).GRADLE_RO_DEP_CACHE, path.join(gradleHome, "caches"));
+    // 呼び出し元の GRADLE_RO_DEP_CACHE が優先。
+    assert.equal(verificationEnvironment(workspace, { GRADLE_USER_HOME: gradleHome, GRADLE_RO_DEP_CACHE: "/custom/ro" }).GRADLE_RO_DEP_CACHE, "/custom/ro");
+    // GRADLE_USER_HOME がなければ HOME/.gradle を見る。
+    const home = await mkdtemp(path.join(os.tmpdir(), "yorishiro-gradle-home-"));
+    try {
+      assert.equal("GRADLE_RO_DEP_CACHE" in verificationEnvironment(workspace, { HOME: home }), false);
+      await mkdir(path.join(home, ".gradle", "caches"), { recursive: true });
+      assert.equal(verificationEnvironment(workspace, { HOME: home }).GRADLE_RO_DEP_CACHE, path.join(home, ".gradle", "caches"));
+    } finally { await rm(home, { recursive: true, force: true }); }
+    // caches がファイルなら付けない。
+    const fileCaches = await mkdtemp(path.join(os.tmpdir(), "yorishiro-gradle-file-"));
+    try { await writeFile(path.join(fileCaches, "caches"), "x"); assert.equal("GRADLE_RO_DEP_CACHE" in verificationEnvironment(workspace, { GRADLE_USER_HOME: fileCaches }), false); }
+    finally { await rm(fileCaches, { recursive: true, force: true }); }
+
+    // gradle.properties の複製: 内容は同じ、権限は 600、元の権限が広くても狭める。なければ何もしない。
+    const cache = await mkdtemp(path.join(os.tmpdir(), "yorishiro-gradle-cache-"));
+    try {
+      assert.equal(await copyGradleProperties(cache, { GRADLE_USER_HOME: gradleHome }), false, "no gradle.properties, nothing copied");
+      await assert.rejects(stat(path.join(cache, "gradle")), "no Gradle home is created without a source");
+      await writeFile(path.join(gradleHome, "gradle.properties"), "org.gradle.java.installations.paths=/jdk\n");
+      await chmod(path.join(gradleHome, "gradle.properties"), 0o644);
+      assert.equal(await copyGradleProperties(cache, { GRADLE_USER_HOME: gradleHome }), true);
+      const copied = path.join(cache, "gradle", "gradle.properties");
+      assert.equal(await readFile(copied, "utf8"), "org.gradle.java.installations.paths=/jdk\n");
+      assert.equal((await stat(copied)).mode & 0o777, 0o600);
+      assert.equal((await stat(path.join(gradleHome, "gradle.properties"))).mode & 0o777, 0o644, "the original is untouched");
+      // 既存のファイルが広い権限でも、600 で書き直す。
+      await chmod(copied, 0o666);
+      assert.equal(await copyGradleProperties(cache, { GRADLE_USER_HOME: gradleHome }), true);
+      assert.equal((await stat(copied)).mode & 0o777, 0o600);
+    } finally { await rm(cache, { recursive: true, force: true }); }
+  } finally { await rm(gradleHome, { recursive: true, force: true }); }
+}
+
+// timeoutMs の上限 1800000 は契約の検証・development_pipeline と run_verification_command の TypeBox スキーマで同じ値を使う。
+// このテストは typebox を空のスタブに差し替えるため、スキーマの値そのものは見られない。ソースが定数を参照していることを確かめる
+// （claude-mcp.mjs のスキーマの値は test:claude-mcp が実際の MCP サーバーで確かめる）。既定（120000）は変えない。
+{
+  const { MAX_CHECK_TIMEOUT_MS } = await import("../extensions/development-pipeline/quality-contract.ts");
+  assert.equal(MAX_CHECK_TIMEOUT_MS, 1800000);
+  const source = async name => readFile(new URL(`../extensions/development-pipeline/${name}`, import.meta.url), "utf8");
+  const tools = await source("verifier-tools.ts"), pipeline = await source("index.ts");
+  assert.match(tools, /timeoutMs: Type\.Optional\(Type\.Integer\(\{ minimum: 1000, maximum: MAX_CHECK_TIMEOUT_MS \}\)\)/);
+  assert.match(tools, /input\.timeoutMs \?\? 120000/, "the run_verification_command default stays 120000");
+  assert.match(pipeline, /timeoutMs: Type\.Optional\(Type\.Integer\(\{ minimum: 1, maximum: MAX_CHECK_TIMEOUT_MS \}\)\)/);
+  assert.match(pipeline, /check\.timeoutMs \?\? 120000/, "the requiredChecks default stays 120000");
+  for (const text of [tools, pipeline]) assert.doesNotMatch(text, /maximum: 300000/);
+}
+
+// macOS の sandbox プロファイル: DARWIN_USER_TEMP_DIR の realpath への書き込みを許す。取得できなければ足さない。
+{
+  const without = darwinSandboxProfile("/snap");
+  assert.equal(without, '(version 1) (allow default) (deny file-write*) (allow file-write* (subpath "/snap")) (allow file-write* (literal "/dev/null"))');
+  const withTemp = darwinSandboxProfile("/snap", "/private/var/folders/ab/cd/T");
+  assert.equal(withTemp, `${without} (allow file-write* (subpath "/private/var/folders/ab/cd/T"))`);
+  if (process.platform === "darwin") {
+    const userTemp = darwinUserTempDir();
+    assert.ok(userTemp && path.isAbsolute(userTemp), "getconf DARWIN_USER_TEMP_DIR is available on macOS");
+    const command = sandboxCommand("/bin/echo", ["hi"], "/snap");
+    assert.deepEqual([command[0], command[1]], ["/usr/bin/sandbox-exec", "-p"]);
+    assert.ok(command[2].includes(`(allow file-write* (subpath ${JSON.stringify(userTemp)}))`), "the sandbox command's profile allows the user temp directory");
+    assert.deepEqual(command.slice(3), ["--", "/bin/echo", "hi"]);
+  }
 }
 
 // run(): replaceEnv なら env だけを子の環境にし、process.env を足し戻さない。

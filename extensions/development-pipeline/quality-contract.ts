@@ -5,6 +5,8 @@ import * as path from "node:path";
 import { isRepositoryRelativePath, isWithinRepositories, repositoryDir, workspacePath } from "./repositories.ts";
 
 export { isRepositoryRelativePath };
+/** Upper bound of one check's timeoutMs (a JVM build takes minutes). verifier-tools.ts, index.ts and claude-mcp.mjs use the same number. */
+export const MAX_CHECK_TIMEOUT_MS = 1_800_000;
 export type QualityPlanItem = { id: string; description: string };
 /** `cwd` is workspace-relative and only valid when the run has `repositories` (it must be one of them or inside one). */
 export type RequiredCheck = { id: string; program: string; args: string[]; timeoutMs?: number; cwd?: string };
@@ -55,7 +57,7 @@ export function validateQualityContract(value: unknown, options: { repositories?
   for (const item of requiredChecks) {
     if (!plain(item) || !hasKeys(item, ["id", "program", "args"], ["timeoutMs", "cwd"])) return { valid: false, error: "requiredChecks must contain exact id, program, and args fields" };
     if (!id(item.id) || !text(item.program) || !Array.isArray(item.args) || !item.args.every(arg => typeof arg === "string")) return { valid: false, error: "requiredChecks has an invalid id, program, or args" };
-    if (Object.prototype.hasOwnProperty.call(item, "timeoutMs") && (!Number.isInteger(item.timeoutMs) || (item.timeoutMs as number) < 1 || (item.timeoutMs as number) > 300000)) return { valid: false, error: "requiredChecks timeoutMs must be an integer from 1 to 300000" };
+    if (Object.prototype.hasOwnProperty.call(item, "timeoutMs") && (!Number.isInteger(item.timeoutMs) || (item.timeoutMs as number) < 1 || (item.timeoutMs as number) > MAX_CHECK_TIMEOUT_MS)) return { valid: false, error: `requiredChecks timeoutMs must be an integer from 1 to ${MAX_CHECK_TIMEOUT_MS}` };
     if (Object.prototype.hasOwnProperty.call(item, "cwd")) {
       if (!options.repositories) return { valid: false, error: `requiredChecks cwd is only allowed when the run has repositories (check ${String(item.id)})` };
       if (!isWithinRepositories(item.cwd, options.repositories)) return { valid: false, error: `requiredChecks cwd must be a workspace-relative path that is one of repositories or inside one (check ${String(item.id)})` };

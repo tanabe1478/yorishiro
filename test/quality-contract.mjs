@@ -18,6 +18,16 @@ for (const broken of [
 ]) assert.equal(validateQualityContract(broken).valid, false);
 assert.deepEqual(pathsWithinPrefixes(["src/a", "README.md"], ["src"]), ["README.md"]);
 
+// timeoutMs の上限は 1800000（JVM のビルドに足りる長さ）。境界を含めて確かめる。
+const withTimeout = timeoutMs => ({ ...valid, requiredChecks: [{ id: "TEST", program: "/usr/bin/true", args: [], timeoutMs }] });
+assert.equal(validateQualityContract(withTimeout(1800000)).valid, true);
+assert.equal(validateQualityContract(withTimeout(300001)).valid, true, "the old 300000 cap is gone");
+const overCap = validateQualityContract(withTimeout(1800001));
+assert.equal(overCap.valid, false);
+assert.match(overCap.error, /1 to 1800000/);
+for (const bad of [0, -1, 1.5, "1000", null]) assert.equal(validateQualityContract(withTimeout(bad)).valid, false);
+assert.equal(validateQualityContract(valid).valid, true, "timeoutMs stays optional");
+
 const completed = { verdict: "COMPLETED", completedPlanItems: [{ id: "IMPLEMENT", evidence: "実装を確認しました" }], changedPaths: ["src/a.ts"] };
 assert.equal(compareWorkerEvidence(completed, valid, ["src/a.ts"]).valid, true);
 for (const bad of [

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-const { preflightVerifierSandbox } = await import("../extensions/development-pipeline/sandbox.ts");
+const { preflightVerifierSandbox, darwinTargetRejection, verificationRoot } = await import("../extensions/development-pipeline/sandbox.ts");
 const { runSandboxedVerification } = await import("../extensions/development-pipeline/verifier-tools.ts");
 await assert.rejects(() => preflightVerifierSandbox("/tmp"), /does not support repositories under \/tmp/);
 
@@ -30,5 +30,24 @@ try {
 } finally {
   if (originalTmpdir === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = originalTmpdir;
   await rm(base, { recursive: true, force: true });
+}
+
+// macOS: targets under DARWIN_USER_TEMP_DIR or under the snapshot directory are rejected, as is a target that contains the snapshot directory.
+// Pure decision on realpaths; nothing is created or started (the real-filesystem checks are in test:verifier-snapshot-root).
+{
+  const userTemp = "/private/var/folders/ab/cd/T", snapshots = "/Users/me/Library/Caches/yorishiro/verification";
+  assert.match(darwinTargetRejection(`${userTemp}/repo`, userTemp, snapshots) ?? "", /under the macOS user temporary directory DARWIN_USER_TEMP_DIR/);
+  assert.match(darwinTargetRejection(userTemp, userTemp, snapshots) ?? "", /DARWIN_USER_TEMP_DIR/, "the directory itself");
+  assert.match(darwinTargetRejection(`${snapshots}/yorishiro-verification-x/workspace`, userTemp, snapshots) ?? "", /under the verification snapshot directory/);
+  assert.match(darwinTargetRejection(snapshots, undefined, snapshots) ?? "", /under the verification snapshot directory/, "the directory itself, without a user temp directory");
+  assert.match(darwinTargetRejection("/Users/me", userTemp, snapshots) ?? "", /contains the verification snapshot directory/);
+  assert.doesNotMatch(darwinTargetRejection("/Users/me", userTemp, snapshots) ?? "", /contains the temporary directory/, "a different message from the TMPDIR check");
+  assert.equal(darwinTargetRejection("/Users/me/work/repo", userTemp, snapshots), undefined);
+  assert.equal(darwinTargetRejection(`${userTemp}-other/repo`, userTemp, snapshots), undefined, "a sibling that only shares the name prefix");
+  assert.equal(darwinTargetRejection(`${snapshots}-other/repo`, userTemp, snapshots), undefined);
+  assert.equal(darwinTargetRejection("/Users/me/work/repo", undefined, snapshots), undefined, "no user temp directory known: nothing to reject for it");
+  // Where snapshots are made: a Yorishiro-only directory on macOS, tmpdir() elsewhere.
+  if (process.platform === "darwin") assert.equal(verificationRoot(), path.join(os.homedir(), "Library", "Caches", "yorishiro", "verification"));
+  else assert.equal(verificationRoot(), os.tmpdir());
 }
 console.log("sandbox target preflight test passed");

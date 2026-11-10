@@ -25,7 +25,7 @@ Claude CodeとClaudeのモデルだけで動かす場合の役割・既定モデ
 ## 前提
 
 - 親PiがHerdr内で動作し、`HERDR_PANE_ID`、`HERDR_TAB_ID`、`HERDR_WORKSPACE_ID`、`HERDR_SOCKET_PATH`が利用できること。
-- 対象リポジトリがread-only検証sandboxを利用できること。未対応環境、sandbox未導入環境、`/tmp`配下の対象、`TMPDIR`（`os.tmpdir()`）が対象の中にある場合は作業開始前に拒否されます。
+- 対象リポジトリがread-only検証sandboxを利用できること。未対応環境、sandbox未導入環境、`/tmp`配下の対象、`TMPDIR`（`os.tmpdir()`）が対象の中にある場合は作業開始前に拒否されます。macOSでは、`DARWIN_USER_TEMP_DIR`の下の対象と、snapshotの置き場（「sandbox」節）の下または上にある対象も拒否されます。
 - 開始時に現在タブへ親以外のペインがある場合、`LAYOUT_OCCUPIED`として停止し、他人のペインを自動削除しません。
 
 ## レイアウト
@@ -64,7 +64,7 @@ WorkerとReviewerは`submit_stage_report`で中央validatorが検証する構造
 - 指定: 各要素は`cwd`（省略時は呼出元のcwd）からの相対パスです。絶対パス、`.`、`..`、末尾の`/`、重複、入れ子（片方が他方の中）は開始前にエラーです。各要素はgit作業ツリーのルート（`git rev-parse --show-toplevel`がrealpathで一致する。シンボリックリンク経由は不可）でなければなりません。このときcwdはワークスペースのルートで、cwd自体がgitリポジトリかどうかは問いません。CLI（`yorishiro-pipeline run --input`）も同じJSONを受け取ります。
 - パスの書き方: Workerの`changedPaths`と`allowedPathPrefixes`はワークスペース相対です（`neuhaus-backend/src/a.ts`、prefixは`neuhaus-backend/src`）。リポジトリ内の相対path（`src/a.ts`）で書くと、実diffと一致せず`WORKER_EVIDENCE_MISMATCH`になります。差分はリポジトリごとに取り、各pathに`<リポジトリ>/`を前置して1つにまとめて照合します。
 - `requiredChecks`の`cwd`（任意）: ワークスペース相対で、`repositories`のいずれか、またはその配下です。そのcheckはその場所で実行します。省略したcheckはワークスペースのルートで実行します。`repositories`が無いのに`cwd`を付けると契約エラーです。`cwd`は契約のSHA-256に含まれ、`quality-contract.json`と`quality-gate-N.json`の各checkに残ります。
-- 検証sandbox: 指定したリポジトリだけを、元の相対配置のままsnapshotへ複製します。`../neuhaus-openapi`のような別リポジトリへの参照が解決できます。リポジトリに含まれないワークスペース配下のものは複製しません。書き込みはsnapshot全体に許します。preflight（`/tmp`配下、`TMPDIR`が対象の中、の拒否）は各リポジトリに対して行います。
+- 検証sandbox: 指定したリポジトリだけを、元の相対配置のままsnapshotへ複製します。`../neuhaus-openapi`のような別リポジトリへの参照が解決できます。リポジトリに含まれないワークスペース配下のものは複製しません。書き込みはsnapshot全体に許します。preflight（`/tmp`配下、`TMPDIR`が対象の中、macOSの`DARWIN_USER_TEMP_DIR`の下とsnapshotの置き場の下／上、の拒否）は各リポジトリに対して行います。
 - `run_verification_command`の`cwd`引数（任意、ワークスペース相対）: checkと同じ規則です。省略するとワークスペースのルートです。子には`YORISHIRO_TARGET_CWD`（ワークスペースのルート）に加えて、`YORISHIRO_TARGET_REPOSITORIES`（リポジトリのJSON配列）を渡します（Claudeは各stageのMCP設定、PiはReviewerのlauncher）。`repositories`が無いrunで`cwd`を渡すとエラーです。Claudeランタイムでは、Workerのpromptとbriefに、checkの`cwd`をこのtoolの`cwd`へ渡すよう書きます。
 - artifact: `run.json`に`repositories`（指定時だけ）を記録します。`diffs/`には、リポジトリごとの`<name>-<リポジトリ名>-<8桁のhash>-status.txt`と`-diff.patch`、まとめた`<name>-fingerprint.json`1つが入ります（`<name>`は`baseline`、`implement-N`、`review-N`）。`workflow-brief-<stage>.md`と、Reviewerのpromptに対象リポジトリの一覧とpathの規則、リポジトリごとのsnapshotファイルを書きます。
 - verify Skillの探索、workspace trustの確認、diffaiの実行は、リポジトリごとに行います。diffaiはリポジトリの順に`--cwd <リポジトリ>`で実行し、最初に承認されなかったリポジトリで止めます（`ask`の確認は1回だけです）。
@@ -74,7 +74,7 @@ WorkerとReviewerは`submit_stage_report`で中央validatorが検証する構造
 - `repositories`に含まれないワークスペース配下への書き込みは検出しません（実diffにもsnapshotにも入りません）。
 - workspace trustはリポジトリごとに警告を出しますが、Claude Codeが実際にサブディレクトリのリポジトリで信頼ダイアログを出すかは未観測です。
 - 複数のリポジトリが同名のverify Skillを持つ場合の読み込みは未確認です。
-- 検証sandboxのツールごとのキャッシュの付け替え（`GRADLE_USER_HOME`など）はしません。
+- 検証sandboxのツールごとのキャッシュの付け替えは、JVM向け（`GRADLE_USER_HOME`など）だけです。詳細は「sandbox」節を参照してください。
 
 ## 状態遷移と有限repair
 
@@ -93,11 +93,38 @@ Workerへ戻す情報はsanitized blocking findingだけに制限し、Reviewer�
 
 修正回数は`maxReviewCycles`で指定でき、既定2、上限3です。旧`maxRepairCycles`も互換入力として受理し、両方指定時は`maxReviewCycles`を優先します。上限到達時は`CHANGES_REQUIRED`で終了します。欠落・不正レポート、プロセス失敗、timeout、中断は安全側で停止し、失敗・中断・Planner判断待ちでは子ペインを残します。
 
+### 段階の時間の上限
+
+1段階（WorkerまたはReviewerの1ペイン）の上限は、入力の`stageTimeoutMs`（整数、60000以上14400000以下。CLIも同じJSONを渡す）で指定します。範囲外・整数でない値は、artifactもペインも作る前のエラーです。上限を過ぎると、その段階は`stage deadline expired`で失敗します。
+
+採用する値は、入力の`stageTimeoutMs`、環境変数`YORISHIRO_STAGE_TIMEOUT_MS`、既定の5400000（90分）の順に決まります。環境変数は後方互換のために残してあり、範囲の制限はありません（正の数であること。そうでなければ開始前のエラー）。採用した値と出どころは`run.json`の`stageTimeout`（`{ "ms": 5400000, "source": "input" | "env" | "default" }`）に残ります。
+
+段階の上限は、Workerが報告前に実行する`requiredChecks`の実行時間と、Workerの作業時間の合計より長くしてください。1チェックの上限（1800000、30分）と同じ値にすると、長いチェックを1回走らせただけで段階の上限を使い切ります。既定を30分から90分に延ばしたのはこのためです。JVMのビルドのように1回30分近くかかるチェックを複数回走らせる場合は、`stageTimeoutMs`を明示して延ばします。
+
 ## sandbox
 
 Reviewerとquality gateの検証コマンドは、対象checkoutをcopy-on-write優先で使い捨てsnapshotへ複製し、そのsnapshotだけを書き込み可能にしたmacOSの`sandbox-exec`またはLinuxのbubblewrap/user namespace内で実行します。ビルド成果物やテストfixtureはsnapshotへ書けますが、元checkoutへの書き込みはkernelで拒否されます。
 
 検証コマンドの環境は、orchestratorの環境から`YORISHIRO_`で始まる変数（`YORISHIRO_ROOT`、`YORISHIRO_RUNTIME`、`YORISHIRO_ROLE`など）と`HERDR_`で始まる変数を取り除き、snapshot内を指す`TMPDIR`／`TMP`／`TEMP`、`npm_config_cache`、`XDG_CACHE_HOME`、`YORISHIRO_EVIDENCE_DIR`を設定したものです。`YORISHIRO_ROOT`を継承すると、snapshot内で動くpipelineが元checkoutの`artifacts/`へ書こうとしてsandboxに拒否されます。環境は`verifier-tools.ts`の`verificationEnvironment()`が組み立てます。
+
+JVM系のツール（Gradle、Kotlinコンパイラ、Mockitoのinline mock maker）が動くように、検証コマンドには次の既定も与えます（`verifier-tools.ts`）。JVM以外のツールには広げません。
+
+- `JAVA_TOOL_OPTIONS`: 呼び出し元の値を残したまま`-Djava.io.tmpdir=<snapshotの一時ディレクトリ>`を追記します。JVMは`picked up JAVA_TOOL_OPTIONS`をstderrに出します。
+- `GRADLE_USER_HOME`: snapshot内の`.yorishiro-cache/gradle`にします（元の`~/.gradle`には書けないため）。
+- `GRADLE_RO_DEP_CACHE`: 元のGradleホーム（呼び出し元の`GRADLE_USER_HOME`、なければ`~/.gradle`）に`caches`があれば、そのパスを設定し、依存を読み取り専用で参照させます。呼び出し元が設定済みならそれを優先します。
+- 元のGradleホームの`gradle.properties`は、snapshot作成時に権限600でsnapshot内の`GRADLE_USER_HOME`へ複製します（JDKの場所などの端末設定を引き継ぐため）。中身は出力にもログにも出さず、snapshotと一緒に消えます。
+
+macOSでは、`getconf DARWIN_USER_TEMP_DIR`のrealpath（`/private/var/folders/.../T`）への書き込みもsandboxで許します。HotSpotはattach用のソケットを、Kotlinコンパイラは`kotlin-compiler-in-*.alive`をここへ作り、場所を変えられません。取得できない場合は許可を足しません（エラーにはしません）。このディレクトリには検証コマンドが作ったファイルが残ることがあり、同時に走る別のコマンドからも書けます。
+
+macOSのsnapshotは、`os.tmpdir()`（既定で`DARWIN_USER_TEMP_DIR`と同じ場所）ではなく、Yorishiro専用の`~/Library/Caches/yorishiro/verification/`（なければ作成。権限700）の下に`mkdtemp`で作ります。sandboxが書き込みを許すのは、そのコマンド自身のsnapshotと`DARWIN_USER_TEMP_DIR`だけなので、同時に走っている別のsnapshot（`.yorishiro-evidence`を含む）には書けません。snapshotは従来どおり検証の終了時に消します。異常終了（プロセスの強制終了、電源断など）で残ったsnapshotは自動では掃除しません。`~/Library/Caches/yorishiro/verification/`の古い`yorishiro-verification-*`を手で消してください。
+
+macOSのpreflightは、対象が`DARWIN_USER_TEMP_DIR`のrealpathの下にある場合（`TMPDIR`が別の場所でも）、snapshotの置き場の下にある場合、snapshotの置き場を含む場合（例: `~/Library/Caches`、ホーム）に拒否します。最後のものは、対象のコピーが自分のsnapshotを再帰して含むのを避けるためです。Linuxのsandboxとsnapshotの置き場（`os.tmpdir()`）は変えていません。
+
+Dockerソケット経由の書き込み（コンテナのボリュームなど）は止めていません。sandboxが制限するのは検証コマンド自身のファイル書き込みで、Dockerデーモンが代わりに行う書き込みには及びません。
+
+1チェックの`timeoutMs`（`requiredChecks`、`run_verification_command`）の上限は1800000（30分）です。`requiredChecks`の既定は120000、`run_verification_command`の既定も120000のままです。Claude Codeはstdio MCPのtool呼び出しが30分無応答だと打ち切る（`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`の既定。バイナリから読み取った値で、公式文書では未確認）ため、Claudeランタイムのlauncherはこれを3600000にしてから起動します。
+
+Claude Codeは、MCPのtool呼び出しが120秒を超えると呼び出しをバックグラウンドへ移し、`still running after 120s. It was moved to the background as task ...`と返します。子（WorkerとReviewer）には完了を待つ手段がないため、`npm run test:gate`やGradleのように2分を超える検証コマンドの結果を受け取れません。この閾値はclaude 2.1.322のバイナリから読み取った環境変数`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`で決まり（公式文書では未確認）、`0`なら自動ではバックグラウンドへ移しません。Claudeランタイムのlauncherはこれを`0`にしてから起動します。Piランタイムの子は変わりません。
 
 snapshotは書き込みを閉じたsandboxの中なので、検証コマンドからさらにsandboxを起動する（macOSでは`sandbox-exec`の入れ子、つまりpipelineや`runSandboxedVerification`を呼ぶテスト）ことはできません。Yorishiro自身を対象にするrunの`requiredChecks`は`npm run test:gate`にし、入れ子になるスイートは`test/gate-exclusions.json`の理由付き一覧に載せ、Workerがsandboxの外で`npm test`を実行して確かめます。
 

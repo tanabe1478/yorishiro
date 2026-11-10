@@ -68,14 +68,14 @@ load({ registerTool(tool) { tools.push(tool); } });
 const pipeline = tools.find(tool => tool.name === "development_pipeline");
 assert.ok(pipeline, "production extension must register development_pipeline");
 
-async function executeScenario(scenario, aborted = false) {
+async function executeScenario(scenario, aborted = false, extraInput = {}) {
   await writeFile(log, "");
   await rm(stopFile, { force: true });
   process.env.FAKE_HERDR_SCENARIO = scenario;
   process.env.FAKE_HERDR_STARTS = "";
   const controller = new AbortController();
   if (aborted) controller.abort();
-  const result = await pipeline.execute("test", { task: "routing test", approvedPlan: "approved", qualityContract: { planItems: [{ id: "PLAN-1", description: "実装する" }], requiredChecks: [{ id: "CHECK-1", program: "/usr/bin/true", args: [] }] }, cwd: target, cleanupMode: "never" }, controller.signal, update => {
+  const result = await pipeline.execute("test", { task: "routing test", approvedPlan: "approved", qualityContract: { planItems: [{ id: "PLAN-1", description: "実装する" }], requiredChecks: [{ id: "CHECK-1", program: "/usr/bin/true", args: [] }] }, cwd: target, cleanupMode: "never", ...extraInput }, controller.signal, update => {
     if (scenario === "abort" && update?.content?.[0]?.text.includes("pane is running")) controller.abort();
   }, { cwd: target, hasUI: false });
   const artifact = result.details.artifactDir;
@@ -137,6 +137,25 @@ assert.equal(before.calls.filter(a => a[0] === "pane" && a[1] === "send-keys").l
 assert.equal(before.calls.filter(a => a[0] === "pane" && a[1] === "close").length, 0);
 
 const preflightContract = { planItems: [{ id: "PLAN-1", description: "実装する" }], requiredChecks: [{ id: "CHECK-1", program: "/usr/bin/true", args: [] }] };
+// stageTimeoutMs: the value in effect and where it came from are recorded in run.json; the input wins over the environment, the environment over the default.
+const envBefore = process.env.YORISHIRO_STAGE_TIMEOUT_MS;
+const fromEnv = await executeScenario("layout-occupied");
+assert.deepEqual(fromEnv.metadata.stageTimeout, { ms: 500, source: "env" });
+const fromInput = await executeScenario("layout-occupied", false, { stageTimeoutMs: 60000 });
+assert.deepEqual(fromInput.metadata.stageTimeout, { ms: 60000, source: "input" });
+delete process.env.YORISHIRO_STAGE_TIMEOUT_MS;
+const fromDefault = await executeScenario("layout-occupied");
+assert.deepEqual(fromDefault.metadata.stageTimeout, { ms: 5400000, source: "default" });
+const inputOverDefault = await executeScenario("layout-occupied", false, { stageTimeoutMs: 14400000 });
+assert.deepEqual(inputOverDefault.metadata.stageTimeout, { ms: 14400000, source: "input" });
+process.env.YORISHIRO_STAGE_TIMEOUT_MS = envBefore;
+// An out-of-range input fails before anything starts (no pane, no artifact directory for the run).
+for (const bad of [59999, 14400001, 60000.5, "60000", null]) {
+  await writeFile(log, "");
+  await assert.rejects(() => pipeline.execute("bad-timeout", { task: "t", approvedPlan: "approved", qualityContract: preflightContract, cwd: target, cleanupMode: "never", stageTimeoutMs: bad }, new AbortController().signal, () => {}, { cwd: target, hasUI: false }), /stageTimeoutMs must be an integer from 60000 to 14400000/);
+  assert.equal((await readFile(log, "utf8")).trim(), "", "invalid stageTimeoutMs must not reach Herdr");
+}
+
 async function expectPreflightFailure(env, pattern) {
   Object.assign(process.env, env);
   await writeFile(log, "");

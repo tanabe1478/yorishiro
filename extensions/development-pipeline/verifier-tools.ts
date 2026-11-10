@@ -1,11 +1,13 @@
-import { spawn } from "node:child_process";
-import { constants as fsConstants } from "node:fs";
-import { copyFile, cp, lstat, mkdir, mkdtemp, opendir, realpath, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { execFileSync, spawn } from "node:child_process";
+import { constants as fsConstants, statSync } from "node:fs";
+import { copyFile, cp, lstat, mkdir, mkdtemp, opendir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { preflightWorkspaceSandbox } from "./sandbox.ts";
+import { darwinUserTempDir, preflightWorkspaceSandbox, verificationRoot } from "./sandbox.ts";
+export { darwinUserTempDir };
+import { MAX_CHECK_TIMEOUT_MS } from "./quality-contract.ts";
 import { isWithinRepositories, parseRepositories, repositoryDir } from "./repositories.ts";
 
 export const MAX_OUTPUT = 64 * 1024;
@@ -56,27 +58,56 @@ export function run(program: string, args: string[], cwd: string, timeout: numbe
 }
 
 function sandboxLiteral(value: string) { return JSON.stringify(value); }
+/** The macOS sandbox-exec profile: writes only under `cwd`, /dev/null, and (when given) the user temp directory. */
+export function darwinSandboxProfile(cwd: string, userTempDir?: string): string {
+  return `(version 1) (allow default) (deny file-write*) (allow file-write* (subpath ${sandboxLiteral(cwd)})) (allow file-write* (literal "/dev/null"))${userTempDir ? ` (allow file-write* (subpath ${sandboxLiteral(userTempDir)}))` : ""}`;
+}
 /** `cwd` is the writable root; `workdir` (inside it) is where the program starts. */
 export function sandboxCommand(program: string, args: string[], cwd: string, workdir = cwd): string[] {
-  if (process.platform === "darwin") {
-    const profile = `(version 1) (allow default) (deny file-write*) (allow file-write* (subpath ${sandboxLiteral(cwd)})) (allow file-write* (literal "/dev/null"))`;
-    return ["/usr/bin/sandbox-exec", "-p", profile, "--", program, ...args];
-  }
+  if (process.platform === "darwin") return ["/usr/bin/sandbox-exec", "-p", darwinSandboxProfile(cwd, darwinUserTempDir()), "--", program, ...args];
   if (process.platform === "linux") return ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--bind", cwd, cwd, "--dev", "/dev", "--proc", "/proc", "--chdir", workdir, "--", program, ...args];
   throw new Error(`Verifier sandbox is unsupported on ${process.platform}`);
 }
 
 /** Variables that describe the orchestrator's own session (its root, runtime, role, Herdr pane). A verification command must not inherit them. */
 const ORCHESTRATOR_ENV = /^(?:YORISHIRO_|HERDR_)/;
+/** The caller's Gradle home: GRADLE_USER_HOME, else ~/.gradle. */
+function originalGradleHome(base: NodeJS.ProcessEnv) { return base.GRADLE_USER_HOME || path.join(base.HOME || homedir(), ".gradle"); }
+function isDirectory(target: string) { try { return statSync(target).isDirectory(); } catch { return false; } }
+/** The snapshot's own Gradle home (GRADLE_USER_HOME); the sandbox cannot write the caller's ~/.gradle. */
+function snapshotGradleHome(cache: string) { return path.join(cache, "gradle"); }
+/**
+ * Copy the caller's gradle.properties (JDK locations and other machine settings) into the snapshot's Gradle home
+ * with mode 600. Nothing is read from or written to anywhere else, and nothing is logged. The copy lives in the snapshot.
+ */
+export async function copyGradleProperties(cache: string, base: NodeJS.ProcessEnv = process.env): Promise<boolean> {
+  try {
+    const source = path.join(originalGradleHome(base), "gradle.properties");
+    if (!statSync(source).isFile()) return false;
+    const content = await readFile(source);
+    const home = snapshotGradleHome(cache);
+    await mkdir(home, { recursive: true });
+    const target = path.join(home, "gradle.properties");
+    await rm(target, { force: true }); // writeFile keeps the mode of an existing file
+    await writeFile(target, content, { mode: 0o600, flag: "wx" });
+    return true;
+  } catch { return false; }
+}
 /**
  * The whole environment of a verification command: the caller's environment without the
  * orchestrator's YORISHIRO_* and HERDR_* variables, with temp and cache directories and
  * YORISHIRO_EVIDENCE_DIR pointing into the snapshot. Inheriting YORISHIRO_ROOT sent a
  * checked tree's own pipeline to the real checkout's artifacts, which the sandbox cannot write.
+ *
+ * JVM defaults: java.io.tmpdir is appended to JAVA_TOOL_OPTIONS (the JVM ignores TMPDIR on macOS), GRADLE_USER_HOME is
+ * a directory in the snapshot, and the caller's Gradle caches are visible read-only through GRADLE_RO_DEP_CACHE
+ * (the caller's own GRADLE_RO_DEP_CACHE wins).
  */
 export function verificationEnvironment(workspace: { temp: string; cache: string; evidence: string }, base: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const inherited: Record<string, string> = {};
   for (const [name, value] of Object.entries(base)) if (value !== undefined && !ORCHESTRATOR_ENV.test(name)) inherited[name] = value;
+  const tmpOption = `-Djava.io.tmpdir=${/\s/.test(workspace.temp) ? `"${workspace.temp}"` : workspace.temp}`;
+  const roCache = path.join(originalGradleHome(base), "caches");
   return {
     ...inherited,
     TMPDIR: workspace.temp,
@@ -84,6 +115,9 @@ export function verificationEnvironment(workspace: { temp: string; cache: string
     TEMP: workspace.temp,
     npm_config_cache: path.join(workspace.cache, "npm"),
     XDG_CACHE_HOME: path.join(workspace.cache, "xdg"),
+    JAVA_TOOL_OPTIONS: inherited.JAVA_TOOL_OPTIONS ? `${inherited.JAVA_TOOL_OPTIONS} ${tmpOption}` : tmpOption,
+    GRADLE_USER_HOME: snapshotGradleHome(workspace.cache),
+    ...(inherited.GRADLE_RO_DEP_CACHE === undefined && isDirectory(roCache) ? { GRADLE_RO_DEP_CACHE: roCache } : {}),
     YORISHIRO_EVIDENCE_DIR: workspace.evidence,
   };
 }
@@ -107,7 +141,10 @@ async function copyDirectory(source: string, destination: string, signal?: Abort
  * Anything else under the root is not copied. The whole snapshot root is writable.
  */
 async function createVerificationWorkspace(cwd: string, signal?: AbortSignal, repositories?: readonly string[]): Promise<VerificationWorkspace> {
-  const root = await mkdtemp(path.join(tmpdir(), "yorishiro-verification-"));
+  const parent = verificationRoot();
+  // macOS: a private directory only Yorishiro uses (mode 700); the sandbox allows each command to write its own snapshot only.
+  if (process.platform === "darwin") await mkdir(parent, { recursive: true, mode: 0o700 });
+  const root = await mkdtemp(path.join(parent, "yorishiro-verification-"));
   const workspace = path.join(root, "workspace");
   try {
     await mkdir(workspace);
@@ -124,6 +161,7 @@ async function createVerificationWorkspace(cwd: string, signal?: AbortSignal, re
     // Never preserve that as fresh proof for this check.
     await rm(evidence, { recursive: true, force: true });
     await Promise.all([mkdir(temp, { recursive: true }), mkdir(cache, { recursive: true }), mkdir(evidence, { recursive: true })]);
+    await copyGradleProperties(cache);
     return { root, cwd: canonical, temp, cache, evidence };
   } catch (error) {
     await rm(root, { recursive: true, force: true });
@@ -281,7 +319,7 @@ export default function (pi: ExtensionAPI) {
     name: "run_verification_command",
     label: "Run Read-only Verification Command",
     description: "Run one executable in a kernel-enforced read-only sandbox. Output is capped at 64 KiB and cancellation terminates its process group. Files written to $YORISHIRO_EVIDENCE_DIR are copied to orchestrator-owned evidence before the snapshot is removed.",
-    parameters: Type.Object({ program: Type.String(), args: Type.Array(Type.String()), timeoutMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 300000 })), cwd: Type.Optional(Type.String({ description: "Workspace-relative directory to run in: one of the run's repositories or inside one. Only for runs with repositories; default is the workspace root." })) }),
+    parameters: Type.Object({ program: Type.String(), args: Type.Array(Type.String()), timeoutMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: MAX_CHECK_TIMEOUT_MS })), cwd: Type.Optional(Type.String({ description: "Workspace-relative directory to run in: one of the run's repositories or inside one. Only for runs with repositories; default is the workspace root." })) }),
     async execute(_id, input: { program: string; args: string[]; timeoutMs?: number; cwd?: string }, signal: AbortSignal) {
       const cwd = process.env.YORISHIRO_TARGET_CWD;
       if (!cwd) throw new Error("Verifier sandbox is not configured");

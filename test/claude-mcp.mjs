@@ -72,6 +72,7 @@ try {
   assert.deepEqual(reviewerTools.map(tool => tool.name), ["submit_stage_report", "run_verification_command"]);
   assert.deepEqual(reviewerTools[0].inputSchema.properties.verdict.enum, ["APPROVED", "APPROVED_WITH_NOTES", "CHANGES_REQUESTED", "NEEDS_PLANNER"]);
   assert.deepEqual(reviewerTools[1].inputSchema.required, ["program", "args"]);
+  assert.deepEqual([reviewerTools[1].inputSchema.properties.timeoutMs.minimum, reviewerTools[1].inputSchema.properties.timeoutMs.maximum], [1000, 1800000], "one verification command may run 30 minutes");
   await reviewer.close();
 } finally {
   await rm(base, { recursive: true, force: true });

@@ -265,6 +265,8 @@ export function renderClaudeMcpConfig(options: LauncherOptions) {
  * `--add-dir`) come first and single-value options last, so the positional
  * prompt is never consumed as an option value.
  */
+/** Claude Code's idle timeout for a stdio MCP tool call (CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT); above the longest verification command (MAX_CHECK_TIMEOUT_MS). */
+export const MCP_TOOL_IDLE_TIMEOUT_MS = 3_600_000;
 export function renderClaudeLauncher(options: LauncherOptions): string {
   const stage = options.stage;
   const claudeBin = options.claudeBin ?? process.env.YORISHIRO_CLAUDE_BIN ?? "claude";
@@ -273,6 +275,10 @@ export function renderClaudeLauncher(options: LauncherOptions): string {
   const dirs = [options.artifactDir, options.workflowSkillDir];
   const exports = [
     `export YORISHIRO_RUNTIME=${shellQuote("claude")}`,
+    // Claude Code ends a stdio MCP tool call that is silent for 30 minutes (its default). One verification command may now run 30 minutes after its snapshot copy.
+    `export CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=${shellQuote(String(MCP_TOOL_IDLE_TIMEOUT_MS))}`,
+    // Claude Code moves an MCP call that runs over 120 s to the background and returns "moved to the background as task ...", so the child cannot wait for the result. 0 turns that off (read from the claude 2.1.322 binary; not documented).
+    `export CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=${shellQuote("0")}`,
     `export YORISHIRO_REPORT_STAGE=${shellQuote(stage)}`,
     `export YORISHIRO_ROLE=${shellQuote(INFO[stage].label)}`,
     `export YORISHIRO_PROMPT_PATH=${shellQuote(options.promptFile)}`,

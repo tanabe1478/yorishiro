@@ -86,8 +86,8 @@ try {
   await mkdir(artifactDir, { recursive: true });
   await mkdir(cwd, { recursive: true });
   const fakeClaude = path.join(base, "claude");
-  const argvLog = path.join(base, "argv.json"), envLog = path.join(base, "evidence-dir.txt");
-  await writeFile(fakeClaude, `#!/bin/sh\nprintf '%s' "\${YORISHIRO_EVIDENCE_DIR-unset}" > ${JSON.stringify(envLog)}\nnode -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(2)))' ${JSON.stringify(argvLog)} "$@"\n`);
+  const argvLog = path.join(base, "argv.json"), envLog = path.join(base, "evidence-dir.txt"), backgroundLog = path.join(base, "auto-background.txt");
+  await writeFile(fakeClaude, `#!/bin/sh\nprintf '%s' "\${YORISHIRO_EVIDENCE_DIR-unset}" > ${JSON.stringify(envLog)}\nprintf '%s' "\${CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS-unset}" > ${JSON.stringify(backgroundLog)}\nnode -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(2)))' ${JSON.stringify(argvLog)} "$@"\n`);
   await chmod(fakeClaude, 0o755);
   const skillDir = path.join(root, "skills", "development-workflow");
   const common = { cwd, artifactDir, root, workflowSkillDir: skillDir, workflowPlaybook: path.join(skillDir, "playbooks", "feature.md"), workflow: "feature", verifySkills: [], claudeBin: fakeClaude };
@@ -95,7 +95,7 @@ try {
   const runLauncher = async stage => {
     const files = await writeLauncher({ ...common, stage, name: models.INFO[stage].label, promptFile: path.join(artifactDir, `${stage}-prompt.md`), promptFileContent: prompt, reportPath: path.join(artifactDir, `${stage}-pending.json`), workflowBrief: path.join(artifactDir, `workflow-brief-${stage}.md`) });
     // The quality gate sets YORISHIRO_EVIDENCE_DIR for its own checks; the launcher must decide it for itself.
-    const { YORISHIRO_EVIDENCE_DIR: _inherited, ...cleanEnv } = process.env;
+    const { YORISHIRO_EVIDENCE_DIR: _inherited, CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS: _background, ...cleanEnv } = process.env;
     const run = spawnSync("/bin/sh", [files.launcher], { encoding: "utf8", env: cleanEnv });
     assert.equal(run.status, 0, run.stderr);
     return { files, argv: JSON.parse(await readFile(argvLog, "utf8")) };
@@ -107,6 +107,9 @@ try {
   const workerEvidence = path.join(artifactDir, "evidence", "worker");
   assert.equal(await readFile(envLog, "utf8"), workerEvidence, "the Worker's YORISHIRO_EVIDENCE_DIR points into the artifact");
   assert.equal(existsSync(workerEvidence), true, "the directory exists before the child starts");
+  assert.match(await readFile(worker.files.launcher, "utf8"), /^export CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT='3600000'$/m, "Claude Code's 30 minute idle limit for an MCP tool call is raised above the longest check");
+  assert.equal(await readFile(backgroundLog, "utf8"), "0", "the Worker's claude process sees CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0");
+  assert.match(await readFile(worker.files.launcher, "utf8"), /^export CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS='0'$/m, "Claude Code's move of an MCP call over 120 s to the background is turned off, so the child can wait for a long verification command");
   assert.equal(worker.argv.at(-1), prompt, "the prompt must stay the last positional argument");
   assert.equal(option(worker.argv, "--model"), "claude-sonnet-5-5");
   assert.equal(option(worker.argv, "--effort"), "high");
@@ -124,6 +127,7 @@ try {
   const reviewer = await runLauncher("review");
   assert.equal(await readFile(envLog, "utf8"), "unset", "the Reviewer's evidence goes through run_verification_command, not a variable of its own");
   assert.equal(reviewer.argv.at(-1), prompt);
+  assert.equal(await readFile(backgroundLog, "utf8"), "0", "the Reviewer's claude process sees CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0 (its npm run test:gate ran over 120 s)");
   assert.equal(option(reviewer.argv, "--model"), "claude-opus-5-5");
   assert.equal(option(reviewer.argv, "--effort"), "medium");
   assert.ok(reviewer.argv.includes("--restricted"), "the Reviewer must run in restricted mode");

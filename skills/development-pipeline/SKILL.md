@@ -27,7 +27,7 @@ description: Run the approved development pipeline in stable Herdr worker panes 
 1. 親で計画と`qualityContract`を確定する。
 2. `development_pipeline`を実行する。piでは固定modelをpane起動前に`pi auth check`とcatalogで確認し、`model-guard.ts`が`tool_call`境界で不一致・不明を拒否する。Claude Codeでは`claude auth status`でログインを確認し、子を`--model`で固定して起動する（model guardはない）。
 3. Workerの`COMPLETED`／`BLOCKED` reportを中央validatorが検査する。契約IDのexact一致、実diff一致、prefix遵守が必須で、report各fieldの仕様は[詳細](../../docs/development-pipeline.md#qualitycontractとreport)だけに置く。
-4. requiredChecksをsandbox snapshotで実行する。1件でも失敗すれば`QUALITY_GATE_FAILED`。
+4. requiredChecksをsandbox snapshotで実行する。1件でも失敗すれば`QUALITY_GATE_FAILED`。1チェックの`timeoutMs`は最大1800000（30分）。JVM（Gradle、Kotlin、Mockito）向けの環境の既定は[詳細](../../docs/development-pipeline.md#sandbox)。
 5. Reviewer判定（`APPROVED`／`APPROVED_WITH_NOTES`／`CHANGES_REQUESTED`／`NEEDS_PLANNER`）に従い、blocking findingだけをsanitizedでWorkerへ返す。
 6. 成功時だけ`cleanupMode`（既定`ask`）で整理する。失敗・中断・`NEEDS_PLANNER`・`CHANGES_REQUIRED`ではペインと証跡を残し、`development_pipeline_reset`で別途resetする。
 
@@ -37,6 +37,7 @@ description: Run the approved development pipeline in stable Herdr worker panes 
 
 ## 安全境界
 
+- 1段階の時間の上限は入力の`stageTimeoutMs`（60000〜14400000、既定5400000）。requiredChecksの実行時間とWorkerの作業時間の合計より長くする。[詳細](../../docs/development-pipeline.md#段階の時間の上限)
 - 修正は同一Workerペインで`maxReviewCycles`（既定2、上限3。旧`maxRepairCycles`は互換入力）まで。モデル切替・fallbackはせず、再発や上限到達は`NEEDS_PLANNER`／`CHANGES_REQUIRED`で止める。
 - 証跡は`$YORISHIRO_EVIDENCE_DIR`からorchestratorが上限付きで回収する。Reviewerは元checkoutを書き換えられない。
 - Claude CodeのWorkerにも`run_verification_command`（Reviewerと同じsnapshotとsandbox）と`YORISHIRO_EVIDENCE_DIR`（artifactの`evidence/worker/`、直接書く。目録は`run.json`の`workerEvidence`）を渡す。Workerは報告前にrequiredChecksをこのtoolで確かめ、検証用の複製やsandboxを手作りしない。
