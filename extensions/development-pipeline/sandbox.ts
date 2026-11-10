@@ -25,3 +25,9 @@ export async function preflightVerifierSandbox(cwd: string): Promise<void> {
   }
   throw new Error(`Verifier sandbox is unsupported on ${process.platform}`);
 }
+
+/** One repository: the cwd. Several: each repository (the workspace root itself is not copied, so it is not checked). */
+export async function preflightWorkspaceSandbox(cwd: string, repositories?: readonly string[]): Promise<void> {
+  if (!repositories) return preflightVerifierSandbox(cwd);
+  for (const repository of repositories) await preflightVerifierSandbox(path.join(cwd, ...repository.split("/")));
+}

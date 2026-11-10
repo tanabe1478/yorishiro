@@ -31,6 +31,10 @@ description: Run the approved development pipeline in stable Herdr worker panes 
 5. Reviewer判定（`APPROVED`／`APPROVED_WITH_NOTES`／`CHANGES_REQUESTED`／`NEEDS_PLANNER`）に従い、blocking findingだけをsanitizedでWorkerへ返す。
 6. 成功時だけ`cleanupMode`（既定`ask`）で整理する。失敗・中断・`NEEDS_PLANNER`・`CHANGES_REQUIRED`ではペインと証跡を残し、`development_pipeline_reset`で別途resetする。
 
+## 複数リポジトリ
+
+互いに依存する複数のgitリポジトリを1回で扱うときは、入力に`repositories`（`cwd`からの相対パスの配列。各要素がgitルート）を足す。このとき`changedPaths`、`allowedPathPrefixes`、`requiredChecks`の任意の`cwd`は、すべてワークスペース相対（`backend/src/a.ts`）で書く。省略すれば従来どおり。指定方法とsandboxの扱いは[詳細](../../docs/development-pipeline.md#複数リポジトリ)。
+
 ## 安全境界
 
 - 修正は同一Workerペインで`maxReviewCycles`（既定2、上限3。旧`maxRepairCycles`は互換入力）まで。モデル切替・fallbackはせず、再発や上限到達は`NEEDS_PLANNER`／`CHANGES_REQUIRED`で止める。

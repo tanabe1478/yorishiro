@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { preflightVerifierSandbox } from "./sandbox.ts";
+import { preflightWorkspaceSandbox } from "./sandbox.ts";
+import { isWithinRepositories, parseRepositories, repositoryDir } from "./repositories.ts";
 
 export const MAX_OUTPUT = 64 * 1024;
 export const TRUNCATION_NOTICE = "\n[output truncated at 65536 bytes]";
@@ -55,12 +56,13 @@ export function run(program: string, args: string[], cwd: string, timeout: numbe
 }
 
 function sandboxLiteral(value: string) { return JSON.stringify(value); }
-export function sandboxCommand(program: string, args: string[], cwd: string): string[] {
+/** `cwd` is the writable root; `workdir` (inside it) is where the program starts. */
+export function sandboxCommand(program: string, args: string[], cwd: string, workdir = cwd): string[] {
   if (process.platform === "darwin") {
     const profile = `(version 1) (allow default) (deny file-write*) (allow file-write* (subpath ${sandboxLiteral(cwd)})) (allow file-write* (literal "/dev/null"))`;
     return ["/usr/bin/sandbox-exec", "-p", profile, "--", program, ...args];
   }
-  if (process.platform === "linux") return ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--bind", cwd, cwd, "--dev", "/dev", "--proc", "/proc", "--chdir", cwd, "--", program, ...args];
+  if (process.platform === "linux") return ["/usr/bin/bwrap", "--ro-bind", "/", "/", "--bind", cwd, cwd, "--dev", "/dev", "--proc", "/proc", "--chdir", workdir, "--", program, ...args];
   throw new Error(`Verifier sandbox is unsupported on ${process.platform}`);
 }
 
@@ -87,20 +89,35 @@ export function verificationEnvironment(workspace: { temp: string; cache: string
 }
 
 type VerificationWorkspace = { root: string; cwd: string; temp: string; cache: string; evidence: string };
-async function createVerificationWorkspace(cwd: string, signal?: AbortSignal): Promise<VerificationWorkspace> {
+/** Copy the contents of `source` into the existing directory `destination` (copy-on-write where possible). */
+async function copyDirectory(source: string, destination: string, signal?: AbortSignal) {
+  const from = `${source}${path.sep}.`;
+  const copyArgs = process.platform === "darwin" ? ["-cR", from, destination] : ["-a", "--reflink=auto", from, destination];
+  const copied = await run("/bin/cp", copyArgs, source, 300_000, signal);
+  if (copied.code !== 0 || copied.cancelled || copied.timedOut) {
+    await rm(destination, { recursive: true, force: true });
+    await mkdir(destination, { recursive: true });
+    if (signal?.aborted) throw new Error("Verifier snapshot copy was cancelled");
+    await cp(source, destination, { recursive: true, force: true, errorOnExist: false });
+  }
+}
+/**
+ * One repository: the snapshot is a copy of `cwd`. With `repositories`, `cwd` is the workspace root and only
+ * those repositories are copied, at their relative paths, so `../<other repo>` resolves inside the snapshot.
+ * Anything else under the root is not copied. The whole snapshot root is writable.
+ */
+async function createVerificationWorkspace(cwd: string, signal?: AbortSignal, repositories?: readonly string[]): Promise<VerificationWorkspace> {
   const root = await mkdtemp(path.join(tmpdir(), "yorishiro-verification-"));
   const workspace = path.join(root, "workspace");
   try {
     await mkdir(workspace);
-    const source = `${cwd}${path.sep}.`;
-    const copyArgs = process.platform === "darwin" ? ["-cR", source, workspace] : ["-a", "--reflink=auto", source, workspace];
-    const copied = await run("/bin/cp", copyArgs, cwd, 300_000, signal);
-    if (copied.code !== 0 || copied.cancelled || copied.timedOut) {
-      await rm(workspace, { recursive: true, force: true });
-      await mkdir(workspace);
-      if (signal?.aborted) throw new Error("Verifier snapshot copy was cancelled");
-      await cp(cwd, workspace, { recursive: true, force: true, errorOnExist: false });
-    }
+    if (repositories) {
+      for (const repository of repositories) {
+        const target = repositoryDir(workspace, repository);
+        await mkdir(target, { recursive: true });
+        await copyDirectory(repositoryDir(cwd, repository), target, signal);
+      }
+    } else await copyDirectory(cwd, workspace, signal);
     const canonical = await realpath(workspace);
     const temp = path.join(canonical, ".yorishiro-tmp"), cache = path.join(canonical, ".yorishiro-cache"), evidence = path.join(canonical, EVIDENCE_DIR_NAME);
     // The target checkout may already contain a stale `.yorishiro-evidence`.
@@ -214,17 +231,27 @@ export async function collectEvidence(sourceDir: string, destination: string, op
   return result;
 }
 
-export async function runSandboxedVerification(program: string, args: string[], cwd: string, timeoutMs: number, signal?: AbortSignal, options: { evidenceDir?: string } = {}) {
-  await preflightVerifierSandbox(cwd);
+/**
+ * `options.repositories` makes `cwd` a multi-repository workspace root (see createVerificationWorkspace).
+ * `options.workdir` is a workspace-relative directory that is one of the repositories or inside one; the
+ * program starts there. It is only valid together with `repositories`.
+ */
+export async function runSandboxedVerification(program: string, args: string[], cwd: string, timeoutMs: number, signal?: AbortSignal, options: { evidenceDir?: string; repositories?: readonly string[]; workdir?: string } = {}) {
+  const { repositories, workdir } = options;
+  if (workdir !== undefined && !repositories) throw new Error("cwd is only allowed when the run has repositories");
+  if (workdir !== undefined && !isWithinRepositories(workdir, repositories)) throw new Error(`cwd must be a workspace-relative path that is one of repositories or inside one: ${workdir}`);
+  await preflightWorkspaceSandbox(cwd, repositories);
   let workspace: VerificationWorkspace;
-  try { workspace = await createVerificationWorkspace(await realpath(cwd), signal); }
+  try { workspace = await createVerificationWorkspace(await realpath(cwd), signal, repositories); }
   catch (error) {
     if (signal?.aborted) return { code: 1, stdout: "", stderr: "", truncated: false, cancelled: true, timedOut: false };
     throw error;
   }
   try {
-    const command = sandboxCommand(program, args, workspace.cwd);
-    const result = await run(command[0], command.slice(1), workspace.cwd, timeoutMs, signal, verificationEnvironment(workspace), true);
+    const start = workdir === undefined ? workspace.cwd : repositoryDir(workspace.cwd, workdir);
+    if (workdir !== undefined && !(await lstat(start).then(info => info.isDirectory(), () => false))) throw new Error(`cwd does not exist in the verification workspace: ${workdir}`);
+    const command = sandboxCommand(program, args, workspace.cwd, start);
+    const result = await run(command[0], command.slice(1), start, timeoutMs, signal, verificationEnvironment(workspace), true);
     if (!options.evidenceDir) return result;
     try {
       const evidence = await collectEvidence(workspace.evidence, options.evidenceDir);
@@ -237,14 +264,25 @@ export async function runSandboxedVerification(program: string, args: string[], 
   }
 }
 
+/** The run's repositories as the launcher passes them to the verifier (JSON array in YORISHIRO_TARGET_REPOSITORIES). */
+export function targetRepositoriesFromEnv(env: NodeJS.ProcessEnv = process.env): string[] | undefined {
+  const raw = env.YORISHIRO_TARGET_REPOSITORIES;
+  if (raw === undefined || raw === "") return undefined;
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { throw new Error("YORISHIRO_TARGET_REPOSITORIES is not valid JSON"); }
+  const parsed = parseRepositories(value);
+  if (!parsed.valid) throw new Error(`YORISHIRO_TARGET_REPOSITORIES is invalid: ${parsed.error}`);
+  return parsed.value;
+}
+
 export default function (pi: ExtensionAPI) {
   let evidenceCounter = 0;
   pi.registerTool({
     name: "run_verification_command",
     label: "Run Read-only Verification Command",
     description: "Run one executable in a kernel-enforced read-only sandbox. Output is capped at 64 KiB and cancellation terminates its process group. Files written to $YORISHIRO_EVIDENCE_DIR are copied to orchestrator-owned evidence before the snapshot is removed.",
-    parameters: Type.Object({ program: Type.String(), args: Type.Array(Type.String()), timeoutMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 300000 })) }),
-    async execute(_id, input: { program: string; args: string[]; timeoutMs?: number }, signal: AbortSignal) {
+    parameters: Type.Object({ program: Type.String(), args: Type.Array(Type.String()), timeoutMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: 300000 })), cwd: Type.Optional(Type.String({ description: "Workspace-relative directory to run in: one of the run's repositories or inside one. Only for runs with repositories; default is the workspace root." })) }),
+    async execute(_id, input: { program: string; args: string[]; timeoutMs?: number; cwd?: string }, signal: AbortSignal) {
       const cwd = process.env.YORISHIRO_TARGET_CWD;
       if (!cwd) throw new Error("Verifier sandbox is not configured");
       const evidenceRoot = process.env.YORISHIRO_EVIDENCE_ROOT;
@@ -253,7 +291,8 @@ export default function (pi: ExtensionAPI) {
       const evidenceOwner = process.env.YORISHIRO_REPORT_STAGE === "implement" ? "worker-verification" : "reviewer";
       const evidenceDir = evidenceRoot ? path.join(evidenceRoot, evidenceOwner, `${Date.now()}-${process.pid}-${++evidenceCounter}`) : undefined;
       const timeout = input.timeoutMs ?? 120000;
-      const result = await runSandboxedVerification(input.program, input.args, cwd, timeout, signal, evidenceDir ? { evidenceDir } : {});
+      const repositories = targetRepositoriesFromEnv();
+      const result = await runSandboxedVerification(input.program, input.args, cwd, timeout, signal, { ...(evidenceDir ? { evidenceDir } : {}), ...(repositories ? { repositories } : {}), ...(input.cwd !== undefined ? { workdir: input.cwd } : {}) });
       const status = result.timedOut ? "TIMEOUT" : result.cancelled ? "CANCELLED" : "EXIT";
       const statusLine = `\n[verification ${status} exit=${result.code}]`;
       const resultEvidence = (result as any).evidence;

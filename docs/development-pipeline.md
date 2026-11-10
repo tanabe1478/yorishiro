@@ -53,6 +53,29 @@ WorkerとReviewerは`submit_stage_report`で中央validatorが検証する構造
 - `BLOCKED`は完了済みcontract IDのsubset（unknown／duplicate不可）とactual `changedPaths` exact一致、prefix遵守を必須とし、独立checksとReviewerを起動せず`IMPLEMENTATION_BLOCKED`で終わります。
 - BLOCKEDでも虚偽ID／path／prefix違反は許さず、`WORKER_EVIDENCE_MISMATCH`として停止します。
 
+## 複数リポジトリ
+
+互いに依存する複数のgitリポジトリ（API定義、それを実装するbackend、利用するadminなど）を1回のrunで実装・レビューするには、入力に`repositories`を足します。省略すると従来どおり、`cwd`が1つのgitリポジトリです（成果物の形式・パスも変わりません）。
+
+```json
+{ "cwd": "/work/neuhaus", "repositories": ["neuhaus-openapi", "neuhaus-backend", "neuhaus-admin"], "task": "...", "approvedPlan": "...", "qualityContract": { "...": "..." } }
+```
+
+- 指定: 各要素は`cwd`（省略時は呼出元のcwd）からの相対パスです。絶対パス、`.`、`..`、末尾の`/`、重複、入れ子（片方が他方の中）は開始前にエラーです。各要素はgit作業ツリーのルート（`git rev-parse --show-toplevel`がrealpathで一致する。シンボリックリンク経由は不可）でなければなりません。このときcwdはワークスペースのルートで、cwd自体がgitリポジトリかどうかは問いません。CLI（`yorishiro-pipeline run --input`）も同じJSONを受け取ります。
+- パスの書き方: Workerの`changedPaths`と`allowedPathPrefixes`はワークスペース相対です（`neuhaus-backend/src/a.ts`、prefixは`neuhaus-backend/src`）。リポジトリ内の相対path（`src/a.ts`）で書くと、実diffと一致せず`WORKER_EVIDENCE_MISMATCH`になります。差分はリポジトリごとに取り、各pathに`<リポジトリ>/`を前置して1つにまとめて照合します。
+- `requiredChecks`の`cwd`（任意）: ワークスペース相対で、`repositories`のいずれか、またはその配下です。そのcheckはその場所で実行します。省略したcheckはワークスペースのルートで実行します。`repositories`が無いのに`cwd`を付けると契約エラーです。`cwd`は契約のSHA-256に含まれ、`quality-contract.json`と`quality-gate-N.json`の各checkに残ります。
+- 検証sandbox: 指定したリポジトリだけを、元の相対配置のままsnapshotへ複製します。`../neuhaus-openapi`のような別リポジトリへの参照が解決できます。リポジトリに含まれないワークスペース配下のものは複製しません。書き込みはsnapshot全体に許します。preflight（`/tmp`配下、`TMPDIR`が対象の中、の拒否）は各リポジトリに対して行います。
+- `run_verification_command`の`cwd`引数（任意、ワークスペース相対）: checkと同じ規則です。省略するとワークスペースのルートです。子には`YORISHIRO_TARGET_CWD`（ワークスペースのルート）に加えて、`YORISHIRO_TARGET_REPOSITORIES`（リポジトリのJSON配列）を渡します（Claudeは各stageのMCP設定、PiはReviewerのlauncher）。`repositories`が無いrunで`cwd`を渡すとエラーです。Claudeランタイムでは、Workerのpromptとbriefに、checkの`cwd`をこのtoolの`cwd`へ渡すよう書きます。
+- artifact: `run.json`に`repositories`（指定時だけ）を記録します。`diffs/`には、リポジトリごとの`<name>-<リポジトリ名>-<8桁のhash>-status.txt`と`-diff.patch`、まとめた`<name>-fingerprint.json`1つが入ります（`<name>`は`baseline`、`implement-N`、`review-N`）。`workflow-brief-<stage>.md`と、Reviewerのpromptに対象リポジトリの一覧とpathの規則、リポジトリごとのsnapshotファイルを書きます。
+- verify Skillの探索、workspace trustの確認、diffaiの実行は、リポジトリごとに行います。diffaiはリポジトリの順に`--cwd <リポジトリ>`で実行し、最初に承認されなかったリポジトリで止めます（`ask`の確認は1回だけです）。
+
+制約と未確認の点:
+
+- `repositories`に含まれないワークスペース配下への書き込みは検出しません（実diffにもsnapshotにも入りません）。
+- workspace trustはリポジトリごとに警告を出しますが、Claude Codeが実際にサブディレクトリのリポジトリで信頼ダイアログを出すかは未観測です。
+- 複数のリポジトリが同名のverify Skillを持つ場合の読み込みは未確認です。
+- 検証sandboxのツールごとのキャッシュの付け替え（`GRADLE_USER_HOME`など）はしません。
+
 ## 状態遷移と有限repair
 
 Quality evidence不一致の初回だけ、Reviewerを起動せず同じWorkerペインへsanitized finding（ログ・絶対path・Reviewer出力を含まず、リポジトリ相対の違反pathだけを上限付きで含む）を送り、quality repairを1回行います。signatureは違反種別とcontract item/check IDで安定化します。findingには、prefix違反のpath（`outsidePaths`）と、changedPathsが実diffと食い違うpath（`missingPaths`＝報告漏れ、`unknownPaths`＝実diffに無い報告）を、リポジトリ相対pathのまま各50件まで含めます（超過は`omitted`に件数）。ログや絶対pathは含めません。違反pathがprefixの文字列前方一致になっている場合（`tsconfig`と`tsconfig.json`）は、「prefixはパス区切り単位で照合します。`tsconfig.json`を許可するなら`'tsconfig.json'`を明示してください」という提案（`prefixHints`）を足します。提案はfinding、`quality-gate-N.json`、`run.json`、`NEEDS_PLANNER`／`WORKER_EVIDENCE_MISMATCH`の結果messageに出ます。同じsignatureが再発した場合は、同一Workerの有限repairを使い切ったものとして`NEEDS_PLANNER`で停止し、モデル切替・fallbackは行わず、停止理由を`quality-planner-stop.json`と`run.json`へ残します。異なる2回目の違反は`WORKER_EVIDENCE_MISMATCH`で停止し、loopしません。

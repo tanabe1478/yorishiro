@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
+import * as path from "node:path";
 
 export type ReviewMode = "ask" | "required" | "skip";
 export type HumanDecision = "approved" | "rejected" | "skipped" | "unavailable" | "error" | "aborted" | "timeout" | "invalid";
@@ -160,3 +161,25 @@ export async function reviewDiff(options: DiffGateOptions): Promise<DiffGateResu
   }
 }
 export const runDiffReview = reviewDiff;
+
+export type RepositoryDiffGateOptions = Omit<DiffGateOptions, "cwd" | "exec"> & { cwd: string; repositories: readonly string[]; exec: (command: string, args: string[], cwd: string, signal?: AbortSignal) => ReturnType<DiffExec> };
+export type RepositoryDiffGateResult = DiffGateResult & { repositories: Array<DiffGateResult & { repository: string; argv: string[] }> };
+/**
+ * Multi-repository run: diffai reviews one repository per run (`--cwd <repository>`), in order, and stops
+ * at the first repository that is not approved. The overall decision is that repository's decision, or
+ * `approved` when every repository was approved. `confirm` is asked once, not once per repository.
+ */
+export async function reviewRepositoryDiffs(options: RepositoryDiffGateOptions): Promise<RepositoryDiffGateResult> {
+  let answer: Promise<boolean> | undefined;
+  const confirm = options.confirm ? () => (answer ??= Promise.resolve(options.confirm!())) : undefined;
+  const results: RepositoryDiffGateResult["repositories"] = [];
+  for (const repository of options.repositories) {
+    const dir = path.join(options.cwd, ...repository.split("/"));
+    const result = await reviewDiff({ ...options, cwd: dir, confirm, exec: (command, args, signal) => options.exec(command, args, dir, signal) });
+    results.push({ ...result, repository, argv: ["--yes", "github:tanabe1478/diffai", "--cwd", dir] });
+    if (result.decision !== "approved") break;
+  }
+  const last = results.at(-1)!;
+  const feedback = results.filter(item => item.feedback).map(item => `[${item.repository}] ${item.feedback}`).join("\n");
+  return { decision: last.decision, ...(feedback ? { feedback } : {}), ...(last.error ? { error: `[${last.repository}] ${last.error}` } : {}), ...(last.replyFile ? { replyFile: last.replyFile } : {}), repositories: results };
+}

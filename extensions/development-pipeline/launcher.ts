@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { INFO, MODELS, RUNTIME, type Stage } from "./models.ts";
 import { renderInputFilesSection, type InputFilesReport } from "./input-files.ts";
+import { repositoryDir } from "./repositories.ts";
 
 export const WORKFLOW_NAMES = ["feature", "bug-fix", "refactoring"] as const;
 export type WorkflowName = (typeof WORKFLOW_NAMES)[number];
@@ -26,11 +27,12 @@ export function workerEvidenceDir(artifactDir: string) {
  * prompt. The Worker has `run_verification_command` and a writable evidence
  * directory only there; Pi Workers have neither, so they are not told about them.
  */
-export function workerToolingInstructions(artifactDir: string, attempt?: number) {
+export function workerToolingInstructions(artifactDir: string, attempt?: number, repositories?: string[]) {
   const evidence = workerEvidenceDir(artifactDir);
   const where = attempt === undefined ? `${evidence}/attempt-<n>/` : `${evidence}/attempt-${attempt}/`;
   return [
     "報告前に、qualityContractのrequiredChecksを`run_verification_command`（MCPツール。programとargsを渡す）で実行し、exit 0を確かめる。本番のquality gateと同じsnapshotとsandbox条件で実行されるので、gateで落ちる原因を報告前に見つけられる。APFS cloneやsandbox-execで検証用の複製や環境を手作りしない。",
+    ...(repositories ? ["複数リポジトリのrunでは、requiredChecksの`cwd`（ワークスペース相対）があればそのcheckは`run_verification_command`の`cwd`引数に同じ値を渡して実行する。`cwd`なしのcheckは、cwdを渡さずワークスペースのルートで実行する。"] : []),
     `スクリーンショットや観測JSONなどの証跡は、環境変数\$YORISHIRO_EVIDENCE_DIR（${evidence}）の下の${where}に置く。orchestratorがartifactの一部として保存する。scratchpadやtempにだけ置かない。`,
   ];
 }
@@ -80,6 +82,14 @@ export async function discoverVerifySkills(cwd: string): Promise<string[]> {
   return [...new Set(candidates)].sort();
 }
 
+/** Verify skills of every repository of a multi-repository run (the workspace root is not a repository). */
+export async function discoverWorkspaceVerifySkills(cwd: string, repositories?: readonly string[]): Promise<string[]> {
+  if (!repositories) return discoverVerifySkills(cwd);
+  const found: string[] = [];
+  for (const repository of repositories) found.push(...await discoverVerifySkills(repositoryDir(cwd, repository)));
+  return [...new Set(found)].sort();
+}
+
 export type WorkflowBriefOptions = {
   artifactDir: string;
   cwd: string;
@@ -90,6 +100,8 @@ export type WorkflowBriefOptions = {
   stage: Stage;
   /** External files copied into the artifact because the child cannot read their original location. */
   inputFiles?: InputFilesReport;
+  /** Multi-repository run: cwd is the workspace root and these are the repositories (workspace-relative). */
+  repositories?: string[];
 };
 
 export async function writeWorkflowBrief(options: WorkflowBriefOptions) {
@@ -104,16 +116,21 @@ export async function writeWorkflowBrief(options: WorkflowBriefOptions) {
     ? "Reviewerはsourceと対象checkoutを編集しない。`run_verification_command`などの検証commandはdisposable snapshot内だけに書き込み、元checkoutを変更しない。永続writeは`submit_stage_report`とorchestratorが回収する`YORISHIRO_EVIDENCE_DIR`に限る。"
     : "Workerは対象checkoutの承認済みpathを編集してよい。run artifactはorchestrator所有であり、指定されたreport以外を書き換えない。対象外pathや他repositoryへ書き込まない。";
   const workerTooling = options.stage === "implement" && RUNTIME === "claude"
-    ? `## Workerの道具と証跡\n\n${workerToolingInstructions(options.artifactDir).map(line => `- ${line}`).join("\n")}\n\n`
+    ? `## Workerの道具と証跡\n\n${workerToolingInstructions(options.artifactDir, undefined, options.repositories).map(line => `- ${line}`).join("\n")}\n\n`
+    : "";
+  const repositories = options.repositories;
+  const hasVerifyTool = options.stage === "review" || RUNTIME === "claude";
+  const repositoriesSection = repositories
+    ? `\n## 対象リポジトリ\n\nこのrunは複数のgitリポジトリを扱う。cwdはワークスペースのルートで、対象は次のとおり（ワークスペース相対）。\n\n${repositories.map(repository => `- ${repository}（${repositoryDir(options.cwd, repository)}）`).join("\n")}\n\n- changedPathsとallowedPathPrefixesは、ワークスペース相対で書く（例: \`${repositories[0]}/src/index.ts\`）。リポジトリ内の相対pathでは照合されない。\n- 検証sandboxは上のリポジトリだけを、相対配置のまま複製する。\`../<別リポジトリ>\`の参照は解決できる。上に無いワークスペース配下は複製されず、そこへの書き込みは検出されない。\n${hasVerifyTool ? "- `run_verification_command`の`cwd`引数（任意、ワークスペース相対）で実行ディレクトリを指定する。省略するとワークスペースのルート。\n" : ""}`
     : "";
   const content = `# Child workflow brief
 
 role: ${INFO[options.stage].label}
 model: ${MODELS[options.stage]}
 workflow: ${options.workflow}
-target checkout: ${options.cwd}
+target checkout: ${options.cwd}${repositories ? "（ワークスペースのルート）" : ""}
 
-${reviewerNote}
+${reviewerNote}${repositoriesSection}
 ## 最初に必ず読むもの
 
 - workflow Skill: ${path.join(options.skillDir, "SKILL.md")}
@@ -159,6 +176,8 @@ export type LauncherOptions = {
   workflowBrief: string;
   workflow: WorkflowName;
   verifySkills: string[];
+  /** Multi-repository run: cwd is the workspace root and these are the repositories (workspace-relative). */
+  repositories?: string[];
   piBin?: string;
   claudeBin?: string;
   nodeBin?: string;
@@ -196,7 +215,7 @@ export function renderLauncher(options: LauncherOptions): string {
     `export YORISHIRO_WORKFLOW_SKILL=${shellQuote(options.workflowSkillDir)}`,
     `export YORISHIRO_WORKFLOW_PLAYBOOK=${shellQuote(options.workflowPlaybook)}`,
     `export YORISHIRO_WORKFLOW_BRIEF=${shellQuote(options.workflowBrief)}`,
-    ...(stage === "review" ? [`export YORISHIRO_TARGET_CWD=${shellQuote(options.cwd)}`] : []),
+    ...(stage === "review" ? [`export YORISHIRO_TARGET_CWD=${shellQuote(options.cwd)}`, ...(options.repositories ? [`export YORISHIRO_TARGET_REPOSITORIES=${shellQuote(JSON.stringify(options.repositories))}`] : [])] : []),
   ].join("\n");
   const extensionArgs = extensions.map(file => ` -e ${shellQuote(file)}`).join("");
   const skillArgs = skills.map(dir => ` --skill ${shellQuote(dir)}`).join("");
@@ -233,6 +252,7 @@ export function renderClaudeMcpConfig(options: LauncherOptions) {
     YORISHIRO_REPORT_PATH: options.reportPath,
     YORISHIRO_EVIDENCE_ROOT: path.join(options.artifactDir, "evidence"),
     YORISHIRO_TARGET_CWD: options.cwd,
+    ...(options.repositories ? { YORISHIRO_TARGET_REPOSITORIES: JSON.stringify(options.repositories) } : {}),
     ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
     ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
   };

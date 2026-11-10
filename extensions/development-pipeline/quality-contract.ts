@@ -2,9 +2,12 @@ import { createHash } from "node:crypto";
 import { lstat, readFile, readlink } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import * as path from "node:path";
+import { isRepositoryRelativePath, isWithinRepositories, repositoryDir, workspacePath } from "./repositories.ts";
 
+export { isRepositoryRelativePath };
 export type QualityPlanItem = { id: string; description: string };
-export type RequiredCheck = { id: string; program: string; args: string[]; timeoutMs?: number };
+/** `cwd` is workspace-relative and only valid when the run has `repositories` (it must be one of them or inside one). */
+export type RequiredCheck = { id: string; program: string; args: string[]; timeoutMs?: number; cwd?: string };
 export type QualityContract = { planItems: QualityPlanItem[]; requiredChecks: RequiredCheck[]; allowedPathPrefixes?: string[] };
 export type Validation = { valid: true; value: QualityContract } | { valid: false; error: string };
 export type FingerprintMap = Record<string, string>;
@@ -14,6 +17,11 @@ const plain = (value: unknown): value is Record<string, unknown> => !!value && t
 const exact = (value: Record<string, unknown>, keys: readonly string[]) => {
   const actual = Reflect.ownKeys(value);
   return actual.length === keys.length && keys.every(key => Object.prototype.hasOwnProperty.call(value, key)) && actual.every(key => typeof key === "string" && keys.includes(key));
+};
+/** All `required` keys present, and no key beyond `required` and `optional`. */
+const hasKeys = (value: Record<string, unknown>, required: readonly string[], optional: readonly string[]) => {
+  const actual = Reflect.ownKeys(value);
+  return required.every(key => Object.prototype.hasOwnProperty.call(value, key)) && actual.every(key => typeof key === "string" && (required.includes(key) || optional.includes(key)));
 };
 const id = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
 const unique = (items: unknown[], get: (item: unknown) => unknown) => {
@@ -26,20 +34,13 @@ const unique = (items: unknown[], get: (item: unknown) => unknown) => {
   return true;
 };
 
-export function isRepositoryRelativePath(value: unknown): value is string {
-  if (typeof value !== "string" || value.length === 0 || value.includes("\0") || value.includes("\\")) return false;
-  if (path.posix.isAbsolute(value) || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith("//")) return false;
-  const parts = value.split("/");
-  return parts.every(part => part.length > 0 && part !== "." && part !== "..");
-}
-
 function prefix(value: unknown): value is string {
   if (!text(value)) return false;
   const normalized = value.replace(/\/+$/, "");
   return normalized.length > 0 && isRepositoryRelativePath(normalized);
 }
 
-export function validateQualityContract(value: unknown): Validation {
+export function validateQualityContract(value: unknown, options: { repositories?: readonly string[] } = {}): Validation {
   if (!plain(value) || !exact(value, ["planItems", "requiredChecks", "allowedPathPrefixes"])) {
     // allowedPathPrefixes is optional, so validate the exact required shape separately.
     if (!plain(value) || !exact(value, ["planItems", "requiredChecks"])) return { valid: false, error: "qualityContract must contain exact planItems and requiredChecks fields" };
@@ -52,11 +53,13 @@ export function validateQualityContract(value: unknown): Validation {
   }
   if (!Array.isArray(requiredChecks) || requiredChecks.length === 0 || !unique(requiredChecks, item => plain(item) ? item.id : undefined)) return { valid: false, error: "requiredChecks must be a nonempty array with unique canonical IDs" };
   for (const item of requiredChecks) {
-    if (!plain(item) || !exact(item, ["id", "program", "args", "timeoutMs"])) {
-      if (!plain(item) || !exact(item, ["id", "program", "args"])) return { valid: false, error: "requiredChecks must contain exact id, program, and args fields" };
-    }
+    if (!plain(item) || !hasKeys(item, ["id", "program", "args"], ["timeoutMs", "cwd"])) return { valid: false, error: "requiredChecks must contain exact id, program, and args fields" };
     if (!id(item.id) || !text(item.program) || !Array.isArray(item.args) || !item.args.every(arg => typeof arg === "string")) return { valid: false, error: "requiredChecks has an invalid id, program, or args" };
     if (Object.prototype.hasOwnProperty.call(item, "timeoutMs") && (!Number.isInteger(item.timeoutMs) || (item.timeoutMs as number) < 1 || (item.timeoutMs as number) > 300000)) return { valid: false, error: "requiredChecks timeoutMs must be an integer from 1 to 300000" };
+    if (Object.prototype.hasOwnProperty.call(item, "cwd")) {
+      if (!options.repositories) return { valid: false, error: `requiredChecks cwd is only allowed when the run has repositories (check ${String(item.id)})` };
+      if (!isWithinRepositories(item.cwd, options.repositories)) return { valid: false, error: `requiredChecks cwd must be a workspace-relative path that is one of repositories or inside one (check ${String(item.id)})` };
+    }
   }
   if (Object.prototype.hasOwnProperty.call(c, "allowedPathPrefixes")) {
     if (!Array.isArray(c.allowedPathPrefixes) || !c.allowedPathPrefixes.every(prefix)) return { valid: false, error: "allowedPathPrefixes must be a string array of repository-relative prefixes" };
@@ -69,7 +72,7 @@ export function validateQualityContract(value: unknown): Validation {
 function canonical(value: QualityContract): string {
   const normalized = {
     planItems: value.planItems.map(item => ({ id: item.id, description: item.description })),
-    requiredChecks: value.requiredChecks.map(item => Object.prototype.hasOwnProperty.call(item, "timeoutMs") ? { id: item.id, program: item.program, args: [...item.args], timeoutMs: item.timeoutMs } : { id: item.id, program: item.program, args: [...item.args] }),
+    requiredChecks: value.requiredChecks.map(item => ({ id: item.id, program: item.program, args: [...item.args], ...(Object.prototype.hasOwnProperty.call(item, "timeoutMs") ? { timeoutMs: item.timeoutMs } : {}), ...(Object.prototype.hasOwnProperty.call(item, "cwd") ? { cwd: item.cwd } : {}) })),
     ...(value.allowedPathPrefixes === undefined ? {} : { allowedPathPrefixes: value.allowedPathPrefixes.map(x => x.replace(/\/+$/, "")) }),
   };
   return JSON.stringify(normalized);
@@ -126,6 +129,20 @@ export async function captureFingerprintMap(cwd: string): Promise<FingerprintMap
     const unstagedDiffHash = await diffHash(cwd, false, file);
     const stagedDiffHash = await diffHash(cwd, true, file);
     result[file] = digest(JSON.stringify({ path: file, status: state, ...current, unstagedDiffHash, stagedDiffHash }));
+  }
+  return result;
+}
+/**
+ * Fingerprint of the whole workspace. Without `repositories` it is the cwd's own repository (unchanged).
+ * With them, each repository is fingerprinted at its root and every path gets its repository as a prefix,
+ * so the maps of repositories that share file names do not mix.
+ */
+export async function captureWorkspaceFingerprintMap(cwd: string, repositories?: readonly string[]): Promise<FingerprintMap> {
+  if (!repositories) return captureFingerprintMap(cwd);
+  const result: FingerprintMap = {};
+  for (const repository of repositories) {
+    const map = await captureFingerprintMap(repositoryDir(cwd, repository));
+    for (const [file, hash] of Object.entries(map)) result[workspacePath(repository, file)] = hash;
   }
   return result;
 }

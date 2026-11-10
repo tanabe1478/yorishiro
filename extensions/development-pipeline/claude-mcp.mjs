@@ -26,7 +26,7 @@ const REVIEWER_SCHEMA = object({
   nonBlockingNotes: { type: "array", items: object({ id: str(), severity: { type: "string", enum: ["medium", "low"] }, target: str(), note: str() }) },
   plannerQuestions: { type: "array", items: str() },
 });
-const VERIFY_SCHEMA = object({ program: str("実行するprogram"), args: { type: "array", items: str() }, timeoutMs: { type: "integer", minimum: 1000, maximum: 300000 } }, ["timeoutMs"]);
+const VERIFY_SCHEMA = object({ program: str("実行するprogram"), args: { type: "array", items: str() }, timeoutMs: { type: "integer", minimum: 1000, maximum: 300000 }, cwd: str("ワークスペース相対の実行ディレクトリ（対象リポジトリのいずれか、またはその配下）。複数リポジトリのrunだけで使える。省略時はワークスペースのルート") }, ["timeoutMs", "cwd"]);
 
 export function inputSchema(name, env = process.env) {
   if (name === "run_verification_command") return VERIFY_SCHEMA;

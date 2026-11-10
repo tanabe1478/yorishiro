@@ -56,6 +56,13 @@ export async function checkWorkspaceTrust(cwd: string, options: { stateFile?: st
   return { status: "untrusted", source: file };
 }
 
+/** Multi-repository run: each repository is checked on its own (the unit of trust is a git root). */
+export async function checkRepositoriesTrust(cwd: string, repositories: readonly string[], options: { stateFile?: string; gitCeiling?: string } = {}): Promise<Array<WorkspaceTrust & { repository: string }>> {
+  const results: Array<WorkspaceTrust & { repository: string }> = [];
+  for (const repository of repositories) results.push({ repository, ...await checkWorkspaceTrust(path.join(cwd, ...repository.split("/")), options) });
+  return results;
+}
+
 /** Nearest ancestor (or self) holding a `.git` entry (a directory, or a file for worktrees and submodules), not searching up into a ceiling. null when there is none. Throws when it cannot be determined. */
 async function findGitRoot(start: string, ceilings: ReadonlySet<string>): Promise<string | null> {
   for (let dir = start; ; dir = path.dirname(dir)) {
