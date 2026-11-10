@@ -83,17 +83,23 @@ delete env.YORISHIRO_RUNTIME;
 delete env.YORISHIRO_CLAUDE_BIN;
 
 let artifactDir;
-try {
-  const result = await new Promise(resolve => {
-    const child = spawn(cli, ["run", "--input", inputFile, "--worker-model", "claude-haiku-5-5"], { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] });
+const artifactDirs = [];
+const runCli = extra => new Promise(resolve => {
+  const file = path.join(base, "input-run.json");
+  writeFile(file, JSON.stringify({ ...input, ...extra })).then(() => {
+    const child = spawn(cli, ["run", "--input", file, "--worker-model", "claude-haiku-5-5"], { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "", stderr = "";
     child.stdout.on("data", data => { stdout += data; });
     child.stderr.on("data", data => { stderr += data; });
     const timer = setTimeout(() => child.kill("SIGTERM"), 90_000);
     child.on("close", code => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
   });
+});
+try {
+  const result = await runCli({});
   const summary = JSON.parse(result.stdout || "{}");
   artifactDir = summary.artifactDir;
+  artifactDirs.push(artifactDir);
   const paneLogs = async () => (await Promise.all((await readdir(state)).filter(name => name.endsWith(".log") && name !== "herdr.log").map(async name => `--- ${name}\n${await readFile(path.join(state, name), "utf8")}`))).join("\n");
   assert.equal(result.code, 0, `CLI failed (${result.code})\nstdout=${result.stdout}\nstderr=${result.stderr.slice(-1500)}\n${await paneLogs()}`);
   assert.equal(summary.outcome, "SUCCESS");
@@ -117,8 +123,35 @@ try {
   assert.equal(reviewerArgv[reviewerArgv.indexOf("--model") + 1], "claude-opus-5-5");
   assert.ok(reviewerArgv.includes("--restricted"));
   assert.match(workerArgv.at(-1), /あなたはWorker · Claudeです/);
+  // No workerPermissionMode: the Worker keeps dontAsk, and run.json records it.
+  assert.deepEqual(run.workerPermission, { mode: "default", flag: "--permission-mode dontAsk" });
+  assert.equal(workerArgv[workerArgv.indexOf("--permission-mode") + 1], "dontAsk");
+  assert.equal(workerArgv.includes("--dangerously-skip-permissions"), false);
+  assert.equal(reviewerArgv[reviewerArgv.indexOf("--permission-mode") + 1], "dontAsk");
   assert.deepEqual(JSON.parse(await readFile(path.join(state, "tools-implement.json"), "utf8")), ["submit_stage_report", "run_verification_command"], "the Worker verifies requiredChecks with the same tool as the Reviewer");
   assert.deepEqual(JSON.parse(await readFile(path.join(state, "tools-review.json"), "utf8")), ["submit_stage_report", "run_verification_command"]);
+
+  // workerPermissionMode "bypass": only the Worker's permission flag changes, and run.json records it. Start from a clean fake Herdr.
+  for (const name of await readdir(state)) await rm(path.join(state, name), { recursive: true, force: true });
+  const bypassResult = await runCli({ workerPermissionMode: "bypass" });
+  const bypassSummary = JSON.parse(bypassResult.stdout || "{}");
+  if (bypassSummary.artifactDir) artifactDirs.push(bypassSummary.artifactDir);
+  assert.equal(bypassResult.code, 0, `bypass CLI failed (${bypassResult.code})\nstdout=${bypassResult.stdout}\nstderr=${bypassResult.stderr.slice(-1500)}\n${await paneLogs()}`);
+  assert.equal(bypassSummary.outcome, "SUCCESS");
+  const bypassRun = JSON.parse(await readFile(path.join(bypassSummary.artifactDir, "run.json"), "utf8"));
+  assert.deepEqual(bypassRun.workerPermission, { mode: "bypass", flag: "--dangerously-skip-permissions" });
+  const bypassWorkerArgv = JSON.parse(await readFile(path.join(state, "claude-implement.json"), "utf8"));
+  const bypassReviewerArgv = JSON.parse(await readFile(path.join(state, "claude-review.json"), "utf8"));
+  assert.ok(bypassWorkerArgv.includes("--dangerously-skip-permissions"));
+  assert.equal(bypassWorkerArgv.includes("--permission-mode"), false);
+  assert.equal(bypassWorkerArgv[bypassWorkerArgv.indexOf("--setting-sources") + 1], "project");
+  assert.ok(bypassReviewerArgv.includes("--restricted"), "the Reviewer stays restricted");
+  assert.equal(bypassReviewerArgv[bypassReviewerArgv.indexOf("--permission-mode") + 1], "dontAsk");
+  assert.equal(bypassReviewerArgv.includes("--dangerously-skip-permissions"), false, "bypass must not reach the Reviewer");
+  // An unknown value is a start-up error (exit 2), before any pane exists.
+  const badMode = spawnSync(cli, ["run", "--input", "-"], { input: JSON.stringify({ ...input, workerPermissionMode: "acceptEdits" }), encoding: "utf8", env });
+  assert.equal(badMode.status, 2);
+  assert.match(badMode.stderr, /workerPermissionMode must be one of default, bypass/);
 
   const usage = spawnSync(cli, ["run", "--input", "-"], { input: JSON.stringify({ ...input, diffReviewMode: "required" }), encoding: "utf8", env });
   assert.equal(usage.status, 2);
@@ -130,9 +163,9 @@ try {
     const herdrState = JSON.parse(await readFile(path.join(state, "herdr.json"), "utf8"));
     for (const pid of herdrState.pids) { try { process.kill(-pid, "SIGTERM"); } catch { /* exited */ } }
   } catch { /* no panes started */ }
-  if (process.env.YORISHIRO_KEEP_TEST_STATE) console.error(`kept ${base} and ${artifactDir}`);
+  if (process.env.YORISHIRO_KEEP_TEST_STATE) console.error(`kept ${base} and ${artifactDirs.join(" ")}`);
   else {
-    if (artifactDir && artifactDir.startsWith(path.join(root, "artifacts"))) await rm(artifactDir, { recursive: true, force: true });
+    for (const dir of artifactDirs) if (dir && dir.startsWith(path.join(root, "artifacts"))) await rm(dir, { recursive: true, force: true });
     await rm(base, { recursive: true, force: true });
   }
 }

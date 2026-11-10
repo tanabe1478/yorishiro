@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { INFO, MODELS, RUNTIME, type Stage } from "./models.ts";
 import { renderInputFilesSection, type InputFilesReport } from "./input-files.ts";
 import { repositoryDir } from "./repositories.ts";
+import { WORKER_PERMISSION_FLAGS, type WorkerPermissionMode } from "./worker-permission.ts";
 
 export const WORKFLOW_NAMES = ["feature", "bug-fix", "refactoring"] as const;
 export type WorkflowName = (typeof WORKFLOW_NAMES)[number];
@@ -178,6 +179,8 @@ export type LauncherOptions = {
   verifySkills: string[];
   /** Multi-repository run: cwd is the workspace root and these are the repositories (workspace-relative). */
   repositories?: string[];
+  /** Claude Worker only: `bypass` starts it with --dangerously-skip-permissions. Ignored for the Reviewer and for Pi. */
+  workerPermissionMode?: WorkerPermissionMode;
   piBin?: string;
   claudeBin?: string;
   nodeBin?: string;
@@ -290,11 +293,13 @@ export function renderClaudeLauncher(options: LauncherOptions): string {
   // The Reviewer is read-only: --restricted drops code-running tools, ignores
   // settings files, and confines file tools to the working directories.
   const isolation = stage === "review" ? " --restricted" : ` --setting-sources ${shellQuote("project")}`;
+  // Only the Worker can bypass. The Reviewer keeps dontAsk whatever the run asked for.
+  const permission = stage === "implement" && options.workerPermissionMode === "bypass" ? WORKER_PERMISSION_FLAGS.bypass : `--permission-mode ${shellQuote("dontAsk")}`;
   return `#!/bin/sh
 set -eu
 ${exports}
 prompt=$(cat -- ${shellQuote(options.promptFile)})
-exec ${shellQuote(claudeBin)}${isolation} --strict-mcp-config --mcp-config ${shellQuote(claudeMcpConfigPath(options))} --permission-mode ${shellQuote("dontAsk")} --tools ${shellQuote(INFO[stage].tools)} --allowedTools ${shellQuote(allowed.join(","))} --add-dir ${dirs.map(shellQuote).join(" ")} --effort ${shellQuote(INFO[stage].thinking)} --name ${shellQuote(options.name)} --model ${shellQuote(MODELS[stage])} "$prompt"
+exec ${shellQuote(claudeBin)}${isolation} --strict-mcp-config --mcp-config ${shellQuote(claudeMcpConfigPath(options))} ${permission} --tools ${shellQuote(INFO[stage].tools)} --allowedTools ${shellQuote(allowed.join(","))} --add-dir ${dirs.map(shellQuote).join(" ")} --effort ${shellQuote(INFO[stage].thinking)} --name ${shellQuote(options.name)} --model ${shellQuote(MODELS[stage])} "$prompt"
 `;
 }
 

@@ -57,9 +57,33 @@ Claude Code には pi のツール登録の仕組みがないので、パイプ�
 
 子は Herdr のペインで、対話型の `claude` として起動します。
 
-- 共通：`--model` でモデルを固定し、`--permission-mode dontAsk`、`--strict-mcp-config` を付けます。報告ツール `submit_stage_report` は、run ごとに生成する stdio MCP サーバー（`extensions/development-pipeline/claude-mcp.mjs`）から渡します。
+- 共通：`--model` でモデルを固定し、`--permission-mode dontAsk`（Worker は入力の `workerPermissionMode` が `bypass` のときだけ代わりに `--dangerously-skip-permissions`。[下記](#worker-の権限workerpermissionmode)）、`--strict-mcp-config` を付けます。報告ツール `submit_stage_report` は、run ごとに生成する stdio MCP サーバー（`extensions/development-pipeline/claude-mcp.mjs`）から渡します。
 - Worker：`--setting-sources project` で利用者の個人設定を読みません。ツールは Read/Grep/Glob/Bash/Edit/Write です。
 - Reviewer：`--restricted` で、コードを実行するツールを外し、設定ファイルを読まず、ファイル操作を作業ディレクトリに閉じ込めます。ツールは Read/Grep/Glob と、sandbox で検証を行う `run_verification_command` だけです。
+
+### Worker の権限（workerPermissionMode）
+
+入力の `workerPermissionMode` は `"default"`（既定。省略と同じ）か `"bypass"`。CLI も同じ JSON をそのまま渡します。それ以外の値と、Pi ランタイムでの `"bypass"` は、artifact もペインも作る前のエラーです。採用した値は `run.json` の `workerPermission`（`{ "mode": "bypass", "flag": "--dangerously-skip-permissions" }`、既定なら `{ "mode": "default", "flag": "--permission-mode dontAsk" }`）に残ります。
+
+用途：Worker が保護された場所（`.claude/`、`.git/` など）へ Edit/Write で書く必要があるときだけ指定します。たとえば `.claude/skills/<名前>/` に skill を作る依頼です。`default` の Worker はここへ書けず、`IMPLEMENTATION_BLOCKED` になります。
+
+`bypass` のとき変わるのは Worker 起動時の `--permission-mode dontAsk` が `--dangerously-skip-permissions` に替わる点だけです。`--setting-sources project`、`--tools`、`--allowedTools`、`--add-dir`、export する環境変数は同じで、修正ループで同じペインへ指示を送っても起動時の設定のままです。
+
+保護された場所へ file tool で書けるかを、claude 2.1.322 で一時的な git リポジトリの中で、`claude -p` に `.claude/skills/t/a.txt` を Write させて確かめた結果（プロンプトは標準入力から渡す）：
+
+| 権限の設定 | 結果 |
+|---|---|
+| dontAsk + `--allowedTools Write` | 拒否 |
+| dontAsk + `Write(.claude/skills/**)` | 拒否（「file permission checks には Edit(path) だけが効く」と警告） |
+| dontAsk + `Edit(.claude/skills/**)`（相対・絶対） | 拒否 |
+| `--permission-mode acceptEdits` | 拒否 |
+| `--dangerously-skip-permissions` | 書けた |
+
+`.claude/` は allow rule では開けられず、skip-permissions だけが通ります。このため他の権限設定（acceptEdits など）は選べません。
+
+危険：Worker はもともと Bash を制限なしで許されているので、増えるのは保護された場所への file tool での書き込みです。`.claude/settings.json` の hooks や `.git/` を直接書き換えられます。対象リポジトリの外は `allowedPathPrefixes` の照合の対象外で、これは Bash と同じです。信頼できる依頼にだけ使ってください。
+
+Reviewer は `workerPermissionMode` に関係なく、常に `--restricted` と dontAsk の読み取り専用です。
 
 ### pi 版との違い
 

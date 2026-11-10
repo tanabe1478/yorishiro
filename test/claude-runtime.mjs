@@ -92,8 +92,8 @@ try {
   const skillDir = path.join(root, "skills", "development-workflow");
   const common = { cwd, artifactDir, root, workflowSkillDir: skillDir, workflowPlaybook: path.join(skillDir, "playbooks", "feature.md"), workflow: "feature", verifySkills: [], claudeBin: fakeClaude };
   const prompt = "あなたはWorker · Claudeです。\n--model を含む複数行の\"依頼\"";
-  const runLauncher = async stage => {
-    const files = await writeLauncher({ ...common, stage, name: models.INFO[stage].label, promptFile: path.join(artifactDir, `${stage}-prompt.md`), promptFileContent: prompt, reportPath: path.join(artifactDir, `${stage}-pending.json`), workflowBrief: path.join(artifactDir, `workflow-brief-${stage}.md`) });
+  const runLauncher = async (stage, extra = {}) => {
+    const files = await writeLauncher({ ...common, ...extra, stage, name: models.INFO[stage].label, promptFile: path.join(artifactDir, `${stage}-prompt.md`), promptFileContent: prompt, reportPath: path.join(artifactDir, `${stage}-pending.json`), workflowBrief: path.join(artifactDir, `workflow-brief-${stage}.md`) });
     // The quality gate sets YORISHIRO_EVIDENCE_DIR for its own checks; the launcher must decide it for itself.
     const { YORISHIRO_EVIDENCE_DIR: _inherited, CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS: _background, ...cleanEnv } = process.env;
     const run = spawnSync("/bin/sh", [files.launcher], { encoding: "utf8", env: cleanEnv });
@@ -136,6 +136,38 @@ try {
   assert.equal(option(reviewer.argv, "--allowedTools"), "mcp__yorishiro__submit_stage_report,mcp__yorishiro__run_verification_command");
   assert.equal(option(worker.argv, "--allowedTools").split(",").filter(name => name.startsWith("mcp__")).join(","), option(reviewer.argv, "--allowedTools").split(",").join(","), "both roles get the same MCP tools");
   assert.doesNotMatch(option(reviewer.argv, "--allowedTools"), /Bash|Edit|Write/);
+
+  // workerPermissionMode: default keeps dontAsk; bypass swaps only that one flag of the Worker. The Reviewer never changes.
+  assert.equal(worker.argv.includes("--dangerously-skip-permissions"), false, "the default Worker does not skip permissions");
+  assert.equal(reviewer.argv.includes("--dangerously-skip-permissions"), false);
+  assert.equal(option(reviewer.argv, "--permission-mode"), "dontAsk");
+  const explicitDefault = await runLauncher("implement", { workerPermissionMode: "default" });
+  assert.deepEqual(explicitDefault.argv, worker.argv, "an explicit default is the same launcher as no mode");
+  const bypassWorker = await runLauncher("implement", { workerPermissionMode: "bypass" });
+  assert.ok(bypassWorker.argv.includes("--dangerously-skip-permissions"), "the bypass Worker skips permissions");
+  assert.equal(bypassWorker.argv.includes("--permission-mode"), false, "the bypass Worker has no dontAsk");
+  assert.equal(bypassWorker.argv.includes("dontAsk"), false);
+  assert.deepEqual(bypassWorker.argv.filter(arg => arg !== "--dangerously-skip-permissions"), worker.argv.filter((arg, index) => arg !== "--permission-mode" && worker.argv[index - 1] !== "--permission-mode"), "bypass changes nothing but the permission flag (--setting-sources, --tools, --allowedTools, --add-dir, prompt)");
+  assert.equal(option(bypassWorker.argv, "--setting-sources"), "project");
+  assert.equal(option(bypassWorker.argv, "--allowedTools"), option(worker.argv, "--allowedTools"));
+  assert.equal(bypassWorker.argv.at(-1), prompt);
+  assert.equal(await readFile(envLog, "utf8"), workerEvidence, "bypass does not change the exported variables");
+  const bypassReviewer = await runLauncher("review", { workerPermissionMode: "bypass" });
+  assert.deepEqual(bypassReviewer.argv, reviewer.argv, "bypass must not leak into the Reviewer launcher");
+  assert.ok(bypassReviewer.argv.includes("--restricted"));
+  assert.equal(option(bypassReviewer.argv, "--permission-mode"), "dontAsk");
+  assert.equal(bypassReviewer.argv.includes("--dangerously-skip-permissions"), false);
+  const launcherText = (stage, mode) => renderLauncher({ ...common, stage, name: "x", promptFile: "/p.md", reportPath: "/r.json", workflowBrief: "/b.md", ...(mode ? { workerPermissionMode: mode } : {}) });
+  for (const mode of [undefined, "default", "bypass"]) {
+    const text = launcherText("review", mode);
+    assert.match(text, / --restricted /);
+    assert.match(text, / --permission-mode 'dontAsk' /);
+    assert.doesNotMatch(text, /dangerously-skip-permissions/);
+  }
+  assert.match(launcherText("implement", "default"), / --permission-mode 'dontAsk' /);
+  assert.doesNotMatch(launcherText("implement", "default"), /dangerously-skip-permissions/);
+  assert.match(launcherText("implement", "bypass"), / --dangerously-skip-permissions /);
+  assert.doesNotMatch(launcherText("implement", "bypass"), /dontAsk|--permission-mode/);
 
   const workerMcp = JSON.parse(await readFile(worker.files.mcpConfig, "utf8"));
   const reviewerMcp = JSON.parse(await readFile(reviewer.files.mcpConfig, "utf8"));

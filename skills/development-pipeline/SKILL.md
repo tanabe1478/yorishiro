@@ -38,6 +38,7 @@ description: Run the approved development pipeline in stable Herdr worker panes 
 ## 安全境界
 
 - 1段階の時間の上限は入力の`stageTimeoutMs`（60000〜14400000、既定5400000）。requiredChecksの実行時間とWorkerの作業時間の合計より長くする。[詳細](../../docs/development-pipeline.md#段階の時間の上限)
+- Claudeランタイムで、Workerが`.claude/skills/`など保護された場所へ書く必要があるときだけ、入力に`workerPermissionMode: "bypass"`（既定`"default"`）を足す。WorkerだけがBashに加えfile toolで保護された場所へ書けるようになり、Reviewerは常に読み取り専用。[詳細](../../docs/development-pipeline.md#workerの権限claudeランタイムのみ)
 - 修正は同一Workerペインで`maxReviewCycles`（既定2、上限3。旧`maxRepairCycles`は互換入力）まで。モデル切替・fallbackはせず、再発や上限到達は`NEEDS_PLANNER`／`CHANGES_REQUIRED`で止める。
 - 証跡は`$YORISHIRO_EVIDENCE_DIR`からorchestratorが上限付きで回収する。Reviewerは元checkoutを書き換えられない。
 - Claude CodeのWorkerにも`run_verification_command`（Reviewerと同じsnapshotとsandbox）と`YORISHIRO_EVIDENCE_DIR`（artifactの`evidence/worker/`、直接書く。目録は`run.json`の`workerEvidence`）を渡す。Workerは報告前にrequiredChecksをこのtoolで確かめ、検証用の複製やsandboxを手作りしない。

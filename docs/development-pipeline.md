@@ -101,6 +101,14 @@ Workerへ戻す情報はsanitized blocking findingだけに制限し、Reviewer�
 
 段階の上限は、Workerが報告前に実行する`requiredChecks`の実行時間と、Workerの作業時間の合計より長くしてください。1チェックの上限（1800000、30分）と同じ値にすると、長いチェックを1回走らせただけで段階の上限を使い切ります。既定を30分から90分に延ばしたのはこのためです。JVMのビルドのように1回30分近くかかるチェックを複数回走らせる場合は、`stageTimeoutMs`を明示して延ばします。
 
+### Workerの権限（Claudeランタイムのみ）
+
+入力の`workerPermissionMode`は`"default"`（既定）か`"bypass"`です。`"bypass"`のときだけ、ClaudeランタイムのWorker（implement段階）が`--permission-mode dontAsk`の代わりに`--dangerously-skip-permissions`で起動します。それ以外の値と、Piランタイムでの`"bypass"`は、artifactもペインも作る前のエラーです。採用した値は`run.json`の`workerPermission`（`{ "mode": "default", "flag": "--permission-mode dontAsk" }`または`{ "mode": "bypass", "flag": "--dangerously-skip-permissions" }`）に残ります。Piランタイムでは記録しません。
+
+用途は、Workerが`.claude/skills/`など保護された場所（`.claude/`、`.git/`）へEdit/Writeで書く必要があるときだけです。claude 2.1.322で、dontAskに`--allowedTools Write`、`Write(.claude/skills/**)`、`Edit(.claude/skills/**)`（相対・絶対）を足しても、`--permission-mode acceptEdits`でも拒否され、`--dangerously-skip-permissions`だけが書けました。詳細は[Claude Codeで使う](claude-code.md#worker-の権限workerpermissionmode)。
+
+危険は、保護された場所へfile toolで直接書けることです。`.claude/settings.json`のhooksや`.git/`を書き換えられます。対象リポジトリの外は`allowedPathPrefixes`の照合の対象外で、これはBashと同じです。Reviewerは`workerPermissionMode`に関係なく、常に`--restricted`とdontAskの読み取り専用です。
+
 ## sandbox
 
 Reviewerとquality gateの検証コマンドは、対象checkoutをcopy-on-write優先で使い捨てsnapshotへ複製し、そのsnapshotだけを書き込み可能にしたmacOSの`sandbox-exec`またはLinuxのbubblewrap/user namespace内で実行します。ビルド成果物やテストfixtureはsnapshotへ書けますが、元checkoutへの書き込みはkernelで拒否されます。
