@@ -219,7 +219,6 @@ export function renderLauncher(options: LauncherOptions): string {
     `export YORISHIRO_MODEL_GUARD=${shellQuote("1")}`,
     `export YORISHIRO_EXPECTED_MODEL=${shellQuote(MODELS[stage])}`,
     `export YORISHIRO_GUARD_LOG=${shellQuote(path.join(options.artifactDir, "model-guard.log"))}`,
-    `export YORISHIRO_EVIDENCE_ROOT=${shellQuote(path.join(options.artifactDir, "evidence"))}`,
     `export YORISHIRO_WORKFLOW=${shellQuote(options.workflow)}`,
     `export YORISHIRO_WORKFLOW_SKILL=${shellQuote(options.workflowSkillDir)}`,
     `export YORISHIRO_WORKFLOW_PLAYBOOK=${shellQuote(options.workflowPlaybook)}`,
@@ -259,7 +258,6 @@ export function renderClaudeMcpConfig(options: LauncherOptions) {
     YORISHIRO_REPORT_STAGE: stage,
     YORISHIRO_ROLE: INFO[stage].label,
     YORISHIRO_REPORT_PATH: options.reportPath,
-    YORISHIRO_EVIDENCE_ROOT: path.join(options.artifactDir, "evidence"),
     // run_verification_command asks the orchestrator, which runs the command in its own process and environment (the quality gate's).
     [REQUEST_DIR_ENV]: verificationRequestDir(options.artifactDir, stage),
     ...(process.env.PATH ? { PATH: process.env.PATH } : {}),

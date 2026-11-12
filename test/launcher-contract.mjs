@@ -92,7 +92,7 @@ try {
   assert.match(worker, /model-guard\.ts/);
   assert.match(worker, /YORISHIRO_MODEL_GUARD='1'/);
   assert.match(worker, /YORISHIRO_EXPECTED_MODEL='opencode-go\/deepseek-v4\.1-flash'/);
-  assert.match(worker, /YORISHIRO_EVIDENCE_ROOT='/);
+  assert.doesNotMatch(worker, /YORISHIRO_EVIDENCE_ROOT/, "nothing reads the evidence root from the environment; the orchestrator decides where evidence goes");
   assert.match(worker, /YORISHIRO_GUARD_LOG='/);
   assert.match(worker, /stage-reporter\.ts/);
   assert.doesNotMatch(worker, /verifier-tools\.ts/);

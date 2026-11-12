@@ -142,13 +142,71 @@ try {
     } finally { await b.stop(); }
   }
 
-  // ---- concurrent requests are all answered
+  // ---- requests run one at a time, in the order they were made, and every one is answered
   {
-    const b = await broker({ run: async ({ program }) => { await sleep(program === "slow" ? 150 : 10); return outcome(program); } });
+    let active = 0, maxActive = 0;
+    const b = await broker({ run: async ({ program }) => { active++; maxActive = Math.max(maxActive, active); await sleep(program === "slow" ? 150 : 10); active--; return outcome(program); } });
     try {
       const results = await Promise.all([call(b, { program: "slow", args: [] }), call(b, { program: "a", args: [] }), call(b, { program: "b", args: [] })]);
       assert.deepEqual(results.map(result => result.content[0].text.split("\n")[0]), ["slow", "a", "b"]);
+      assert.equal(maxActive, 1, "no two commands (and so no two snapshots) at the same time");
+      assert.deepEqual(b.calls.map(item => item.program), ["slow", "a", "b"], "in the order the requests were made");
     } finally { await b.stop(); }
+  }
+
+  // ---- a request that waits behind a running one is answered when it is cancelled or runs out of time, and is not run afterwards
+  {
+    let release; const gate = new Promise(resolve => { release = resolve; });
+    const b = await broker({ run: async ({ program, signal }) => {
+      if (program === "first") { await Promise.race([gate, new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }))]); return outcome("first done"); }
+      return outcome(program);
+    } });
+    try {
+      const first = call(b, { program: "first", args: [], timeoutMs: 30000 });
+      for (let i = 0; i < 200 && b.calls.length < 1; i++) await sleep(10);
+      assert.equal(b.calls.length, 1, "the first command is running");
+      // cancelled while waiting: answered at once, with the first still running
+      const controller = new AbortController();
+      const waitingCancelled = call(b, { program: "cancelled-while-waiting", args: [], timeoutMs: 30000 }, controller.signal);
+      await sleep(100);
+      const startedCancel = Date.now(); controller.abort();
+      const cancelled = await waitingCancelled;
+      assert.equal(cancelled.details.cancelled, true);
+      assert.match(cancelled.content[0].text, /\[verification CANCELLED exit=1\]$/);
+      assert.match(cancelled.content[0].text, /cancelled before it started/, "the orchestrator answered, not the caller's own give-up");
+      assert.ok(Date.now() - startedCancel < 250, `answered while the first command was still running (${Date.now() - startedCancel} ms)`);
+      // out of time while waiting: the caller returns timed out after timeoutMs + margin (1000 + 300 ms here), and its request is cancelled
+      const waitingTimedOut = await call(b, { program: "timed-out-while-waiting", args: [], timeoutMs: 1000 });
+      assert.equal(waitingTimedOut.details.timedOut, true);
+      assert.match(waitingTimedOut.content[0].text, /\[verification TIMEOUT exit=1\]$/);
+      const timedOutCancel = (await readdir(b.requestDir)).filter(name => name.endsWith(".cancel"));
+      assert.equal(timedOutCancel.length, 2, "both waiting requests were cancelled");
+      // the first is untouched, and what comes after still runs
+      const third = call(b, { program: "after", args: [], timeoutMs: 30000 });
+      await sleep(100);
+      assert.equal(b.calls.length, 1, "nothing else started while the first runs");
+      release();
+      assert.match((await first).content[0].text, /^first done/);
+      assert.match((await third).content[0].text, /^after/);
+      assert.deepEqual(b.calls.map(item => item.program), ["first", "after"], "the cancelled and timed-out requests were never run");
+      for (const name of (await readdir(b.requestDir)).filter(name => name.endsWith(".request.json"))) {
+        assert.equal(existsSync(path.join(b.requestDir, name.replace(".request.json", ".result.json"))), true, `${name} was answered`);
+      }
+    } finally { release(); await b.stop(); }
+  }
+
+  // ---- stop() with a request waiting: the running one is aborted, the waiting one is answered and never run
+  {
+    const b = await broker({ run: ({ signal }) => new Promise(resolve => { const done = () => resolve(outcome("", { code: 143, cancelled: true })); if (signal.aborted) done(); else signal.addEventListener("abort", done, { once: true }); }) });
+    const running = call(b, { program: "running", args: [], timeoutMs: 30000 });
+    for (let i = 0; i < 200 && b.calls.length < 1; i++) await sleep(10);
+    const waiting = call(b, { program: "waiting", args: [], timeoutMs: 30000 });
+    waiting.catch(() => {});
+    await sleep(100);
+    await b.stop();
+    assert.match((await running).content[0].text, /\[verification CANCELLED exit=143\]$/);
+    await assert.rejects(() => waiting, /stage ended before the request was run|stopped accepting|not accepting/);
+    assert.deepEqual(b.calls.map(item => item.program), ["running"], "the waiting request was never started");
   }
 
   // ---- cancellation: the cancel marker reaches the runner's signal

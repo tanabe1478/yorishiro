@@ -151,7 +151,7 @@ Claude Codeランタイムでは、Workerにも`run_verification_command`を渡�
 | `<id>.cancel` | 呼び出し側が諦めた印。orchestratorが実行中の検証を止める |
 | `<id>.result.json` | 結果。orchestratorが原子的に書く（stdout、stderr、終了コード、`truncated`、`cancelled`、`timedOut`、証跡の回収結果、または拒否・失敗の理由） |
 
-- 受付は、子ペインを起動する前から段階の終わりまで動きます（`broker.json`がある間）。依頼は並行して処理します。段階が終わると、実行中の検証を止め、未着手の依頼にはエラーの結果を書いて、`broker.json`を消します。前の段階が残した依頼は実行せずエラーにします。
+- 受付は、子ペインを起動する前から段階の終わりまで動きます（`broker.json`がある間）。依頼は届いた順に1件ずつ処理します（依頼ごとに対象の snapshot を複製するので、大きなリポジトリで複製が重ならないようにするため）。待っている依頼は、呼び出し側がキャンセルしたとき、または呼び出し側の時間切れ（`timeoutMs`に余裕を足した時間。待ち時間も含む）でキャンセルされたときに、起動せずに取り消しの結果を返します。段階が終わると、実行中の検証を止め、未着手の依頼にはエラーの結果を書いて、`broker.json`を消します。前の段階が残した依頼は実行せずエラーにします。
 - 依頼の検証は、実行前にtool（呼び出し側）とorchestratorの両方が行います。`program`は空でない文字列、`args`は文字列の配列、`timeoutMs`は1000以上`MAX_CHECK_TIMEOUT_MS`（1800000）以下の整数（省略時120000）、`cwd`は`repositories`があるrunだけで、そのいずれかかその配下です。未知のフィールドと1MiBを超える依頼も拒否します。拒否した依頼は実行しません。
 - 証跡の置き場所（`evidence/worker-verification/`か`evidence/reviewer/`）は、依頼の中身ではなく、orchestratorがどの段階を待っているかで決まります。
 - 環境変数の値は、依頼にも結果にも書きません。orchestratorは自分の`process.env`を使います（コマンドが出力した内容は結果のstdout／stderrに入ります）。

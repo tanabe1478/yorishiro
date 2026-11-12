@@ -26,8 +26,11 @@ export type VerificationBroker = { requestDir: string; stop(): Promise<void> };
 
 /**
  * Accept verification requests of one stage and run each with the same runSandboxedVerification as the quality gate,
- * in this process, so a command sees the orchestrator's environment and not the child pane's shell. Requests run
- * concurrently (each in its own snapshot). `stop()` aborts what is running, answers what was not started, and withdraws broker.json.
+ * in this process, so a command sees the orchestrator's environment and not the child pane's shell. Requests run one at
+ * a time, in the order they were found: each makes a snapshot of the target, and copies of a large repository side by side
+ * would load the machine for every one of them. A request that waits is still answered when it is cancelled (the caller's
+ * abort, or the caller's own time limit) and when the stage ends; it is not started after that.
+ * `stop()` aborts what is running, answers what was not started, and withdraws broker.json.
  */
 export async function startVerificationBroker(options: VerificationBrokerOptions): Promise<VerificationBroker> {
   const { requestDir, evidenceRoot, stage, cwd, repositories } = options;
@@ -36,7 +39,10 @@ export async function startVerificationBroker(options: VerificationBrokerOptions
   const owner = evidenceOwnerForStage(stage);
   await mkdir(requestDir, { recursive: true, mode: 0o700 });
   const seen = new Set<string>();
-  const inflight = new Map<string, { controller: AbortController; done: Promise<void> }>();
+  /** Requests found and not yet answered: waiting in `queue` or the one running. */
+  const pending = new Map<string, { controller: AbortController; state: "queued" | "running" }>();
+  const queue: string[] = [];
+  let current: { id: string; done: Promise<void> } | undefined;
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
 
@@ -48,6 +54,10 @@ export async function startVerificationBroker(options: VerificationBrokerOptions
   const sweep = async (reason: string) => {
     for (const id of await idsOf()) if (!(await hasResult(id))) await writeResult(id, { id, status: "failed", error: reason }).catch(() => {});
   };
+
+  const isCancelled = (id: string) => lstat(cancelFile(requestDir, id)).then(() => true, () => false);
+  /** Answer a request that was cancelled while it waited, without running it. */
+  const answerCancelled = (id: string) => writeResult(id, { id, status: "completed", owner, code: 1, stdout: "", stderr: "The verification was cancelled before it started.", truncated: false, cancelled: true, timedOut: false }).catch(() => {});
 
   const handle = async (id: string, controller: AbortController) => {
     const file = requestFile(requestDir, id);
@@ -70,17 +80,45 @@ export async function startVerificationBroker(options: VerificationBrokerOptions
     } catch (error) { await writeResult(id, { id, status: "failed", error: error instanceof Error ? error.message : String(error) }); }
   };
 
+  /** Start the next waiting request when none is running. Never throws. */
+  const pump = () => {
+    if (current || stopped) return;
+    const id = queue.shift();
+    if (id === undefined) return;
+    const entry = pending.get(id);
+    if (!entry) return pump();
+    const done = (async () => {
+      try {
+        // Cancelled between the last look and now: nothing is copied or run for it.
+        if (await isCancelled(id)) await answerCancelled(id);
+        else if (!stopped) { entry.state = "running"; await handle(id, entry.controller); }
+      } catch { /* handle answers its own failures */ }
+    })().finally(() => { pending.delete(id); current = undefined; pump(); });
+    current = { id, done };
+  };
+
   const tick = async () => {
     try {
-      for (const id of await idsOf()) {
-        if (seen.has(id) || stopped) continue;
+      const found = (await idsOf()).filter(id => !seen.has(id)).sort((a, b) => a.localeCompare(b, "en", { numeric: true }));
+      for (const id of found) {
+        if (stopped) break;
         seen.add(id);
         if (await hasResult(id) || stopped) continue;
-        const controller = new AbortController();
-        const done = handle(id, controller).catch(() => {}).finally(() => { inflight.delete(id); });
-        inflight.set(id, { controller, done });
+        pending.set(id, { controller: new AbortController(), state: "queued" });
+        queue.push(id);
       }
-      for (const [id, entry] of inflight) if (!entry.controller.signal.aborted && await lstat(cancelFile(requestDir, id)).then(() => true, () => false)) entry.controller.abort();
+      for (const [id, entry] of [...pending]) {
+        if (entry.controller.signal.aborted || !(await isCancelled(id))) continue;
+        if (entry.state === "running") { entry.controller.abort(); continue; }
+        // Waiting: answer now, so the caller is not left to its own grace period behind a long command.
+        const at = queue.indexOf(id);
+        if (at < 0) continue;
+        queue.splice(at, 1);
+        pending.delete(id);
+        entry.controller.abort();
+        await answerCancelled(id);
+      }
+      pump();
     } catch { /* the next tick tries again */ }
     if (!stopped) timer = setTimeout(() => { void tick(); }, pollMs);
   };
@@ -94,9 +132,10 @@ export async function startVerificationBroker(options: VerificationBrokerOptions
       if (stopped) return;
       stopped = true;
       if (timer) clearTimeout(timer);
-      for (const entry of inflight.values()) entry.controller.abort();
+      queue.length = 0;
+      for (const entry of pending.values()) entry.controller.abort();
       let giveUp: NodeJS.Timeout | undefined;
-      await Promise.race([Promise.allSettled([...inflight.values()].map(entry => entry.done)), new Promise<void>(resolve => { giveUp = setTimeout(resolve, options.stopGraceMs ?? 30_000); })]);
+      await Promise.race([current ? current.done : Promise.resolve(), new Promise<void>(resolve => { giveUp = setTimeout(resolve, options.stopGraceMs ?? 30_000); })]);
       clearTimeout(giveUp);
       await sweep("The stage ended before the request was run.");
       await rm(path.join(requestDir, BROKER_MARKER), { force: true });

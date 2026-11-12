@@ -180,11 +180,11 @@ try {
   assert.equal(server.env.YORISHIRO_REPORT_PATH, path.join(artifactDir, "implement-pending.json"));
   assert.equal(server.env.YORISHIRO_VERIFICATION_REQUEST_DIR, path.join(artifactDir, "verification-requests", "implement"), "the Worker's verifier asks the orchestrator, which runs the command in its own environment");
   assert.equal(server.env.YORISHIRO_TARGET_CWD, undefined, "the verifier no longer runs anything itself, so it is not told the checkout");
-  assert.equal(server.env.YORISHIRO_EVIDENCE_ROOT, path.join(artifactDir, "evidence"));
+  assert.equal(server.env.YORISHIRO_EVIDENCE_ROOT, undefined, "nothing reads the evidence root from the environment");
   assert.equal(reviewerMcp.mcpServers.yorishiro.env.YORISHIRO_MCP_TOOLS, "submit_stage_report,run_verification_command");
   assert.equal(reviewerMcp.mcpServers.yorishiro.env.YORISHIRO_REPORT_SCHEMA, "reviewer");
   assert.equal(reviewerMcp.mcpServers.yorishiro.env.YORISHIRO_VERIFICATION_REQUEST_DIR, path.join(artifactDir, "verification-requests", "review"), "each stage has its own request directory");
-  assert.equal(reviewerMcp.mcpServers.yorishiro.env.YORISHIRO_EVIDENCE_ROOT, path.join(artifactDir, "evidence"));
+  assert.equal(reviewerMcp.mcpServers.yorishiro.env.YORISHIRO_EVIDENCE_ROOT, undefined);
   assert.deepEqual(renderClaudeMcpConfig({ ...common, stage: "implement", name: "x", promptFile: path.join(artifactDir, "p.md"), reportPath: "/r.json", workflowBrief: "/b.md" }).mcpServers.yorishiro.env.YORISHIRO_RUNTIME, "claude");
   assert.doesNotMatch(renderLauncher({ ...common, stage: "implement", name: "x", promptFile: "/p.md", reportPath: "/r.json", workflowBrief: "/b.md" }), / -e | --no-extensions| --skill /, "Pi-only flags must not leak into Claude launchers");
 

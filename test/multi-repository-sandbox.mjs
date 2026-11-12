@@ -11,7 +11,6 @@ import { installFakePi } from "./support/fake-pi.mjs";
 // The run is a Pi-runtime one with its own artifacts: do not inherit a session's root or runtime.
 delete process.env.YORISHIRO_ROOT;
 delete process.env.YORISHIRO_RUNTIME;
-delete process.env.YORISHIRO_EVIDENCE_ROOT;
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ext = name => path.join(root, "extensions", "development-pipeline", name);
 const { runSandboxedVerification } = await import(ext("verifier-tools.ts"));
