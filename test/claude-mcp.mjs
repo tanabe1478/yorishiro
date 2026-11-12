@@ -66,7 +66,7 @@ try {
   assert.equal((await worker.request("resources/list")).error.code, -32601);
   await worker.close();
 
-  const reviewer = startServer({ YORISHIRO_MCP_TOOLS: "submit_stage_report,run_verification_command", YORISHIRO_REPORT_SCHEMA: "reviewer", YORISHIRO_REPORT_STAGE: "review", YORISHIRO_REPORT_PATH: path.join(base, "review-pending.json"), YORISHIRO_TARGET_CWD: root });
+  const reviewer = startServer({ YORISHIRO_MCP_TOOLS: "submit_stage_report,run_verification_command", YORISHIRO_REPORT_SCHEMA: "reviewer", YORISHIRO_REPORT_STAGE: "review", YORISHIRO_REPORT_PATH: path.join(base, "review-pending.json"), YORISHIRO_VERIFICATION_REQUEST_DIR: path.join(base, "verification-requests", "review") });
   await reviewer.request("initialize", { protocolVersion: "2025-06-18" });
   const reviewerTools = (await reviewer.request("tools/list")).result.tools;
   assert.deepEqual(reviewerTools.map(tool => tool.name), ["submit_stage_report", "run_verification_command"]);

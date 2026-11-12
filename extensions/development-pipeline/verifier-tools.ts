@@ -8,7 +8,8 @@ import { Type } from "typebox";
 import { darwinUserTempDir, preflightWorkspaceSandbox, verificationRoot } from "./sandbox.ts";
 export { darwinUserTempDir };
 import { MAX_CHECK_TIMEOUT_MS } from "./quality-contract.ts";
-import { isWithinRepositories, parseRepositories, repositoryDir } from "./repositories.ts";
+import { isWithinRepositories, repositoryDir } from "./repositories.ts";
+import { REQUEST_DIR_ENV, requestTimingFromEnv, requestVerification } from "./verification-requests.ts";
 
 export const MAX_OUTPUT = 64 * 1024;
 export const TRUNCATION_NOTICE = "\n[output truncated at 65536 bytes]";
@@ -302,35 +303,20 @@ export async function runSandboxedVerification(program: string, args: string[], 
   }
 }
 
-/** The run's repositories as the launcher passes them to the verifier (JSON array in YORISHIRO_TARGET_REPOSITORIES). */
-export function targetRepositoriesFromEnv(env: NodeJS.ProcessEnv = process.env): string[] | undefined {
-  const raw = env.YORISHIRO_TARGET_REPOSITORIES;
-  if (raw === undefined || raw === "") return undefined;
-  let value: unknown;
-  try { value = JSON.parse(raw); } catch { throw new Error("YORISHIRO_TARGET_REPOSITORIES is not valid JSON"); }
-  const parsed = parseRepositories(value);
-  if (!parsed.valid) throw new Error(`YORISHIRO_TARGET_REPOSITORIES is invalid: ${parsed.error}`);
-  return parsed.value;
-}
-
 export default function (pi: ExtensionAPI) {
-  let evidenceCounter = 0;
   pi.registerTool({
     name: "run_verification_command",
     label: "Run Read-only Verification Command",
-    description: "Run one executable in a kernel-enforced read-only sandbox. Output is capped at 64 KiB and cancellation terminates its process group. Files written to $YORISHIRO_EVIDENCE_DIR are copied to orchestrator-owned evidence before the snapshot is removed.",
+    description: "Run one executable in a kernel-enforced read-only sandbox. Output is capped at 64 KiB and cancellation terminates its process group. Files written to $YORISHIRO_EVIDENCE_DIR are copied to orchestrator-owned evidence before the snapshot is removed. The pipeline orchestrator runs the command, in its own process and environment, exactly like the quality gate.",
     parameters: Type.Object({ program: Type.String(), args: Type.Array(Type.String()), timeoutMs: Type.Optional(Type.Integer({ minimum: 1000, maximum: MAX_CHECK_TIMEOUT_MS })), cwd: Type.Optional(Type.String({ description: "Workspace-relative directory to run in: one of the run's repositories or inside one. Only for runs with repositories; default is the workspace root." })) }),
     async execute(_id, input: { program: string; args: string[]; timeoutMs?: number; cwd?: string }, signal: AbortSignal) {
-      const cwd = process.env.YORISHIRO_TARGET_CWD;
-      if (!cwd) throw new Error("Verifier sandbox is not configured");
-      const evidenceRoot = process.env.YORISHIRO_EVIDENCE_ROOT;
-      if (evidenceRoot && !path.isAbsolute(evidenceRoot)) throw new Error("Verifier evidence root must be an absolute orchestrator path");
-      // The Claude Worker uses this tool too (before reporting); keep its snapshot evidence apart from the Reviewer's.
-      const evidenceOwner = process.env.YORISHIRO_REPORT_STAGE === "implement" ? "worker-verification" : "reviewer";
-      const evidenceDir = evidenceRoot ? path.join(evidenceRoot, evidenceOwner, `${Date.now()}-${process.pid}-${++evidenceCounter}`) : undefined;
+      // The command is run by the orchestrator, in its process and environment like the quality gate; this tool only asks.
+      // Without the request directory there is no fallback to running here: that would bring back a different environment silently.
+      const requestDir = process.env[REQUEST_DIR_ENV];
+      if (!requestDir) throw new Error(`Verifier is not configured: ${REQUEST_DIR_ENV} is not set. The command is run by the pipeline orchestrator, not by this process.`);
       const timeout = input.timeoutMs ?? 120000;
-      const repositories = targetRepositoriesFromEnv();
-      const result = await runSandboxedVerification(input.program, input.args, cwd, timeout, signal, { ...(evidenceDir ? { evidenceDir } : {}), ...(repositories ? { repositories } : {}), ...(input.cwd !== undefined ? { workdir: input.cwd } : {}) });
+      const result = await requestVerification(requestDir, { program: input.program, args: input.args, timeoutMs: timeout, ...(input.cwd !== undefined ? { cwd: input.cwd } : {}) }, signal, requestTimingFromEnv());
+      const evidenceDir = result.evidenceDir;
       const status = result.timedOut ? "TIMEOUT" : result.cancelled ? "CANCELLED" : "EXIT";
       const statusLine = `\n[verification ${status} exit=${result.code}]`;
       const resultEvidence = (result as any).evidence;

@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 const tools = [];
 const { default: load, MAX_OUTPUT, TRUNCATION_NOTICE } = await import("../extensions/development-pipeline/verifier-tools.ts");
 load({ registerTool(tool) { tools.push(tool); } });
 assert.deepEqual(tools.map(tool => tool.name), ["run_verification_command"]);
 assert.match(tools[0].description, /kernel-enforced read-only sandbox/);
 assert.ok(!tools[0].description.includes("bash"));
-process.env.YORISHIRO_TARGET_CWD = process.cwd();
+// The tool only asks the orchestrator, which runs the command; this test is the orchestrator for a review stage.
+const { startVerificationBroker } = await import("../extensions/development-pipeline/verification-broker.ts");
+const base = await mkdtemp(path.join(os.tmpdir(), "yorishiro-verifier-boundary-"));
+const broker = await startVerificationBroker({ requestDir: path.join(base, "verification-requests", "review"), evidenceRoot: path.join(base, "evidence"), stage: "review", cwd: process.cwd() });
+process.env.YORISHIRO_VERIFICATION_REQUEST_DIR = broker.requestDir;
 async function invoke(program, args, signal = new AbortController().signal, timeoutMs) { return tools[0].execute("test", { program, args, ...(timeoutMs ? { timeoutMs } : {}) }, signal); }
 try {
   const silentSuccess = await invoke("/usr/bin/true", []);
@@ -35,5 +42,5 @@ try {
   assert.ok(invalidVisible.includes(TRUNCATION_NOTICE));
   assert.match(invalidVisible, /verification EXIT exit=0\]$/);
   assert.ok(invalidVisible.includes("�"));
-} finally { delete process.env.YORISHIRO_TARGET_CWD; }
+} finally { delete process.env.YORISHIRO_VERIFICATION_REQUEST_DIR; await broker.stop(); await rm(base, { recursive: true, force: true }); }
 console.log("verifier boundary load test passed");

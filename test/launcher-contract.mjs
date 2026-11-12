@@ -96,14 +96,15 @@ try {
   assert.match(worker, /YORISHIRO_GUARD_LOG='/);
   assert.match(worker, /stage-reporter\.ts/);
   assert.doesNotMatch(worker, /verifier-tools\.ts/);
-  assert.doesNotMatch(worker, /YORISHIRO_TARGET_CWD/);
+  assert.doesNotMatch(worker, /YORISHIRO_VERIFICATION_REQUEST_DIR/);
 
   const reviewer = renderLauncher({ ...options, stage: "review", name: "Reviewer · Sol", promptFile: path.join(artifactDir, "review-prompt.md"), promptFileContent: "review", reportPath: path.join(artifactDir, "review-pending.json") });
   assert.match(reviewer, /--model 'openai\/gpt-5\.6-sol'/);
   assert.match(reviewer, /--thinking 'medium'/);
   assert.match(reviewer, /run_verification_command/);
   assert.match(reviewer, /verifier-tools\.ts/);
-  assert.match(reviewer, /YORISHIRO_TARGET_CWD='/);
+  assert.match(reviewer, new RegExp(`YORISHIRO_VERIFICATION_REQUEST_DIR='${path.join(artifactDir, "verification-requests", "review").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'`));
+  assert.doesNotMatch(reviewer, /YORISHIRO_TARGET_CWD|YORISHIRO_TARGET_REPOSITORIES/, "the verifier does not run commands, so it needs neither the checkout nor the repositories");
 
   const written = await writeLauncher(options);
   assert.match(await readFile(written.launcher, "utf8"), /--model 'opencode-go\/deepseek-v4\.1-flash'/);

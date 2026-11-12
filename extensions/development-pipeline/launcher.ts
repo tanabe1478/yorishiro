@@ -4,6 +4,7 @@ import { INFO, MODELS, RUNTIME, type Stage } from "./models.ts";
 import { renderInputFilesSection, type InputFilesReport } from "./input-files.ts";
 import { repositoryDir } from "./repositories.ts";
 import { WORKER_PERMISSION_FLAGS, type WorkerPermissionMode } from "./worker-permission.ts";
+import { REQUEST_DIR_ENV, verificationRequestDir } from "./verification-requests.ts";
 
 export const WORKFLOW_NAMES = ["feature", "bug-fix", "refactoring"] as const;
 export type WorkflowName = (typeof WORKFLOW_NAMES)[number];
@@ -23,6 +24,11 @@ export function workerEvidenceDir(artifactDir: string) {
   return path.join(artifactDir, "evidence", WORKER_EVIDENCE_SUBDIR);
 }
 
+/** Whether the child of this stage has run_verification_command: the Reviewer always, the Worker only on the Claude runtime. */
+export function stageHasVerifier(stage: Stage) {
+  return stage === "review" || RUNTIME === "claude";
+}
+
 /**
  * Worker-only instructions of the Claude runtime, shared by the brief and the
  * prompt. The Worker has `run_verification_command` and a writable evidence
@@ -32,7 +38,7 @@ export function workerToolingInstructions(artifactDir: string, attempt?: number,
   const evidence = workerEvidenceDir(artifactDir);
   const where = attempt === undefined ? `${evidence}/attempt-<n>/` : `${evidence}/attempt-${attempt}/`;
   return [
-    "報告前に、qualityContractのrequiredChecksを`run_verification_command`（MCPツール。programとargsを渡す）で実行し、exit 0を確かめる。本番のquality gateと同じsnapshotとsandbox条件で実行されるので、gateで落ちる原因を報告前に見つけられる。APFS cloneやsandbox-execで検証用の複製や環境を手作りしない。",
+    "報告前に、qualityContractのrequiredChecksを`run_verification_command`（MCPツール。programとargsを渡す）で実行し、exit 0を確かめる。本番のquality gateと同じプロセス・環境・snapshot・sandbox条件でorchestratorが実行するので、gateで落ちる原因を報告前に見つけられる。APFS cloneやsandbox-execで検証用の複製や環境を手作りしない。",
     ...(repositories ? ["複数リポジトリのrunでは、requiredChecksの`cwd`（ワークスペース相対）があればそのcheckは`run_verification_command`の`cwd`引数に同じ値を渡して実行する。`cwd`なしのcheckは、cwdを渡さずワークスペースのルートで実行する。"] : []),
     `スクリーンショットや観測JSONなどの証跡は、環境変数\$YORISHIRO_EVIDENCE_DIR（${evidence}）の下の${where}に置く。orchestratorがartifactの一部として保存する。scratchpadやtempにだけ置かない。`,
   ];
@@ -120,7 +126,7 @@ export async function writeWorkflowBrief(options: WorkflowBriefOptions) {
     ? `## Workerの道具と証跡\n\n${workerToolingInstructions(options.artifactDir, undefined, options.repositories).map(line => `- ${line}`).join("\n")}\n\n`
     : "";
   const repositories = options.repositories;
-  const hasVerifyTool = options.stage === "review" || RUNTIME === "claude";
+  const hasVerifyTool = stageHasVerifier(options.stage);
   const repositoriesSection = repositories
     ? `\n## 対象リポジトリ\n\nこのrunは複数のgitリポジトリを扱う。cwdはワークスペースのルートで、対象は次のとおり（ワークスペース相対）。\n\n${repositories.map(repository => `- ${repository}（${repositoryDir(options.cwd, repository)}）`).join("\n")}\n\n- changedPathsとallowedPathPrefixesは、ワークスペース相対で書く（例: \`${repositories[0]}/src/index.ts\`）。リポジトリ内の相対pathでは照合されない。\n- 検証sandboxは上のリポジトリだけを、相対配置のまま複製する。\`../<別リポジトリ>\`の参照は解決できる。上に無いワークスペース配下は複製されず、そこへの書き込みは検出されない。\n${hasVerifyTool ? "- `run_verification_command`の`cwd`引数（任意、ワークスペース相対）で実行ディレクトリを指定する。省略するとワークスペースのルート。\n" : ""}`
     : "";
@@ -218,7 +224,7 @@ export function renderLauncher(options: LauncherOptions): string {
     `export YORISHIRO_WORKFLOW_SKILL=${shellQuote(options.workflowSkillDir)}`,
     `export YORISHIRO_WORKFLOW_PLAYBOOK=${shellQuote(options.workflowPlaybook)}`,
     `export YORISHIRO_WORKFLOW_BRIEF=${shellQuote(options.workflowBrief)}`,
-    ...(stage === "review" ? [`export YORISHIRO_TARGET_CWD=${shellQuote(options.cwd)}`, ...(options.repositories ? [`export YORISHIRO_TARGET_REPOSITORIES=${shellQuote(JSON.stringify(options.repositories))}`] : [])] : []),
+    ...(stage === "review" ? [`export ${REQUEST_DIR_ENV}=${shellQuote(verificationRequestDir(options.artifactDir, stage))}`] : []),
   ].join("\n");
   const extensionArgs = extensions.map(file => ` -e ${shellQuote(file)}`).join("");
   const skillArgs = skills.map(dir => ` --skill ${shellQuote(dir)}`).join("");
@@ -236,7 +242,7 @@ export function claudeMcpConfigPath(options: Pick<LauncherOptions, "promptFile" 
 
 /** Tool names a Claude Code child sees from the stage-scoped Yorishiro MCP server. */
 export function claudeMcpTools(_stage: Stage) {
-  // Both roles verify in the same disposable snapshot and sandbox the quality gate uses. The Worker's original checkout stays writable; only the snapshot is.
+  // Both roles verify in the same disposable snapshot and sandbox the quality gate uses, run by the orchestrator. The Worker's original checkout stays writable; only the snapshot is.
   return ["submit_stage_report", "run_verification_command"];
 }
 
@@ -254,8 +260,8 @@ export function renderClaudeMcpConfig(options: LauncherOptions) {
     YORISHIRO_ROLE: INFO[stage].label,
     YORISHIRO_REPORT_PATH: options.reportPath,
     YORISHIRO_EVIDENCE_ROOT: path.join(options.artifactDir, "evidence"),
-    YORISHIRO_TARGET_CWD: options.cwd,
-    ...(options.repositories ? { YORISHIRO_TARGET_REPOSITORIES: JSON.stringify(options.repositories) } : {}),
+    // run_verification_command asks the orchestrator, which runs the command in its own process and environment (the quality gate's).
+    [REQUEST_DIR_ENV]: verificationRequestDir(options.artifactDir, stage),
     ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
     ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
   };

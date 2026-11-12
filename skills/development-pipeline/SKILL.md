@@ -41,7 +41,7 @@ description: Run the approved development pipeline in stable Herdr worker panes 
 - Claudeランタイムで、Workerが`.claude/skills/`など保護された場所へ書く必要があるときだけ、入力に`workerPermissionMode: "bypass"`（既定`"default"`）を足す。WorkerだけがBashに加えfile toolで保護された場所へ書けるようになり、Reviewerは常に読み取り専用。[詳細](../../docs/development-pipeline.md#workerの権限claudeランタイムのみ)
 - 修正は同一Workerペインで`maxReviewCycles`（既定2、上限3。旧`maxRepairCycles`は互換入力）まで。モデル切替・fallbackはせず、再発や上限到達は`NEEDS_PLANNER`／`CHANGES_REQUIRED`で止める。
 - 証跡は`$YORISHIRO_EVIDENCE_DIR`からorchestratorが上限付きで回収する。Reviewerは元checkoutを書き換えられない。
-- Claude CodeのWorkerにも`run_verification_command`（Reviewerと同じsnapshotとsandbox）と`YORISHIRO_EVIDENCE_DIR`（artifactの`evidence/worker/`、直接書く。目録は`run.json`の`workerEvidence`）を渡す。Workerは報告前にrequiredChecksをこのtoolで確かめ、検証用の複製やsandboxを手作りしない。
+- Claude CodeのWorkerにも`run_verification_command`と`YORISHIRO_EVIDENCE_DIR`（artifactの`evidence/worker/`、直接書く。目録は`run.json`の`workerEvidence`）を渡す。検証はWorker・Reviewer・品質ゲートのどれもorchestratorが同じプロセスと環境、同じsnapshotとsandboxで実行する（子ペインのシェルの環境は使わない）。Workerは報告前にrequiredChecksをこのtoolで確かめ、検証用の複製やsandboxを手作りしない。[詳細](../../docs/development-pipeline.md#検証の実行はorchestratorが行う)
 - Claude Codeで修正・再reviewの指示を同じペインへ送るときは、全文を`<stage>-prompt-<attempt>.md`へ書き、ペインには短い1行だけ送る。子が作業を始めたかを確認し、変わらなければEnterを2回まで再送する。それでも始まらなければ`PROMPT_NOT_SUBMITTED`で止まる（`REPORT_MISSING`とは別。ペインIDは`run.json`の`promptFailures`とCLIのmessage）。
 - `planReviewMode`／`diffReviewMode`（`ask`既定）の人間gateを尊重し、commit・pushは行わない。
 - model guardは敵対的Workerやnested shellへのsecurity sandboxではない。

@@ -162,15 +162,18 @@ try {
   assert.match(launcher.workerToolingInstructions(artifactDir, 1, ["api"]).join("\n"), /`cwd`引数に同じ値を渡して実行する/);
   assert.equal(launcher.workerToolingInstructions(artifactDir, 1).length, 2, "without repositories the Worker instructions are unchanged");
 
-  // (per-repo-aux) the launchers hand the repositories to the verifier
+  // (per-repo-aux) the verifier is told where to ask the orchestrator; the orchestrator, not the launcher, knows the repositories
   const launch = { name: "x", promptFile: path.join(artifactDir, "p.md"), cwd: base, reportPath: path.join(artifactDir, "r.json"), artifactDir, root, workflowSkillDir: skillDir, workflowPlaybook: playbookPath, workflowBrief: path.join(artifactDir, "b.md"), workflow: "feature", verifySkills: [] };
-  assert.match(launcher.renderLauncher({ ...launch, stage: "review", repositories: ["api", "backend"] }), /export YORISHIRO_TARGET_REPOSITORIES='\["api","backend"\]'/);
-  assert.doesNotMatch(launcher.renderLauncher({ ...launch, stage: "review" }), /YORISHIRO_TARGET_REPOSITORIES/);
-  assert.doesNotMatch(launcher.renderLauncher({ ...launch, stage: "implement", repositories: ["api"] }), /YORISHIRO_TARGET_REPOSITORIES/, "the Pi Worker has no verifier");
+  const reviewLauncher = launcher.renderLauncher({ ...launch, stage: "review", repositories: ["api", "backend"] });
+  assert.ok(reviewLauncher.includes(`export YORISHIRO_VERIFICATION_REQUEST_DIR='${path.join(artifactDir, "verification-requests", "review")}'`));
+  assert.doesNotMatch(reviewLauncher, /YORISHIRO_TARGET_REPOSITORIES|YORISHIRO_TARGET_CWD/);
+  assert.doesNotMatch(launcher.renderLauncher({ ...launch, stage: "implement", repositories: ["api"] }), /YORISHIRO_VERIFICATION_REQUEST_DIR/, "the Pi Worker has no verifier");
   for (const stage of ["implement", "review"]) {
-    assert.equal(launcher.renderClaudeMcpConfig({ ...launch, stage, repositories: ["api", "backend"] }).mcpServers.yorishiro.env.YORISHIRO_TARGET_REPOSITORIES, '["api","backend"]');
-    assert.equal(launcher.renderClaudeMcpConfig({ ...launch, stage }).mcpServers.yorishiro.env.YORISHIRO_TARGET_REPOSITORIES, undefined);
-    assert.equal(launcher.renderClaudeMcpConfig({ ...launch, stage, repositories: ["api"] }).mcpServers.yorishiro.env.YORISHIRO_TARGET_CWD, base);
+    const env = launcher.renderClaudeMcpConfig({ ...launch, stage, repositories: ["api", "backend"] }).mcpServers.yorishiro.env;
+    assert.equal(env.YORISHIRO_VERIFICATION_REQUEST_DIR, path.join(artifactDir, "verification-requests", stage));
+    assert.equal(env.YORISHIRO_TARGET_REPOSITORIES, undefined);
+    assert.equal(env.YORISHIRO_TARGET_CWD, undefined);
+    assert.deepEqual(launcher.renderClaudeMcpConfig({ ...launch, stage }).mcpServers.yorishiro.env, env, "the repositories do not change what the verifier is given");
   }
 
   // (per-repo-aux) the prompts name the repositories and the per-repository snapshot files

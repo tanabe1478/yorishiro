@@ -10,6 +10,7 @@ const verifierModule = await import("../extensions/development-pipeline/verifier
 const { collectEvidence, runSandboxedVerification, EVIDENCE_LIMITS } = verifierModule;
 const loadVerifier = verifierModule.default;
 const { evidenceSegment } = await import("../extensions/development-pipeline/index.ts");
+const { startVerificationBroker } = await import("../extensions/development-pipeline/verification-broker.ts");
 
 const base = await mkdtemp(path.join(os.tmpdir(), "yorishiro-evidence-"));
 
@@ -98,10 +99,10 @@ try {
     const tools = [];
     loadVerifier({ registerTool(tool) { tools.push(tool); } });
     const reviewerRoot = path.join(base, "reviewer-evidence");
-    process.env.YORISHIRO_TARGET_CWD = checkout;
-    process.env.YORISHIRO_EVIDENCE_ROOT = reviewerRoot;
-    // The stage decides the evidence owner; do not inherit it from the session that runs the tests (a Worker has implement).
-    process.env.YORISHIRO_REPORT_STAGE = "review";
+    // The orchestrator decides the evidence owner by the stage it waits for, not the request or the session that runs the tests.
+    const brokerFor = stage => startVerificationBroker({ requestDir: path.join(base, "verification-requests", stage), evidenceRoot: reviewerRoot, stage, cwd: checkout });
+    const reviewBroker = await brokerFor("review");
+    process.env.YORISHIRO_VERIFICATION_REQUEST_DIR = reviewBroker.requestDir;
     try {
       const script = "const fs=require('node:fs'),path=require('node:path');const dir=process.env.YORISHIRO_EVIDENCE_DIR;fs.writeFileSync(path.join(dir,'proof.txt'),'proof');fs.symlinkSync('/etc/passwd',path.join(dir,'leak'));";
       const reviewerResult = await tools[0].execute("test", { program: process.execPath, args: ["-e", script], timeoutMs: 10_000 }, new AbortController().signal);
@@ -113,18 +114,21 @@ try {
       assert.equal(runs.length, 1);
       assert.equal(existsSync(path.join(reviewerRoot, "reviewer", runs[0], "proof.txt")), true);
       assert.equal(existsSync(path.join(reviewerRoot, "reviewer", runs[0], "leak")), false);
+      await reviewBroker.stop();
 
       // The Claude Worker uses the same tool before it reports; its snapshot evidence stays apart from the Reviewer's.
-      process.env.YORISHIRO_REPORT_STAGE = "implement";
-      const workerResult = await tools[0].execute("test", { program: process.execPath, args: ["-e", "require('node:fs').writeFileSync(require('node:path').join(process.env.YORISHIRO_EVIDENCE_DIR,'worker-proof.txt'),'w')"], timeoutMs: 10_000 }, new AbortController().signal);
-      assert.equal(workerResult.details.exitCode, 0, workerResult.content[0].text);
-      assert.ok(workerResult.details.evidence.dir.startsWith(path.join(reviewerRoot, "worker-verification") + path.sep), "Worker verification evidence lands under worker-verification/");
-      assert.equal(await readFile(path.join(workerResult.details.evidence.dir, "worker-proof.txt"), "utf8"), "w");
-      assert.equal((await readdir(path.join(reviewerRoot, "reviewer"))).length, 1, "the Reviewer's directory is not touched by the Worker's run");
+      const implementBroker = await brokerFor("implement");
+      process.env.YORISHIRO_VERIFICATION_REQUEST_DIR = implementBroker.requestDir;
+      try {
+        const workerResult = await tools[0].execute("test", { program: process.execPath, args: ["-e", "require('node:fs').writeFileSync(require('node:path').join(process.env.YORISHIRO_EVIDENCE_DIR,'worker-proof.txt'),'w')"], timeoutMs: 10_000 }, new AbortController().signal);
+        assert.equal(workerResult.details.exitCode, 0, workerResult.content[0].text);
+        assert.ok(workerResult.details.evidence.dir.startsWith(path.join(reviewerRoot, "worker-verification") + path.sep), "Worker verification evidence lands under worker-verification/");
+        assert.equal(await readFile(path.join(workerResult.details.evidence.dir, "worker-proof.txt"), "utf8"), "w");
+        assert.equal((await readdir(path.join(reviewerRoot, "reviewer"))).length, 1, "the Reviewer's directory is not touched by the Worker's run");
+      } finally { await implementBroker.stop(); }
     } finally {
-      delete process.env.YORISHIRO_TARGET_CWD;
-      delete process.env.YORISHIRO_EVIDENCE_ROOT;
-      delete process.env.YORISHIRO_REPORT_STAGE;
+      delete process.env.YORISHIRO_VERIFICATION_REQUEST_DIR;
+      await reviewBroker.stop();
     }
   } finally {
     await rm(checkout, { recursive: true, force: true });

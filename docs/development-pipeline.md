@@ -65,7 +65,7 @@ WorkerとReviewerは`submit_stage_report`で中央validatorが検証する構造
 - パスの書き方: Workerの`changedPaths`と`allowedPathPrefixes`はワークスペース相対です（`neuhaus-backend/src/a.ts`、prefixは`neuhaus-backend/src`）。リポジトリ内の相対path（`src/a.ts`）で書くと、実diffと一致せず`WORKER_EVIDENCE_MISMATCH`になります。差分はリポジトリごとに取り、各pathに`<リポジトリ>/`を前置して1つにまとめて照合します。
 - `requiredChecks`の`cwd`（任意）: ワークスペース相対で、`repositories`のいずれか、またはその配下です。そのcheckはその場所で実行します。省略したcheckはワークスペースのルートで実行します。`repositories`が無いのに`cwd`を付けると契約エラーです。`cwd`は契約のSHA-256に含まれ、`quality-contract.json`と`quality-gate-N.json`の各checkに残ります。
 - 検証sandbox: 指定したリポジトリだけを、元の相対配置のままsnapshotへ複製します。`../neuhaus-openapi`のような別リポジトリへの参照が解決できます。リポジトリに含まれないワークスペース配下のものは複製しません。書き込みはsnapshot全体に許します。preflight（`/tmp`配下、`TMPDIR`が対象の中、macOSの`DARWIN_USER_TEMP_DIR`の下とsnapshotの置き場の下／上、の拒否）は各リポジトリに対して行います。
-- `run_verification_command`の`cwd`引数（任意、ワークスペース相対）: checkと同じ規則です。省略するとワークスペースのルートです。子には`YORISHIRO_TARGET_CWD`（ワークスペースのルート）に加えて、`YORISHIRO_TARGET_REPOSITORIES`（リポジトリのJSON配列）を渡します（Claudeは各stageのMCP設定、PiはReviewerのlauncher）。`repositories`が無いrunで`cwd`を渡すとエラーです。Claudeランタイムでは、Workerのpromptとbriefに、checkの`cwd`をこのtoolの`cwd`へ渡すよう書きます。
+- `run_verification_command`の`cwd`引数（任意、ワークスペース相対）: checkと同じ規則です。省略するとワークスペースのルートです。コマンドを実行するのはorchestratorで、ワークスペースのルートとリポジトリはorchestratorが持っているので、子には渡しません（「検証の実行はorchestratorが行う」節）。`repositories`が無いrunで`cwd`を渡すとエラーです。Claudeランタイムでは、Workerのpromptとbriefに、checkの`cwd`をこのtoolの`cwd`へ渡すよう書きます。
 - artifact: `run.json`に`repositories`（指定時だけ）を記録します。`diffs/`には、リポジトリごとの`<name>-<リポジトリ名>-<8桁のhash>-status.txt`と`-diff.patch`、まとめた`<name>-fingerprint.json`1つが入ります（`<name>`は`baseline`、`implement-N`、`review-N`）。`workflow-brief-<stage>.md`と、Reviewerのpromptに対象リポジトリの一覧とpathの規則、リポジトリごとのsnapshotファイルを書きます。
 - verify Skillの探索、workspace trustの確認、diffaiの実行は、リポジトリごとに行います。diffaiはリポジトリの順に`--cwd <リポジトリ>`で実行し、最初に承認されなかったリポジトリで止めます（`ask`の確認は1回だけです）。
 
@@ -111,9 +111,9 @@ Workerへ戻す情報はsanitized blocking findingだけに制限し、Reviewer�
 
 ## sandbox
 
-Reviewerとquality gateの検証コマンドは、対象checkoutをcopy-on-write優先で使い捨てsnapshotへ複製し、そのsnapshotだけを書き込み可能にしたmacOSの`sandbox-exec`またはLinuxのbubblewrap/user namespace内で実行します。ビルド成果物やテストfixtureはsnapshotへ書けますが、元checkoutへの書き込みはkernelで拒否されます。
+Worker（Claudeランタイム）とReviewerの`run_verification_command`、およびquality gateの検証コマンドは、対象checkoutをcopy-on-write優先で使い捨てsnapshotへ複製し、そのsnapshotだけを書き込み可能にしたmacOSの`sandbox-exec`またはLinuxのbubblewrap/user namespace内で実行します。ビルド成果物やテストfixtureはsnapshotへ書けますが、元checkoutへの書き込みはkernelで拒否されます。
 
-検証コマンドの環境は、orchestratorの環境から`YORISHIRO_`で始まる変数（`YORISHIRO_ROOT`、`YORISHIRO_RUNTIME`、`YORISHIRO_ROLE`など）と`HERDR_`で始まる変数を取り除き、snapshot内を指す`TMPDIR`／`TMP`／`TEMP`、`npm_config_cache`、`XDG_CACHE_HOME`、`YORISHIRO_EVIDENCE_DIR`を設定したものです。`YORISHIRO_ROOT`を継承すると、snapshot内で動くpipelineが元checkoutの`artifacts/`へ書こうとしてsandboxに拒否されます。環境は`verifier-tools.ts`の`verificationEnvironment()`が組み立てます。
+検証コマンドの環境は、orchestratorの環境から`YORISHIRO_`で始まる変数（`YORISHIRO_ROOT`、`YORISHIRO_RUNTIME`、`YORISHIRO_ROLE`など）と`HERDR_`で始まる変数を取り除き、snapshot内を指す`TMPDIR`／`TMP`／`TEMP`、`npm_config_cache`、`XDG_CACHE_HOME`、`YORISHIRO_EVIDENCE_DIR`を設定したものです。`YORISHIRO_ROOT`を継承すると、snapshot内で動くpipelineが元checkoutの`artifacts/`へ書こうとしてsandboxに拒否されます。環境は`verifier-tools.ts`の`verificationEnvironment()`が組み立てます。「取り除く」対象になる元の環境は、どの場面でもorchestratorのプロセスの環境です（次節）。
 
 JVM系のツール（Gradle、Kotlinコンパイラ、Mockitoのinline mock maker）が動くように、検証コマンドには次の既定も与えます（`verifier-tools.ts`）。JVM以外のツールには広げません。
 
@@ -136,7 +136,27 @@ Claude Codeは、MCPのtool呼び出しが120秒を超えると呼び出しを�
 
 snapshotは書き込みを閉じたsandboxの中なので、検証コマンドからさらにsandboxを起動する（macOSでは`sandbox-exec`の入れ子、つまりpipelineや`runSandboxedVerification`を呼ぶテスト）ことはできません。Yorishiro自身を対象にするrunの`requiredChecks`は`npm run test:gate`にし、入れ子になるスイートは`test/gate-exclusions.json`の理由付き一覧に載せ、Workerがsandboxの外で`npm test`を実行して確かめます。
 
-Claude Codeランタイムでは、Workerにも`run_verification_command`を渡します（Reviewerと同じ実装、同じsnapshotとsandbox条件、同じ出力上限）。Workerは報告前に、契約の`requiredChecks`をこのtoolで実行してexit 0を確かめます。本番のquality gateと同じ条件で動くので、APFS cloneや`sandbox-exec`で検証用の複製や環境を手作りする必要はありません（手作りの複製は、削除の権限拒否で巨大な複製が残る、sandbox条件の取り違えでgate失敗に気づけない、という問題を起こしました）。Workerの元checkoutは書き込み可能なままで、toolが実行するのはsnapshotの上だけです。このtoolの証跡は`evidence/worker-verification/`に回収されます（Reviewerは`evidence/reviewer/`）。この指示はWorkerのpromptとbrief（`## Workerの道具と証跡`）に入っています。Piランタイムの子は変わりません。
+Claude Codeランタイムでは、Workerにも`run_verification_command`を渡します（Reviewerと同じ実装、同じプロセスと環境、同じsnapshotとsandbox条件、同じ出力上限）。Workerは報告前に、契約の`requiredChecks`をこのtoolで実行してexit 0を確かめます。本番のquality gateと同じ条件で動くので、APFS cloneや`sandbox-exec`で検証用の複製や環境を手作りする必要はありません（手作りの複製は、削除の権限拒否で巨大な複製が残る、sandbox条件の取り違えでgate失敗に気づけない、という問題を起こしました）。Workerの元checkoutは書き込み可能なままで、toolが実行するのはsnapshotの上だけです。このtoolの証跡は`evidence/worker-verification/`に回収されます（Reviewerは`evidence/reviewer/`）。この指示はWorkerのpromptとbrief（`## Workerの道具と証跡`）に入っています。Piランタイムの子は変わりません。
+
+### 検証の実行はorchestratorが行う
+
+`run_verification_command`（Worker・Reviewer）は、自分ではコマンドを実行しません。依頼を書き、orchestratorが実行した結果を待ちます。orchestratorは品質ゲートと同じ`runSandboxedVerification`を自分のプロセスで呼ぶので、3つの場面（品質ゲート、Workerの事前確認、Reviewerの検証）は、同じプロセスの同じ環境変数で動きます。以前は、WorkerとReviewerのtoolが子ペインの中のプロセスで実行していたため、環境がHerdrのペインの対話シェル（`~/.zshrc`まで読む）のものになり、品質ゲート（パイプラインを起動したシェルの環境）と食い違いました。`~/.zshrc`にだけある`TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE`のために、Workerの事前確認は通るのに品質ゲートのTestcontainers結合テストが落ちた例があります。
+
+依頼の置き場所は`artifacts/<repository>/<run-id>/verification-requests/<stage>/`（`<stage>`は`implement`か`review`）です。launcherが環境変数`YORISHIRO_VERIFICATION_REQUEST_DIR`でその場所を子に渡します（Claudeは各stageのMCP設定の`env`、PiはReviewerのlauncherのexport。Piに`run_verification_command`を持つのはReviewerだけです）。この変数がないとtoolはエラーになり、子のプロセスでの直接実行には戻りません（戻すと環境の食い違いが黙って戻るため）。
+
+| ファイル | 内容 |
+|---|---|
+| `broker.json` | orchestratorがこの段階の依頼を受け付けている間だけ存在する |
+| `<id>.request.json` | `{ program, args, timeoutMs?, cwd? }`。toolが原子的に書く（`<id>`は`<時刻>-<pid>-<連番>`） |
+| `<id>.cancel` | 呼び出し側が諦めた印。orchestratorが実行中の検証を止める |
+| `<id>.result.json` | 結果。orchestratorが原子的に書く（stdout、stderr、終了コード、`truncated`、`cancelled`、`timedOut`、証跡の回収結果、または拒否・失敗の理由） |
+
+- 受付は、子ペインを起動する前から段階の終わりまで動きます（`broker.json`がある間）。依頼は並行して処理します。段階が終わると、実行中の検証を止め、未着手の依頼にはエラーの結果を書いて、`broker.json`を消します。前の段階が残した依頼は実行せずエラーにします。
+- 依頼の検証は、実行前にtool（呼び出し側）とorchestratorの両方が行います。`program`は空でない文字列、`args`は文字列の配列、`timeoutMs`は1000以上`MAX_CHECK_TIMEOUT_MS`（1800000）以下の整数（省略時120000）、`cwd`は`repositories`があるrunだけで、そのいずれかかその配下です。未知のフィールドと1MiBを超える依頼も拒否します。拒否した依頼は実行しません。
+- 証跡の置き場所（`evidence/worker-verification/`か`evidence/reviewer/`）は、依頼の中身ではなく、orchestratorがどの段階を待っているかで決まります。
+- 環境変数の値は、依頼にも結果にも書きません。orchestratorは自分の`process.env`を使います（コマンドが出力した内容は結果のstdout／stderrに入ります）。
+- キャンセル: toolは`AbortSignal`を受けると`<id>.cancel`を書き、orchestratorが実行中のコマンドのプロセスグループを止めた結果（`cancelled`）を待ちます。15秒たっても確認できなければ、toolが`cancelled`として返します。
+- 時間切れ: orchestratorが依頼の`timeoutMs`＋10分（snapshotの作成と後始末の余裕）たっても答えなければ、toolは`timedOut`として返し、取り消しの印を書きます。コマンド自身の`timeoutMs`超過は、これまでどおりorchestratorが`timedOut`で返します。
 
 ## 証跡回収
 
@@ -169,7 +189,7 @@ Claude Codeは初めて開くディレクトリで信頼ダイアログを出し
 
 ## artifact
 
-成果物は`artifacts/<repository>/<run-id>/`に保存されます。主な内容は依頼、承認済み計画、stage別workflow brief、2回目以降の指示`<stage>-prompt-<attempt>.md`（Claudeランタイム）、Workerが直接置く`evidence/worker/`（Claudeランタイム）、`quality-contract.json`、`plan-review.json`、`diff-review.json`、各attemptの構造化report、quality gate結果と`evidence/`、report-missing時のterminal transcript診断、baselineと各Worker stageのstatus/diff/fingerprint、`model-guard.log`、`run.json`です。baseline fingerprintとの差分で既存dirty pathの内容変更、untracked・deleted・renameも検出します。
+成果物は`artifacts/<repository>/<run-id>/`に保存されます。主な内容は依頼、承認済み計画、stage別workflow brief、2回目以降の指示`<stage>-prompt-<attempt>.md`（Claudeランタイム）、Workerが直接置く`evidence/worker/`（Claudeランタイム）、検証の依頼と結果`verification-requests/<stage>/`、`quality-contract.json`、`plan-review.json`、`diff-review.json`、各attemptの構造化report、quality gate結果と`evidence/`、report-missing時のterminal transcript診断、baselineと各Worker stageのstatus/diff/fingerprint、`model-guard.log`、`run.json`です。baseline fingerprintとの差分で既存dirty pathの内容変更、untracked・deleted・renameも検出します。
 
 ## cleanupとreset
 

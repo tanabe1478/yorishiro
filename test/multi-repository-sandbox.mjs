@@ -17,6 +17,7 @@ const ext = name => path.join(root, "extensions", "development-pipeline", name);
 const { runSandboxedVerification } = await import(ext("verifier-tools.ts"));
 const verifierTools = (await import(ext("verifier-tools.ts"))).default;
 const { runQualityGate, default: loadPipeline } = await import(ext("index.ts"));
+const { startVerificationBroker } = await import(ext("verification-broker.ts"));
 
 const git = (args, cwd) => new Promise((resolve, reject) => { const p = spawn("git", args, { cwd, stdio: "ignore" }); p.once("error", reject); p.once("close", code => code ? reject(new Error(`git ${args.join(" ")}=${code}`)) : resolve()); });
 async function repository(workspace, name, files = {}) {
@@ -83,27 +84,29 @@ const ok = result => assert.equal(result.code, 0, `${result.stdout}${result.stde
       await assert.rejects(() => runSandboxedVerification(node, [], temporary, 5000, undefined, { repositories: ["api"] }), /does not support repositories under \/tmp/);
     } finally { await rm(temporary, { recursive: true, force: true }); }
 
-    // ---- the verification tool (what the Worker and the Reviewer call) with the launcher's environment
+    // ---- the verification tool (what the Worker and the Reviewer call): it asks the orchestrator, here a broker that knows the run's repositories
     const tools = []; verifierTools({ registerTool: tool => tools.push(tool) });
     const tool = tools.find(item => item.name === "run_verification_command");
     assert.ok((tool.parameters.properties ?? tool.parameters).cwd, "the tool takes a cwd (the test loader stubs TypeBox, so the property map may be the parameters themselves)");
-    const run = (input, env) => {
-      const saved = { cwd: process.env.YORISHIRO_TARGET_CWD, repositories: process.env.YORISHIRO_TARGET_REPOSITORIES };
-      process.env.YORISHIRO_TARGET_CWD = ws;
-      if (env === undefined) delete process.env.YORISHIRO_TARGET_REPOSITORIES; else process.env.YORISHIRO_TARGET_REPOSITORIES = env;
-      return tool.execute("t", input, new AbortController().signal).finally(() => { for (const [key, value] of [["YORISHIRO_TARGET_CWD", saved.cwd], ["YORISHIRO_TARGET_REPOSITORIES", saved.repositories]]) if (value === undefined) delete process.env[key]; else process.env[key] = value; });
+    const requestRoot = await mkdtemp(path.join(await realpath(os.tmpdir()), "yorishiro-multi-requests-"));
+    let brokers = 0;
+    const run = async (input, repositories) => {
+      const broker = await startVerificationBroker({ requestDir: path.join(requestRoot, `broker-${++brokers}`), evidenceRoot: path.join(requestRoot, "evidence"), stage: "review", cwd: ws, ...(repositories ? { repositories } : {}) });
+      process.env.YORISHIRO_VERIFICATION_REQUEST_DIR = broker.requestDir;
+      try { return await tool.execute("t", input, new AbortController().signal); }
+      finally { delete process.env.YORISHIRO_VERIFICATION_REQUEST_DIR; await broker.stop(); }
     };
-    const reposEnv = JSON.stringify(["api", "backend"]);
-    const viaTool = await run({ program: node, args: script("process.stdout.write(require('path').basename(process.cwd())+':'+require('fs').readFileSync('../api/data.txt','utf8'))"), cwd: "backend" }, reposEnv);
-    assert.match(viaTool.content[0].text, /^backend:api-data\n/, "cwd selects the repository and ../api resolves");
-    assert.match(viaTool.content[0].text, /\[verification EXIT exit=0\]/);
-    assert.equal(viaTool.details.exitCode, 0);
-    const rootTool = await run({ program: node, args: script("process.stdout.write(JSON.stringify(require('fs').readdirSync('.').filter(name=>!name.startsWith('.'))))") }, reposEnv);
-    assert.match(rootTool.content[0].text, /^\["api","backend"\]/, "without cwd the tool runs at the workspace root");
-    await assert.rejects(() => run({ program: node, args: [], cwd: "docs" }, reposEnv), /one of repositories or inside one/);
-    await assert.rejects(() => run({ program: node, args: [], cwd: "backend" }, undefined), /only allowed when the run has repositories/);
-    await assert.rejects(() => run({ program: node, args: [] }, "not json"), /not valid JSON/);
-    await assert.rejects(() => run({ program: node, args: [] }, JSON.stringify(["../x"])), /YORISHIRO_TARGET_REPOSITORIES is invalid/);
+    try {
+      const repos = ["api", "backend"];
+      const viaTool = await run({ program: node, args: script("process.stdout.write(require('path').basename(process.cwd())+':'+require('fs').readFileSync('../api/data.txt','utf8'))"), cwd: "backend" }, repos);
+      assert.match(viaTool.content[0].text, /^backend:api-data\n/, "cwd selects the repository and ../api resolves");
+      assert.match(viaTool.content[0].text, /\[verification EXIT exit=0\]/);
+      assert.equal(viaTool.details.exitCode, 0);
+      const rootTool = await run({ program: node, args: script("process.stdout.write(JSON.stringify(require('fs').readdirSync('.').filter(name=>!name.startsWith('.'))))") }, repos);
+      assert.match(rootTool.content[0].text, /^\["api","backend"\]/, "without cwd the tool runs at the workspace root");
+      await assert.rejects(() => run({ program: node, args: [], cwd: "docs" }, repos), /one of repositories or inside one/);
+      await assert.rejects(() => run({ program: node, args: [], cwd: "backend" }, undefined), /only allowed when the run has repositories/);
+    } finally { await rm(requestRoot, { recursive: true, force: true }); }
 
     // ---- the quality gate: a check with a cwd runs there, the others at the workspace root
     const artifactDir = await mkdtemp(path.join(await realpath(os.tmpdir()), "yorishiro-multi-gate-"));
@@ -136,12 +139,12 @@ const out=x=>process.stdout.write((typeof x==="string"?x:JSON.stringify(x))+"\n"
 const unquote=x=>String(x).replace(/^['"]|['"]$/g,"");
 const settle=launch=>{
   const s=read();s.attempt[launch.stage]=(s.attempt[launch.stage]||0)+1;save(s);
-  const child=spawnSync(process.execPath,["--experimental-strip-types","--experimental-loader",process.env.CORE_LOADER,"--input-type=module","-e",process.env.CORE_SCRIPT],{cwd:process.env.CORE_ROOT,timeout:120000,encoding:"utf8",env:{...process.env,CORE_STAGE:launch.stage,CORE_TARGET_CWD:launch.targetCwd||"",CORE_TARGET_REPOSITORIES:launch.targetRepositories||"",YORISHIRO_REPORT_PATH:launch.reportPath,YORISHIRO_REPORT_STAGE:launch.stage,YORISHIRO_REPORT_SCHEMA:launch.schema,YORISHIRO_REPORT_ROOT:path.dirname(launch.reportPath)}});
+  const child=spawnSync(process.execPath,["--experimental-strip-types","--experimental-loader",process.env.CORE_LOADER,"--input-type=module","-e",process.env.CORE_SCRIPT],{cwd:process.env.CORE_ROOT,timeout:120000,encoding:"utf8",env:{...process.env,CORE_STAGE:launch.stage,CORE_REQUEST_DIR:launch.requestDir||"",YORISHIRO_REPORT_PATH:launch.reportPath,YORISHIRO_REPORT_STAGE:launch.stage,YORISHIRO_REPORT_SCHEMA:launch.schema,YORISHIRO_REPORT_ROOT:path.dirname(launch.reportPath)}});
   if(child.status!==0){process.stderr.write("fake child failed: "+child.stderr+child.stdout);process.exit(1);}
 };
 if(a[0]==="status")out({});
 else if(a[0]==="pane"&&a[1]==="split"){const s=read();s.splits+=1;s.splitPanes.push("fake:"+s.splits);save(s);out({result:{pane:{pane_id:"fake:"+s.splits,terminal_id:"term-fake-"+s.splits}}});}
-else if(a[0]==="pane"&&a[1]==="run"){const text=fs.readFileSync(unquote(a.find(x=>String(x).includes("launcher.sh"))),"utf8"),get=k=>{const m=text.match(new RegExp("export "+k+"='([^']*)'"));return m===null?undefined:m[1];};const launch={stage:get("YORISHIRO_REPORT_STAGE"),schema:get("YORISHIRO_REPORT_SCHEMA"),reportPath:get("YORISHIRO_REPORT_PATH"),targetCwd:get("YORISHIRO_TARGET_CWD"),targetRepositories:get("YORISHIRO_TARGET_REPOSITORIES")};const s=read();s.panes[a[2]]=launch;s.launches.push(launch);save(s);settle(launch);}
+else if(a[0]==="pane"&&a[1]==="run"){const text=fs.readFileSync(unquote(a.find(x=>String(x).includes("launcher.sh"))),"utf8"),get=k=>{const m=text.match(new RegExp("export "+k+"='([^']*)'"));return m===null?undefined:m[1];};const launch={stage:get("YORISHIRO_REPORT_STAGE"),schema:get("YORISHIRO_REPORT_SCHEMA"),reportPath:get("YORISHIRO_REPORT_PATH"),requestDir:get("YORISHIRO_VERIFICATION_REQUEST_DIR")};const s=read();s.panes[a[2]]=launch;s.launches.push(launch);save(s);settle(launch);}
 else if(a[0]==="pane"&&a[1]==="send-keys"){const s=read();if(a[3]==="enter"&&s.panes[a[2]])settle(s.panes[a[2]]);out({});}
 else if(a[0]==="pane"&&a[1]==="layout"){const s=read();out({result:{layout:{panes:["parent",...s.splitPanes].map(pane_id=>({pane_id})),splits:[{direction:"right",ratio:.55},{direction:"down",ratio:.5}].slice(0,s.splits),zoomed:false}}});}
 else if(a[0]==="pane"&&a[1]==="get")out({agent_status:"idle"});
@@ -165,8 +168,7 @@ if(stage==="implement"){
   report={verdict:"COMPLETED",summary:"日本語の実装報告",changedScope:"二つのリポジトリを変更しました",evidence:"テストを実行しました",completedPlanItems:[{id:"PLAN-1",evidence:"確認しました"}],changedPaths:paths};
 }else{
   const verifier=[];(await import(process.env.CORE_VERIFIER)).default({registerTool:x=>verifier.push(x)});
-  process.env.YORISHIRO_TARGET_CWD=process.env.CORE_TARGET_CWD;
-  if(process.env.CORE_TARGET_REPOSITORIES)process.env.YORISHIRO_TARGET_REPOSITORIES=process.env.CORE_TARGET_REPOSITORIES;
+  process.env.YORISHIRO_VERIFICATION_REQUEST_DIR=process.env.CORE_REQUEST_DIR;
   const result=await verifier[0].execute("verify",{program:process.execPath,args:["-e","process.stdout.write(require('fs').readFileSync('../api/src/index.ts','utf8'))"],cwd:"backend",timeoutMs:30000},new AbortController().signal);
   const text=result.content[0].text;
   if(!text.includes("export const name = 'api changed'")||!text.includes("[verification EXIT exit=0]"))throw new Error("reviewer verification failed: "+text);
@@ -249,9 +251,14 @@ for (const key of Object.keys(names)) names[key] = repositoryArtifactName(key);
     assert.ok(reviewPrompt.includes(path.join(artifact, "diffs", `implement-1-${names.api}-diff.patch`)) && reviewPrompt.includes(path.join(artifact, "diffs", `baseline-${names.backend}-status.txt`)));
     const state = await run.readState();
     const reviewLaunch = state.launches.find(launch => launch.stage === "review"), workerLaunch = state.launches.find(launch => launch.stage === "implement");
-    assert.equal(reviewLaunch.targetRepositories, '["api","backend"]', "the Reviewer's launcher exports the repositories to its verifier");
-    assert.equal(reviewLaunch.targetCwd, run.ws);
-    assert.equal(workerLaunch.targetRepositories, undefined);
+    assert.equal(reviewLaunch.requestDir, path.join(artifact, "verification-requests", "review"), "the Reviewer's launcher exports where to ask the orchestrator to verify");
+    assert.equal(workerLaunch.requestDir, undefined, "the Pi Worker has no verifier");
+    // The orchestrator ran the Reviewer's command (with the repositories of the run) and answered in the request directory.
+    const answers = (await readdir(path.join(artifact, "verification-requests", "review"))).filter(name => name.endsWith(".result.json"));
+    assert.equal(answers.length, 1);
+    const answer = JSON.parse(await readFile(path.join(artifact, "verification-requests", "review", answers[0]), "utf8"));
+    assert.equal(answer.status, "completed"); assert.equal(answer.code, 0); assert.equal(answer.owner, "reviewer");
+    assert.match(answer.stdout, /api changed/);
     assert.equal(metadata.humanReview.diff.decision, "skipped");
     assert.equal(await readFile(path.join(run.ws, "api", "src", "index.ts"), "utf8"), "export const name = 'api changed';\n", "the Worker's edits are in the real checkouts");
     await assert.rejects(() => stat(path.join(run.ws, "root-file.txt")));
